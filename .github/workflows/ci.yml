@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only token: pull requests from forks run this workflow too.
+permissions:
+  contents: read
+
 jobs:
   go:
     runs-on: ubuntu-latest

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/AlmarionAI/swarmpg/security/advisories/new
+    about: Report isolation bypasses and other vulnerabilities privately, never in a public issue.
