@@ -1,0 +1,16 @@
+SwarmPG
+Copyright 2026 AlmarionAI
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE),
+except for the kernel patches in kernel/, which modify PostgreSQL and are
+licensed under the PostgreSQL License (see kernel/LICENSE).
+
+The SwarmPG kernel is built from PostgreSQL
+(https://www.postgresql.org/), Copyright (c) 1996-2026, PostgreSQL Global
+Development Group, and Copyright (c) 1994, The Regents of the University of
+California, distributed under the PostgreSQL License.
+
+PostgreSQL is a trademark of the PostgreSQL Community Association of Canada.
+SwarmPG is an independent project and is not affiliated with or endorsed by
+the PostgreSQL Global Development Group or the PostgreSQL Community
+Association.

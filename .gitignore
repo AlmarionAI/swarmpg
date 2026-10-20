@@ -1,0 +1,12 @@
+.DS_Store
+*.swp
+# local throwaway clusters created by `make pg-start` (stock and KERNEL=1)
+/.pg/
+/.pg-kernel/
+# kernel working tree and install prefix created by `make kernel`
+/swarmpg-core/
+/.pginstall/
+# built binaries
+/.bin/
+/gateway/gateway
+/loadtest/loadtest

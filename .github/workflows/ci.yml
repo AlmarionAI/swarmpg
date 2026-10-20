@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+      - run: make test
+
+  e2e-stock:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: swarmpg
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+    env:
+      DATABASE_URL: postgres://postgres@127.0.0.1:5432/swarmpg?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+      - run: which psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+      - run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f sql/schema.sql
+      - run: AGENTS=1000 REQUESTS=8 scripts/e2e.sh
+
+  kernel:
+    runs-on: ubuntu-latest
+    env:
+      SWARMPG_SRC: ${{ github.workspace }}/swarmpg-core
+      PREFIX: ${{ github.workspace }}/.pginstall
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+      - run: sudo apt-get update && sudo apt-get install -y bison flex libreadline-dev zlib1g-dev
+      - run: kernel/build.sh fetch
+      - run: kernel/build.sh build
+      - run: echo "$PREFIX/bin" >> "$GITHUB_PATH"
+      - run: kernel/build.sh check
+      - if: failure()
+        run: cat swarmpg-core/src/test/regress/regression.diffs || true
+      - name: e2e on the kernel, including kernel probes
+        run: make e2e KERNEL=1 AGENTS=1000 REQUESTS=8
