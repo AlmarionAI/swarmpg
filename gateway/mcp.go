@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -54,7 +55,8 @@ var mcpServerInfo = map[string]string{"name": "swarmpg", "title": "SwarmPG", "ve
 
 const mcpInstructions = "SwarmPG gives you a private, database-enforced slice of a shared Postgres. " +
 	"Your identity, org and budgets come from your token and cannot be changed from SQL. " +
-	"You have key/value JSON memory (optionally shared with your org), JSON documents in named " +
+	"You have versioned key/value JSON memory (optionally shared with your org) with compare-and-set " +
+	"writes, history and undo, JSON documents in named " +
 	"collections, and an append-only, hash-chained event journal. Call schema first, then use query " +
 	"for SQL with $1, $2 parameters; errors return a SQLSTATE code, hint and position so you can fix " +
 	"the statement and retry."
@@ -113,25 +115,67 @@ var mcpTools = []mcpTool{
 		Annotations: annotations("Run SQL", false, true, false),
 	}, toolQuery},
 	{mcpToolDef{
-		Name:        "memory_get",
-		Title:       "Read a memory key",
-		Description: "Read one of your memory keys. If you have no such key, an org-shared key of the same name is returned.",
+		Name:  "memory_get",
+		Title: "Read a memory key",
+		Description: "Read one of your memory keys with its version. If you have no such key, an org-shared key " +
+			"of the same name is returned (own is false). Pass version, or as_of (an RFC 3339 time), to read " +
+			"your own key as it was then.",
 		InputSchema: object(map[string]any{
-			"key": map[string]any{"type": "string", "description": "The memory key."},
+			"key":     map[string]any{"type": "string", "description": "The memory key."},
+			"version": map[string]any{"type": "integer", "description": "Read this version from your history."},
+			"as_of":   map[string]any{"type": "string", "format": "date-time", "description": "Read the value as it was at this time."},
 		}, "key"),
 		Annotations: annotations("Read a memory key", true, false, true),
 	}, toolMemoryGet},
 	{mcpToolDef{
-		Name:        "memory_put",
-		Title:       "Write a memory key",
-		Description: "Create or replace one of your memory keys with any JSON value. Set shared to let agents in your org read it.",
+		Name:  "memory_put",
+		Title: "Write a memory key",
+		Description: "Create or replace one of your memory keys with any JSON value; returns the new version. " +
+			"Pass expected_version for a safe read-modify-write: 0 creates the key only if it does not exist, " +
+			"N writes only if the key is still at version N. Otherwise nothing is written and you get " +
+			"version_conflict with current_version: read the key again and retry. Set shared to let agents " +
+			"in your org read it.",
 		InputSchema: object(map[string]any{
-			"key":    map[string]any{"type": "string", "description": "The memory key."},
-			"value":  map[string]any{"description": "Any JSON value."},
-			"shared": map[string]any{"type": "boolean", "description": "Readable by your org. Default false."},
+			"key":              map[string]any{"type": "string", "description": "The memory key."},
+			"value":            map[string]any{"description": "Any JSON value."},
+			"shared":           map[string]any{"type": "boolean", "description": "Readable by your org. Default false."},
+			"expected_version": map[string]any{"type": "integer", "minimum": 0, "description": "Write only if the key is at this version (0: absent)."},
 		}, "key", "value"),
-		Annotations: annotations("Write a memory key", false, true, true),
+		Annotations: annotations("Write a memory key", false, true, false),
 	}, toolMemoryPut},
+	{mcpToolDef{
+		Name:        "memory_delete",
+		Title:       "Delete a memory key",
+		Description: "Delete one of your memory keys. It stays in your history, so memory_undo can bring it back. Pass expected_version to delete only that version.",
+		InputSchema: object(map[string]any{
+			"key":              map[string]any{"type": "string", "description": "The memory key."},
+			"expected_version": map[string]any{"type": "integer", "minimum": 1, "description": "Delete only if the key is at this version."},
+		}, "key"),
+		Annotations: annotations("Delete a memory key", false, true, false),
+	}, toolMemoryDelete},
+	{mcpToolDef{
+		Name:        "memory_history",
+		Title:       "List a key's versions",
+		Description: "List the versions of one of your memory keys, newest first, with each value, when it was written and whether it was a delete.",
+		InputSchema: object(map[string]any{
+			"key":   map[string]any{"type": "string", "description": "The memory key."},
+			"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 1000, "description": "How many versions. Default 50."},
+		}, "key"),
+		Annotations: annotations("List a key's versions", true, false, true),
+	}, toolMemoryHistory},
+	{mcpToolDef{
+		Name:  "memory_undo",
+		Title: "Undo a memory change",
+		Description: "Undo the latest change to one of your memory keys, or restore it to to_version. The restored " +
+			"state is written as a new version, so an undo can itself be undone. Restoring a state where the " +
+			"key did not exist deletes it. expected_version guards it like memory_put.",
+		InputSchema: object(map[string]any{
+			"key":              map[string]any{"type": "string", "description": "The memory key."},
+			"to_version":       map[string]any{"type": "integer", "minimum": 1, "description": "Restore this version instead of the previous one."},
+			"expected_version": map[string]any{"type": "integer", "minimum": 0, "description": "Undo only if the key is at this version (0: absent)."},
+		}, "key"),
+		Annotations: annotations("Undo a memory change", false, true, false),
+	}, toolMemoryUndo},
 	{mcpToolDef{
 		Name:  "events_append",
 		Title: "Append to your journal",
@@ -196,31 +240,81 @@ func toolQuery(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) 
 
 func toolMemoryGet(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) map[string]any {
 	var in struct {
-		Key string `json:"key"`
+		Key     string     `json:"key"`
+		Version *int64     `json:"version"`
+		AsOf    *time.Time `json:"as_of"`
 	}
 	if aerr := decodeArgs(args, &in); aerr != nil {
 		return toolError(aerr)
 	}
-	v, shared, aerr := g.memoryGet(ctx, a, in.Key)
+	m, aerr := g.memoryGet(ctx, a, in.Key, in.Version, in.AsOf)
 	if aerr != nil {
 		return toolError(aerr)
 	}
-	return toolJSON(map[string]any{"key": in.Key, "value": v, "shared": shared})
+	return toolJSON(m)
 }
 
 func toolMemoryPut(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) map[string]any {
 	var in struct {
-		Key    string          `json:"key"`
-		Value  json.RawMessage `json:"value"`
-		Shared bool            `json:"shared"`
+		Key             string          `json:"key"`
+		Value           json.RawMessage `json:"value"`
+		Shared          bool            `json:"shared"`
+		ExpectedVersion *int64          `json:"expected_version"`
 	}
 	if aerr := decodeArgs(args, &in); aerr != nil {
 		return toolError(aerr)
 	}
-	if aerr := g.memoryPut(ctx, a, in.Key, in.Value, in.Shared); aerr != nil {
+	version, aerr := g.memoryPut(ctx, a, in.Key, in.Value, in.Shared, in.ExpectedVersion)
+	if aerr != nil {
 		return toolError(aerr)
 	}
-	return toolJSON(map[string]any{"ok": true, "key": in.Key, "shared": in.Shared})
+	return toolJSON(map[string]any{"ok": true, "key": in.Key, "version": version, "shared": in.Shared})
+}
+
+func toolMemoryDelete(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) map[string]any {
+	var in struct {
+		Key             string `json:"key"`
+		ExpectedVersion *int64 `json:"expected_version"`
+	}
+	if aerr := decodeArgs(args, &in); aerr != nil {
+		return toolError(aerr)
+	}
+	version, aerr := g.memoryDelete(ctx, a, in.Key, in.ExpectedVersion)
+	if aerr != nil {
+		return toolError(aerr)
+	}
+	return toolJSON(map[string]any{"ok": true, "key": in.Key, "version": version})
+}
+
+func toolMemoryHistory(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) map[string]any {
+	var in struct {
+		Key   string `json:"key"`
+		Limit int    `json:"limit"`
+	}
+	if aerr := decodeArgs(args, &in); aerr != nil {
+		return toolError(aerr)
+	}
+	versions, aerr := g.memoryHistory(ctx, a, in.Key, in.Limit)
+	if aerr != nil {
+		return toolError(aerr)
+	}
+	return toolJSON(map[string]any{"key": in.Key, "versions": versions})
+}
+
+func toolMemoryUndo(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) map[string]any {
+	var in struct {
+		Key             string `json:"key"`
+		ToVersion       *int64 `json:"to_version"`
+		ExpectedVersion *int64 `json:"expected_version"`
+	}
+	if aerr := decodeArgs(args, &in); aerr != nil {
+		return toolError(aerr)
+	}
+	out, aerr := g.memoryUndo(ctx, a, in.Key, in.ToVersion, in.ExpectedVersion)
+	if aerr != nil {
+		return toolError(aerr)
+	}
+	return toolJSON(out)
 }
 
 func toolEventsAppend(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) map[string]any {

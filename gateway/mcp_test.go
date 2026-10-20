@@ -99,7 +99,7 @@ func TestNotificationIsAccepted(t *testing.T) {
 func TestLegacyToolsList(t *testing.T) {
 	rep := serve(t, `{"jsonrpc":"2.0","id":"a","method":"tools/list"}`, map[string]string{"MCP-Protocol-Version": "2025-06-18"})
 	got := strings.Join(toolNames(t, rep), ",")
-	if got != "schema,query,memory_get,memory_put,events_append" {
+	if got != "schema,query,memory_get,memory_put,memory_delete,memory_history,memory_undo,events_append" {
 		t.Fatalf("tools: %s", got)
 	}
 	if _, ok := rep.Result["resultType"]; ok {
@@ -141,7 +141,7 @@ func TestModernToolsList(t *testing.T) {
 	if rep.Result["resultType"] != "complete" || rep.Result["cacheScope"] != "public" || rep.Result["ttlMs"] == nil {
 		t.Fatalf("tools/list: %s", rep.Raw)
 	}
-	if len(toolNames(t, rep)) != 5 {
+	if len(toolNames(t, rep)) != len(mcpTools) {
 		t.Fatalf("tools: %s", rep.Raw)
 	}
 }
@@ -210,13 +210,19 @@ func TestToolCallErrors(t *testing.T) {
 	wantError(t, call("drop_everything", `{}`), 200, rpcInvalidParams)
 
 	// bad arguments are tool errors the model can read and fix
-	for name, args := range map[string]string{
-		"query":         `{"sql":"   "}`,
-		"memory_get":    `{}`,
-		"memory_put":    `{"key":"k"}`,
-		"events_append": `{"payload":{}}`,
-		"schema":        `{"verbose":true}`,
+	for _, tc := range []struct{ name, args string }{
+		{"query", `{"sql":"   "}`},
+		{"memory_get", `{}`},
+		{"memory_get", `{"key":"k","version":1,"as_of":"2026-01-01T00:00:00Z"}`},
+		{"memory_put", `{"key":"k"}`},
+		{"memory_put", `{"key":"k","value":1,"expected_version":-1}`},
+		{"memory_delete", `{"key":"k","expected_version":0}`},
+		{"memory_history", `{"key":""}`},
+		{"memory_undo", `{"key":"k","to_version":"one"}`},
+		{"events_append", `{"payload":{}}`},
+		{"schema", `{"verbose":true}`},
 	} {
+		name, args := tc.name, tc.args
 		rep := call(name, args)
 		if rep.Status != 200 || rep.Error != nil || rep.Result["isError"] != true {
 			t.Fatalf("%s %s: want an isError result, got %s", name, args, rep.Raw)

@@ -293,6 +293,7 @@ type apiError struct {
 	Hint      string
 	Position  int
 	Retryable bool
+	Extra     map[string]any // further fields for the error body, e.g. current_version
 }
 
 func (e *apiError) Error() string { return e.Message }
@@ -313,11 +314,22 @@ func classifyPg(err error) *apiError {
 			retryable = true
 		}
 		status := 400
-		if pg.Code == "42501" { // insufficient_privilege
+		code := pg.Code
+		var extra map[string]any
+		switch pg.Code {
+		case "42501": // insufficient_privilege
 			status = 403
+		case "SW409": // memory version conflict (schema.sql)
+			status, code = 409, "version_conflict"
+			var cur, expected int64
+			if _, err := fmt.Sscanf(pg.Detail, "current_version=%d expected_version=%d", &cur, &expected); err == nil {
+				extra = map[string]any{"current_version": cur}
+			}
+		case "SW404": // memory key or version not found (schema.sql)
+			status, code = 404, "not_found"
 		}
-		return &apiError{Status: status, Code: pg.Code, Message: pg.Message,
-			Detail: pg.Detail, Hint: pg.Hint, Position: int(pg.Position), Retryable: retryable}
+		return &apiError{Status: status, Code: code, Message: pg.Message,
+			Detail: pg.Detail, Hint: pg.Hint, Position: int(pg.Position), Retryable: retryable, Extra: extra}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &apiError{Status: 504, Code: "statement_timeout", Message: "statement timed out", Retryable: true}
@@ -675,7 +687,7 @@ func (g *Gateway) describe(ctx context.Context, a *Agent) (string, *apiError) {
 			       string_agg(c.column_name || ' ' || c.data_type, ', ' ORDER BY c.ordinal_position)
 			FROM information_schema.columns c
 			WHERE c.table_schema = 'swarmpg'
-			  AND c.table_name IN ('memory','documents','events')
+			  AND c.table_name IN ('memory','memory_history','documents','events')
 			GROUP BY c.table_name ORDER BY c.table_name`)
 		if err != nil {
 			return err
@@ -693,6 +705,10 @@ func (g *Gateway) describe(ctx context.Context, a *Agent) (string, *apiError) {
 	sb.WriteString("\n# Rules\n" +
 		"- One statement per request. SET / DO / COPY / DDL / transaction control are rejected by the database.\n" +
 		"- swarmpg.events is append-only and hash-chained.\n" +
+		"- Every memory write gets a new version, kept in swarmpg.memory_history (read-only). Write with\n" +
+		"  swarmpg.memory_put(key, value, shared, expected_version) for compare-and-set (0 = must not exist;\n" +
+		"  a stale version fails with version_conflict). Read the past with swarmpg.memory_at_version(key, v)\n" +
+		"  or swarmpg.memory_as_of(key, ts); swarmpg.memory_undo(key) restores the previous version.\n" +
 		"- Use swarmpg.documents (collection, body jsonb) for your own structured data; you cannot CREATE TABLE.\n" +
 		"- Parameterise with $1,$2,...; results are capped by your row and byte budgets.\n" +
 		"- On error you get a SQLSTATE code, detail, hint and position for repair.\n")
@@ -731,6 +747,9 @@ func errorBody(err *apiError) map[string]any {
 	}
 	if err.Retryable {
 		body["retryable"] = true
+	}
+	for k, v := range err.Extra {
+		body[k] = v
 	}
 	return body
 }
@@ -799,6 +818,19 @@ func newToken() string {
 	return "spg_" + hex.EncodeToString(b)
 }
 
+// queryInt reads an optional integer query parameter.
+func queryInt(r *http.Request, name string) (*int64, *apiError) {
+	s := r.URL.Query().Get(name)
+	if s == "" {
+		return nil, nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return nil, errBadReq(name + " must be an integer")
+	}
+	return &n, nil
+}
+
 func readJSON(r *http.Request, v any) error {
 	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBytes)
 	dec := json.NewDecoder(r.Body)
@@ -851,51 +883,158 @@ func (g *Gateway) idempotentWrite(ctx context.Context, a *Agent, key string, do 
 	return out, replay, nil
 }
 
-// memoryPut upserts the agent's own memory key; shared makes it readable by
-// the agent's org.
-func (g *Gateway) memoryPut(ctx context.Context, a *Agent, key string, value json.RawMessage, shared bool) *apiError {
-	if key == "" {
-		return errBadReq("key required")
-	}
-	if len(value) == 0 {
-		return errBadReq("value required")
-	}
-	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO swarmpg.memory(agent_id, org_id, key, value, shared)
-			VALUES(swarmpg.current_agent(), swarmpg.current_org(), $1, $2, $3)
-			ON CONFLICT (agent_id, key) DO UPDATE SET value = EXCLUDED.value, shared = EXCLUDED.shared, updated_at = now()`,
-			key, string(value), shared)
-		return err
-	})
-	if err != nil {
-		return classifyPg(err)
-	}
-	return nil
+// memoryState is one memory key as an agent sees it: live, or as it was at a
+// version or a point in time.
+type memoryState struct {
+	Key       string          `json:"key"`
+	Value     json.RawMessage `json:"value"`
+	Shared    bool            `json:"shared"`
+	Version   int64           `json:"version"`
+	Own       bool            `json:"own"`
+	ChangedAt *time.Time      `json:"changed_at,omitempty"`
 }
 
-// memoryGet reads the agent's own key, falling back to an org-shared key of
-// the same name.
-func (g *Gateway) memoryGet(ctx context.Context, a *Agent, key string) (json.RawMessage, bool, *apiError) {
+// memoryPut writes one of the agent's own keys and returns its new version.
+// expected is a compare-and-set guard: nil writes unconditionally, 0 creates
+// only if the key is absent, N updates only if the live version is still N.
+func (g *Gateway) memoryPut(ctx context.Context, a *Agent, key string, value json.RawMessage, shared bool, expected *int64) (int64, *apiError) {
 	if key == "" {
-		return nil, false, errBadReq("key required")
+		return 0, errBadReq("key required")
 	}
-	var v json.RawMessage
-	var shared bool
+	if len(value) == 0 {
+		return 0, errBadReq("value required")
+	}
+	if expected != nil && *expected < 0 {
+		return 0, errBadReq("expected_version must be >= 0")
+	}
+	var version int64
 	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT value, shared FROM swarmpg.memory
-			WHERE key = $1 AND (agent_id = swarmpg.current_agent()
-			                    OR (shared AND org_id = swarmpg.current_org()))
-			ORDER BY (agent_id = swarmpg.current_agent()) DESC LIMIT 1`, key).Scan(&v, &shared)
+		return tx.QueryRow(ctx, `SELECT swarmpg.memory_put($1, $2::jsonb, $3, $4)`, key, string(value), shared, expected).Scan(&version)
+	})
+	if err != nil {
+		return 0, classifyPg(err)
+	}
+	return version, nil
+}
+
+// memoryGet reads a key. A live read returns the agent's own key, falling back
+// to an org-shared key of the same name; a read of the past (at a version, or
+// as of a time) sees only the agent's own history.
+func (g *Gateway) memoryGet(ctx context.Context, a *Agent, key string, version *int64, asOf *time.Time) (*memoryState, *apiError) {
+	if key == "" {
+		return nil, errBadReq("key required")
+	}
+	if version != nil && asOf != nil {
+		return nil, errBadReq("pass version or as_of, not both")
+	}
+	m := &memoryState{Key: key, Own: true}
+	var deleted bool
+	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
+		switch {
+		case version != nil:
+			return tx.QueryRow(ctx, `SELECT value, shared, version, deleted, changed_at FROM swarmpg.memory_at_version($1, $2)`,
+				key, *version).Scan(&m.Value, &m.Shared, &m.Version, &deleted, &m.ChangedAt)
+		case asOf != nil:
+			return tx.QueryRow(ctx, `SELECT value, shared, version, deleted, changed_at FROM swarmpg.memory_as_of($1, $2)`,
+				key, *asOf).Scan(&m.Value, &m.Shared, &m.Version, &deleted, &m.ChangedAt)
+		default:
+			return tx.QueryRow(ctx, `
+				SELECT value, shared, version, agent_id = swarmpg.current_agent() FROM swarmpg.memory
+				WHERE key = $1 AND (agent_id = swarmpg.current_agent()
+				                    OR (shared AND org_id = swarmpg.current_org()))
+				ORDER BY (agent_id = swarmpg.current_agent()) DESC LIMIT 1`, key).Scan(&m.Value, &m.Shared, &m.Version, &m.Own)
+		}
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, &apiError{Status: 404, Code: "not_found", Message: "not found"}
+		return nil, &apiError{Status: 404, Code: "not_found", Message: "not found"}
 	}
 	if err != nil {
-		return nil, false, classifyPg(err)
+		return nil, classifyPg(err)
 	}
-	return v, shared, nil
+	if deleted {
+		return nil, &apiError{Status: 404, Code: "not_found", Message: fmt.Sprintf("deleted at version %d", m.Version),
+			Extra: map[string]any{"deleted_version": m.Version}}
+	}
+	return m, nil
+}
+
+// memoryDelete deletes one of the agent's own keys and returns the version of
+// the delete marker. expected guards it like memoryPut, and must be > 0.
+func (g *Gateway) memoryDelete(ctx context.Context, a *Agent, key string, expected *int64) (int64, *apiError) {
+	if key == "" {
+		return 0, errBadReq("key required")
+	}
+	if expected != nil && *expected <= 0 {
+		return 0, errBadReq("expected_version must be > 0 to delete")
+	}
+	var version int64
+	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT swarmpg.memory_delete($1, $2)`, key, expected).Scan(&version)
+	})
+	if err != nil {
+		return 0, classifyPg(err)
+	}
+	return version, nil
+}
+
+// memoryHistory lists the newest versions of one of the agent's own keys.
+func (g *Gateway) memoryHistory(ctx context.Context, a *Agent, key string, limit int) ([]map[string]any, *apiError) {
+	if key == "" {
+		return nil, errBadReq("key required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	var versions []map[string]any
+	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT version, value, shared, deleted, changed_at FROM swarmpg.memory_history($1, $2)`, key, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var version int64
+			var value json.RawMessage
+			var shared, deleted bool
+			var changedAt time.Time
+			if err := rows.Scan(&version, &value, &shared, &deleted, &changedAt); err != nil {
+				return err
+			}
+			v := map[string]any{"version": version, "shared": shared, "deleted": deleted, "changed_at": changedAt}
+			if !deleted {
+				v["value"] = value
+			}
+			versions = append(versions, v)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, classifyPg(err)
+	}
+	if len(versions) == 0 {
+		return nil, &apiError{Status: 404, Code: "not_found", Message: "no history for this key"}
+	}
+	return versions, nil
+}
+
+// memoryUndo restores the state before the key's latest change, or the state
+// at toVersion, as a new version; restoring an absent or deleted state deletes
+// the key. expected guards it like memoryPut.
+func (g *Gateway) memoryUndo(ctx context.Context, a *Agent, key string, toVersion, expected *int64) (map[string]any, *apiError) {
+	if key == "" {
+		return nil, errBadReq("key required")
+	}
+	var version int64
+	var restored *int64
+	var deleted bool
+	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT version, restored_version, deleted FROM swarmpg.memory_undo($1, $2, $3)`,
+			key, toVersion, expected).Scan(&version, &restored, &deleted)
+	})
+	if err != nil {
+		return nil, classifyPg(err)
+	}
+	return map[string]any{"key": key, "version": version, "restored_version": restored, "deleted": deleted}, nil
 }
 
 // appendEvent appends to the agent's hash-chained journal. With an
@@ -1029,27 +1168,94 @@ func (g *Gateway) routes() http.Handler {
 
 	mux.HandleFunc("PUT /v1/memory/{key}", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
 		var in struct {
-			Value  json.RawMessage `json:"value"`
-			Shared bool            `json:"shared"`
+			Value           json.RawMessage `json:"value"`
+			Shared          bool            `json:"shared"`
+			ExpectedVersion *int64          `json:"expected_version"`
 		}
 		if err := readJSON(r, &in); err != nil {
 			writeErr(w, errBadReq(err.Error()))
 			return
 		}
-		if aerr := g.memoryPut(r.Context(), a, r.PathValue("key"), in.Value, in.Shared); aerr != nil {
-			writeErr(w, aerr)
-			return
-		}
-		writeJSON(w, 200, map[string]bool{"ok": true})
-	}))
-
-	mux.HandleFunc("GET /v1/memory/{key}", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
-		v, shared, aerr := g.memoryGet(r.Context(), a, r.PathValue("key"))
+		version, aerr := g.memoryPut(r.Context(), a, r.PathValue("key"), in.Value, in.Shared, in.ExpectedVersion)
 		if aerr != nil {
 			writeErr(w, aerr)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"key": r.PathValue("key"), "value": v, "shared": shared})
+		writeJSON(w, 200, map[string]any{"ok": true, "key": r.PathValue("key"), "version": version})
+	}))
+
+	mux.HandleFunc("GET /v1/memory/{key}", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
+		version, aerr := queryInt(r, "version")
+		if aerr != nil {
+			writeErr(w, aerr)
+			return
+		}
+		var asOf *time.Time
+		if s := r.URL.Query().Get("as_of"); s != "" {
+			t, err := time.Parse(time.RFC3339Nano, s)
+			if err != nil {
+				writeErr(w, errBadReq("as_of must be an RFC 3339 timestamp"))
+				return
+			}
+			asOf = &t
+		}
+		m, aerr := g.memoryGet(r.Context(), a, r.PathValue("key"), version, asOf)
+		if aerr != nil {
+			writeErr(w, aerr)
+			return
+		}
+		writeJSON(w, 200, m)
+	}))
+
+	mux.HandleFunc("DELETE /v1/memory/{key}", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
+		expected, aerr := queryInt(r, "expected_version")
+		if aerr != nil {
+			writeErr(w, aerr)
+			return
+		}
+		version, aerr := g.memoryDelete(r.Context(), a, r.PathValue("key"), expected)
+		if aerr != nil {
+			writeErr(w, aerr)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "key": r.PathValue("key"), "version": version})
+	}))
+
+	mux.HandleFunc("GET /v1/memory/{key}/history", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
+		limit, aerr := queryInt(r, "limit")
+		if aerr != nil {
+			writeErr(w, aerr)
+			return
+		}
+		n := 0
+		if limit != nil {
+			n = int(*limit)
+		}
+		versions, aerr := g.memoryHistory(r.Context(), a, r.PathValue("key"), n)
+		if aerr != nil {
+			writeErr(w, aerr)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"key": r.PathValue("key"), "versions": versions})
+	}))
+
+	mux.HandleFunc("POST /v1/memory/{key}/undo", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
+		var in struct {
+			ToVersion       *int64 `json:"to_version"`
+			ExpectedVersion *int64 `json:"expected_version"`
+		}
+		if r.ContentLength != 0 {
+			if err := readJSON(r, &in); err != nil {
+				writeErr(w, errBadReq(err.Error()))
+				return
+			}
+		}
+		out, aerr := g.memoryUndo(r.Context(), a, r.PathValue("key"), in.ToVersion, in.ExpectedVersion)
+		if aerr != nil {
+			writeErr(w, aerr)
+			return
+		}
+		writeJSON(w, 200, out)
 	}))
 
 	mux.HandleFunc("POST /v1/events", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {

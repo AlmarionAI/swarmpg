@@ -32,6 +32,10 @@ var (
 	principalSecret = flag.String("principal-secret", os.Getenv("PRINCIPAL_SECRET"), "agent_principal_secret, to sign principals in the kernel probes")
 )
 
+// retry429 makes the probes honour Retry-After like a well-behaved agent. The
+// load phase leaves it off, so rate limiting there is counted, not hidden.
+var retry429 atomic.Bool
+
 var client = &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 1000, MaxConnsPerHost: 0}, Timeout: 30 * time.Second}
 
 func call(method, path, token string, body any, admin bool) (int, []byte) {
@@ -47,13 +51,34 @@ func call(method, path, token string, body any, admin bool) (int, []byte) {
 	} else {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(req)
 	if err != nil {
 		return 0, []byte(err.Error())
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, b
+}
+
+// doWithRetry sends req, and while retry429 is on, retries a 429 up to three
+// times after the Retry-After delay.
+func doWithRetry(req *http.Request) (*http.Response, error) {
+	var body []byte
+	if req.Body != nil {
+		body, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+	}
+	for attempt := 0; ; attempt++ {
+		if body != nil {
+			req.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusTooManyRequests || !retry429.Load() || attempt == 3 {
+			return resp, err
+		}
+		resp.Body.Close()
+		time.Sleep(time.Second)
+	}
 }
 
 type agent struct{ ID, Token string }
@@ -76,6 +101,16 @@ func createAgentWith(org, name string, extra map[string]any) agent {
 	var a agent
 	_ = json.Unmarshal(b, &a)
 	return a
+}
+
+// decode parses a JSON object response; anything else decodes to an empty map.
+func decode(b []byte) map[string]any {
+	var m map[string]any
+	_ = json.Unmarshal(b, &m)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return m
 }
 
 // mustOK stops the run when a probe's setup write fails, so a probe can never
@@ -197,6 +232,7 @@ func main() {
 	fmt.Printf("peak postgres backends used by agents: %d (for %d agents)\n", maxConns.Load(), *nAgents)
 
 	// ---- isolation probes: agent 0 attacks agent 1
+	retry429.Store(true)
 	fmt.Println("\n== isolation probes (agent 0 vs agent 1) ==")
 	A, B := agents[0], agents[1]
 	// First, agent B writes a private memory row so cross-agent reads have a
@@ -304,7 +340,7 @@ func main() {
 	code, list := mcpRPC(A.Token, true, "tools/list", nil, nil)
 	listRes, _ := list["result"].(map[string]any)
 	tools, _ := listRes["tools"].([]any)
-	check("tools/list returns the 5 tools", code == 200 && len(tools) == 5, fmt.Sprintf("%d tools", len(tools)))
+	check("tools/list returns the 8 tools", code == 200 && len(tools) == 8, fmt.Sprintf("%d tools", len(tools)))
 	code, _ = mcpRPC("", true, "tools/list", nil, nil)
 	check("no token refused", code == 401, fmt.Sprint(code))
 	code, _ = mcpRPC("spg_not_a_real_token", true, "tools/list", nil, nil)
@@ -316,6 +352,9 @@ func main() {
 		_, msg := mcpRPC(token, true, "tools/call", map[string]any{"name": name, "arguments": args}, nil)
 		res, _ := msg["result"].(map[string]any)
 		sc, _ := res["structuredContent"].(map[string]any)
+		if res == nil { // a protocol or HTTP error: show it rather than nil fields
+			sc = map[string]any{"error": msg["error"]}
+		}
 		text := ""
 		if content, _ := res["content"].([]any); len(content) > 0 {
 			text, _ = content[0].(map[string]any)["text"].(string)
@@ -341,6 +380,112 @@ func main() {
 	_, again, _ := tool(A.Token, "events_append", map[string]any{"kind": "mcp_probe", "idempotency_key": key})
 	check("events_append retry with the same key is replayed", first["id"] != nil && first["id"] == again["id"] && again["replayed"] == true,
 		fmt.Sprintf("id %v then %v, replayed=%v", first["id"], again["id"], again["replayed"]))
+
+	// ---- memory versions: compare-and-set, history, reads of the past, undo
+	fmt.Println("\n== memory version probes (REST and MCP) ==")
+	k := fmt.Sprintf("cas-%d", time.Now().UnixNano())
+	mem := "/v1/memory/" + k
+	put := func(token string, n int, expected any) (int, map[string]any) {
+		body := map[string]any{"value": map[string]any{"n": n}}
+		if expected != nil {
+			body["expected_version"] = expected
+		}
+		code, b := call("PUT", mem, token, body, false)
+		return code, decode(b)
+	}
+	get := func(token, query string) (int, map[string]any) {
+		code, b := call("GET", mem+query, token, nil, false)
+		return code, decode(b)
+	}
+	n := func(m map[string]any) any {
+		v, _ := m["value"].(map[string]any)
+		return v["n"]
+	}
+	errOf := func(m map[string]any) map[string]any {
+		e, _ := m["error"].(map[string]any)
+		return e
+	}
+	code, r := put(A.Token, 1, 0)
+	check("create-only write (expected_version 0)", code == 200 && r["version"] == float64(1), fmt.Sprintf("%d v%v", code, r["version"]))
+	code, r = put(A.Token, 1, 0)
+	check("second create-only write conflicts", code == 409 && errOf(r)["code"] == "version_conflict" && errOf(r)["current_version"] == float64(1),
+		fmt.Sprintf("%d %v current=%v", code, errOf(r)["code"], errOf(r)["current_version"]))
+	code, r = put(A.Token, 2, 1)
+	check("write at the current version", code == 200 && r["version"] == float64(2), fmt.Sprintf("%d v%v", code, r["version"]))
+	code, r = put(A.Token, 99, 1)
+	_, now := get(A.Token, "")
+	check("stale write conflicts and writes nothing", code == 409 && errOf(r)["current_version"] == float64(2) && n(now) == float64(2),
+		fmt.Sprintf("%d current=%v value n=%v", code, errOf(r)["current_version"], n(now)))
+
+	E := createAgentWith(org.ID, "racer", map[string]any{"max_concurrency": 32, "rps_limit": 500})
+	_, _ = call("PUT", mem, E.Token, map[string]any{"value": map[string]any{"n": 0}}, false)
+	var wins, conflicts, other atomic.Int64
+	var race sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		race.Add(1)
+		go func(i int) {
+			defer race.Done()
+			switch c, _ := call("PUT", mem, E.Token, map[string]any{"value": map[string]any{"n": i}, "expected_version": 1}, false); c {
+			case 200:
+				wins.Add(1)
+			case 409:
+				conflicts.Add(1)
+			default:
+				other.Add(1)
+			}
+		}(i)
+	}
+	race.Wait()
+	check("20 concurrent writers at one version: one wins", wins.Load() == 1 && conflicts.Load() == 19 && other.Load() == 0,
+		fmt.Sprintf("won=%d conflicted=%d other=%d", wins.Load(), conflicts.Load(), other.Load()))
+
+	code, r = get(A.Token, "?version=1")
+	check("read an earlier version", code == 200 && n(r) == float64(1), fmt.Sprintf("%d n=%v", code, n(r)))
+	_, hb := call("GET", mem+"/history", A.Token, nil, false)
+	versions, _ := decode(hb)["versions"].([]any)
+	check("history lists every version", len(versions) == 2, fmt.Sprintf("%d versions", len(versions)))
+	if len(versions) == 2 {
+		v1 := versions[1].(map[string]any)["changed_at"].(string)
+		t1, _ := time.Parse(time.RFC3339Nano, v1)
+		code, r = get(A.Token, "?as_of="+url.QueryEscape(v1))
+		before, _ := get(A.Token, "?as_of="+url.QueryEscape(t1.Add(-time.Microsecond).Format(time.RFC3339Nano)))
+		check("as_of reads the value at that time", code == 200 && n(r) == float64(1) && before == 404,
+			fmt.Sprintf("at v1: n=%v; just before: %d", n(r), before))
+	}
+	code, ub := call("POST", mem+"/undo", A.Token, nil, false)
+	u := decode(ub)
+	_, now = get(A.Token, "")
+	check("undo restores the previous value as a new version", code == 200 && u["restored_version"] == float64(1) && u["version"] == float64(3) && n(now) == float64(1),
+		fmt.Sprintf("%d v%v from v%v, n=%v", code, u["version"], u["restored_version"], n(now)))
+	code, _ = call("DELETE", mem+"?expected_version=3", A.Token, nil, false)
+	gone, _ := get(A.Token, "")
+	_, _ = call("POST", mem+"/undo", A.Token, nil, false)
+	back, now := get(A.Token, "")
+	check("a delete can be undone", code == 200 && gone == 404 && back == 200 && n(now) == float64(1),
+		fmt.Sprintf("delete %d, then %d, after undo %d n=%v", code, gone, back, n(now)))
+	probe("raw UPDATE cannot set a version", "allow", A.Token, "UPDATE swarmpg.memory SET version = 1 WHERE key = $1", k)
+	_, now = get(A.Token, "")
+	check("... the version still moves forward", now["version"] == float64(6), fmt.Sprintf("v%v", now["version"]))
+	probe("rewrite history (UPDATE)", "reject", A.Token, "UPDATE swarmpg.memory_history SET value = '{}'::jsonb")
+	probe("erase history (DELETE)", "reject", A.Token, "DELETE FROM swarmpg.memory_history")
+	probe("forge history (INSERT)", "reject", A.Token, "INSERT INTO swarmpg.memory_history(agent_id, org_id, key, version) VALUES ($1, $2, 'x', 1)", A.ID, org.ID)
+	code, _ = call("GET", mem+"/history", B.Token, nil, false)
+	check("a peer cannot read your key's history", code == 404, fmt.Sprint(code))
+	probe("a peer cannot read your history rows", "zero", B.Token, "SELECT * FROM swarmpg.memory_history WHERE agent_id = $1", A.ID)
+
+	isErr, sc, _ = tool(A.Token, "memory_put", map[string]any{"key": k, "value": map[string]any{"n": 7}, "expected_version": 2})
+	errBody, _ = sc["error"].(map[string]any)
+	check("MCP memory_put with a stale version conflicts", isErr && errBody["code"] == "version_conflict" && errBody["current_version"] == float64(6),
+		fmt.Sprintf("%v current=%v", errBody["code"], errBody["current_version"]))
+	isErr, sc, _ = tool(A.Token, "memory_history", map[string]any{"key": k})
+	hv, _ := sc["versions"].([]any)
+	check("MCP memory_history", !isErr && len(hv) == 6, fmt.Sprintf("%d versions", len(hv)))
+	isErr, sc, _ = tool(A.Token, "memory_get", map[string]any{"key": k, "version": 2})
+	v2, _ := sc["value"].(map[string]any)
+	check("MCP memory_get at a version", !isErr && v2["n"] == float64(2), fmt.Sprintf("n=%v", v2["n"]))
+	isErr, sc, _ = tool(A.Token, "memory_undo", map[string]any{"key": k, "to_version": 2, "expected_version": 6})
+	_, now = get(A.Token, "")
+	check("MCP memory_undo to a version", !isErr && sc["version"] == float64(7) && n(now) == float64(2), fmt.Sprintf("v%v n=%v", sc["version"], n(now)))
 
 	// ---- kernel probes: raw SQL as agent_runtime with the gateway bypassed
 	// entirely, then budget probes through the gateway. Only the SwarmPG
@@ -465,7 +610,7 @@ func mcpRPC(token string, modern bool, method string, params map[string]any, ext
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(req)
 	if err != nil {
 		return 0, nil
 	}

@@ -20,7 +20,7 @@ SwarmPG closes those gaps in three layers:
 | Layer | What it enforces |
 |---|---|
 | **Kernel** (`kernel/`) | The agent's identity, agent and org together, is one *sealed* value: once the gateway sets it for a transaction, no `SET`, `RESET` or `set_config()` can change either half, and role defaults or startup options cannot pre-set it. With a server secret, it must also carry the gateway's HMAC signature, so SQL alone cannot claim any identity. No query runs until an identity is sealed. Per-agent budgets live in the executor: a cost gate refuses runaway plans before they start, and a row cap bounds what a statement returns or modifies. The gateway can lower budgets per agent; the agent cannot raise them. |
-| **Schema** (`sql/schema.sql`) | Forced row-level security on every agent table; no DDL; fleet-wide levers revoked (backend signalling, other agents' in-flight SQL, advisory locks, large objects, `set_config`); an append-only, hash-chained event journal; a server-side audit log agents cannot read or write. |
+| **Schema** (`sql/schema.sql`) | Forced row-level security on every agent table; no DDL; fleet-wide levers revoked (backend signalling, other agents' in-flight SQL, advisory locks, large objects, `set_config`); versioned memory with compare-and-set writes, read-only history, reads of the past and undo; an append-only, hash-chained event journal; a server-side audit log agents cannot read or write. |
 | **Gateway** (`gateway/`) | Token auth, per-agent rate, row, byte, concurrency and time budgets, a statement guard, connection reset between agents, idempotent writes, and errors structured for an LLM to repair its own SQL. Served over a REST API and a built-in MCP endpoint. |
 
 ## Quickstart
@@ -57,11 +57,39 @@ JSON responses). Point any MCP client at it with the agent's token:
 }
 ```
 
-The agent gets five tools: `schema`, `query`, `memory_get`, `memory_put` and
-`events_append`. They run under the same identity, budgets and limits as the REST API. A
+The agent gets eight tools: `schema`, `query`, `memory_get`, `memory_put`, `memory_delete`,
+`memory_history`, `memory_undo` and `events_append`. They run under the same identity,
+budgets and limits as the REST API. A
 failed call comes back as a tool error carrying the SQLSTATE, hint and position, so the
 model can fix its SQL and retry. Protocol versions 2026-07-28, 2025-11-25, 2025-06-18 and
 2025-03-26 are supported.
+
+## Versioned memory
+
+Agents read, think (often for many seconds), then write. Holding a transaction open across
+that pause would pin a database connection, so SwarmPG makes the write itself safe instead:
+
+- Every write to a memory key gets a new version. Triggers record each one in a read-only
+  history, so this holds for writes made with raw SQL too, and an agent cannot set a version
+  or edit history.
+- `expected_version` makes a write compare-and-set: `0` creates the key only if it is
+  absent, `N` writes only if the key is still at version `N`. Otherwise nothing is written
+  and the agent gets `409 version_conflict` with the `current_version`, re-reads, and
+  retries.
+- Read any key as it was, by `version` or `as_of` a time, list its history, and undo the
+  latest change or restore any version. Undo writes a new version, so it can itself be
+  undone, and a deleted key can be brought back.
+
+```bash
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -d '{"value":{"plan":"a"},"expected_version":0}' localhost:8080/v1/memory/plan
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -d '{"value":{"plan":"b"},"expected_version":1}' localhost:8080/v1/memory/plan
+curl -s -H "Authorization: Bearer $TOKEN" "localhost:8080/v1/memory/plan?version=1"
+curl -s -X POST -H "Authorization: Bearer $TOKEN" localhost:8080/v1/memory/plan/undo
+```
+
+The same operations are SQL functions agents can call from `query`
+(`swarmpg.memory_put`, `memory_history`, `memory_as_of`, `memory_at_version`,
+`memory_undo`, `memory_delete`) and MCP tools.
 
 ## From source
 
@@ -85,7 +113,10 @@ as the agent role, **bypassing the gateway**: unsealed queries, half-set or forg
 identities, identity changes, reads of another agent's or org's rows, and attempts to
 raise a budget are all refused. 6 budget probes run through the gateway: an over-budget
 write fails as a whole, and runaway queries are refused before they run, including under
-`EXPLAIN ANALYZE` and inside `query_to_xml()`. 12 MCP probes check the `/mcp` endpoint:
+`EXPLAIN ANALYZE` and inside `query_to_xml()`. 21 memory probes check compare-and-set
+(including 20 concurrent writers at one version, of which exactly one wins), reads of the
+past, history, undo and undoing a delete, that raw SQL cannot forge a version or rewrite
+history, and that no agent can see another's history. 12 MCP probes check the `/mcp` endpoint:
 both protocol eras, token and Origin checks, every tool, and the same isolation through
 the tools. One more checks that the MCP `query` tool is held to the kernel budget. The
 official TypeScript (1.32) and Python (1.9) MCP SDKs connect and call every tool.
@@ -103,6 +134,8 @@ benchmark.
   the gateway enforces one.
 - No private DDL: agents use the shared `memory`, `documents` and `events` tables.
 - One gateway process; rate limits are in memory.
+- Memory history is kept indefinitely (no retention policy yet), and versioning, reads of
+  the past and undo cover memory only, not documents.
 - MCP is tools-only: no resources, prompts or server-sent events, and authentication uses
   agent bearer tokens rather than OAuth.
 

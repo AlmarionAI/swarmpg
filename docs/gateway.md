@@ -31,7 +31,11 @@ live in `./.pg`, which is git-ignored.
 | `POST /v1/agents/{id}/disable` | admin | kill switch |
 | `POST /v1/query {sql,params}` | agent | one statement, parameterised, row- and byte-capped, timed out |
 | `GET /v1/schema` | agent | compact schema text written for an LLM |
-| `PUT/GET /v1/memory/{key}` | agent | per-agent JSON memory (org-shareable; GET also returns an org-shared key) |
+| `PUT /v1/memory/{key} {value,shared,expected_version}` | agent | write an own key; returns its new `version`. `expected_version` makes it compare-and-set (`0` = must not exist); a stale one is `409 version_conflict` with `current_version` |
+| `GET /v1/memory/{key}[?version=N\|?as_of=RFC3339]` | agent | read a key with its `version` (live reads fall back to an org-shared key, `own: false`); `version`/`as_of` read the agent's own key as it was |
+| `DELETE /v1/memory/{key}[?expected_version=N]` | agent | delete an own key; it stays in history |
+| `GET /v1/memory/{key}/history[?limit=N]` | agent | the key's versions, newest first, including deletes |
+| `POST /v1/memory/{key}/undo {to_version,expected_version}` | agent | restore the state before the latest change, or `to_version`, as a new version |
 | `POST /v1/events {kind,payload}` | agent | hash-chained append-only journal; honours `Idempotency-Key` |
 | `POST /mcp` | agent | the same operations as MCP tools (see below) |
 
@@ -49,8 +53,11 @@ server-sent events. `GET` and `DELETE` return 405.
 |---|---|---|
 | `schema` | describes the agent's tables and the SQL rules | `GET /v1/schema` |
 | `query` `{sql, params}` | one parameterised statement, budget-capped | `POST /v1/query` |
-| `memory_get` `{key}` | own key, else an org-shared key of that name | `GET /v1/memory/{key}` |
-| `memory_put` `{key, value, shared}` | upsert an own key | `PUT /v1/memory/{key}` |
+| `memory_get` `{key, version, as_of}` | own key, else an org-shared key of that name; or an own key as it was | `GET /v1/memory/{key}` |
+| `memory_put` `{key, value, shared, expected_version}` | write an own key, optionally compare-and-set | `PUT /v1/memory/{key}` |
+| `memory_delete` `{key, expected_version}` | delete an own key | `DELETE /v1/memory/{key}` |
+| `memory_history` `{key, limit}` | the key's versions, newest first | `GET /v1/memory/{key}/history` |
+| `memory_undo` `{key, to_version, expected_version}` | undo the latest change, or restore a version | `POST /v1/memory/{key}/undo` |
 | `events_append` `{kind, payload, idempotency_key}` | append to the journal; a repeated key replays | `POST /v1/events` |
 
 - **Versions.** 2026-07-28 requests carry `io.modelcontextprotocol/protocolVersion` and

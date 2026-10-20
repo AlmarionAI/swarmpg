@@ -167,6 +167,204 @@ EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS memory_org_shared_idx ON swarmpg.memory(org_id) WHERE shared;
 
+-- Memory versions and history. Every change to a memory row bumps its version
+-- and appends the new state to swarmpg.memory_history (a delete appends a
+-- marker). Triggers do this, so writes made with raw SQL are versioned too, and
+-- no agent can choose a version or edit history. On top of that:
+--   memory_put() / memory_delete()  optimistic compare-and-set writes
+--   memory_history() / memory_as_of() / memory_at_version()  reads of the past
+--   memory_undo()  restores an earlier state as a new version (so undo can be undone)
+-- An expected_version names the live version; 0 means "the key must not exist".
+-- Conflicts raise SQLSTATE SW409, missing keys or versions SW404.
+ALTER TABLE swarmpg.memory ADD COLUMN IF NOT EXISTS version bigint NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS swarmpg.memory_history (
+  agent_id uuid NOT NULL,
+  org_id uuid NOT NULL,
+  key text NOT NULL,
+  version bigint NOT NULL,
+  value jsonb,                               -- NULL for a delete
+  shared boolean NOT NULL DEFAULT false,
+  deleted boolean NOT NULL DEFAULT false,
+  changed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (agent_id, key, version)
+);
+-- Rows written before versioning existed get their version-1 entry once.
+INSERT INTO swarmpg.memory_history(agent_id, org_id, key, version, value, shared, changed_at)
+SELECT m.agent_id, m.org_id, m.key, m.version, m.value, m.shared, m.updated_at
+FROM swarmpg.memory m
+WHERE NOT EXISTS (SELECT 1 FROM swarmpg.memory_history h WHERE h.agent_id = m.agent_id AND h.key = m.key)
+ON CONFLICT DO NOTHING;
+
+CREATE OR REPLACE FUNCTION swarmpg.memory_version() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = swarmpg, pg_catalog AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.agent_id <> OLD.agent_id OR NEW.org_id <> OLD.org_id OR NEW.key <> OLD.key THEN
+      RAISE EXCEPTION 'a memory key cannot be renamed or moved; write a new key instead'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    NEW.version := OLD.version + 1;
+  ELSE
+    -- after a delete, numbering continues past the delete marker
+    NEW.version := coalesce((SELECT max(h.version) FROM memory_history h
+                             WHERE h.agent_id = NEW.agent_id AND h.key = NEW.key), 0) + 1;
+  END IF;
+  NEW.updated_at := now();
+  RETURN NEW;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.memory_record() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = swarmpg, pg_catalog AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    INSERT INTO memory_history(agent_id, org_id, key, version, value, shared, deleted)
+    VALUES (OLD.agent_id, OLD.org_id, OLD.key, OLD.version + 1, NULL, OLD.shared, true);
+    RETURN OLD;
+  END IF;
+  INSERT INTO memory_history(agent_id, org_id, key, version, value, shared)
+  VALUES (NEW.agent_id, NEW.org_id, NEW.key, NEW.version, NEW.value, NEW.shared);
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS memory_version_trg ON swarmpg.memory;
+CREATE TRIGGER memory_version_trg BEFORE INSERT OR UPDATE ON swarmpg.memory
+  FOR EACH ROW EXECUTE FUNCTION swarmpg.memory_version();
+DROP TRIGGER IF EXISTS memory_record_trg ON swarmpg.memory;
+CREATE TRIGGER memory_record_trg AFTER INSERT OR UPDATE OR DELETE ON swarmpg.memory
+  FOR EACH ROW EXECUTE FUNCTION swarmpg.memory_record();
+
+-- The functions below run with the caller's rights, so row-level security
+-- confines every one of them to the caller's own keys.
+CREATE OR REPLACE FUNCTION swarmpg.memory_conflict(p_key text, p_expected bigint) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE cur bigint;
+BEGIN
+  SELECT m.version INTO cur FROM swarmpg.memory m
+  WHERE m.agent_id = swarmpg.current_agent() AND m.key = p_key;
+  RAISE EXCEPTION 'version conflict on memory key "%"', p_key
+    USING ERRCODE = 'SW409',
+          DETAIL = format('current_version=%s expected_version=%s', coalesce(cur, 0), p_expected),
+          HINT = 'Read the key again and retry with its current version; 0 means the key must not exist.';
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.memory_put(p_key text, p_value jsonb, p_shared boolean DEFAULT false,
+                                              p_expected_version bigint DEFAULT NULL)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE v bigint;
+BEGIN
+  IF p_expected_version IS NULL THEN
+    INSERT INTO swarmpg.memory(agent_id, org_id, key, value, shared)
+    VALUES (swarmpg.current_agent(), swarmpg.current_org(), p_key, p_value, p_shared)
+    ON CONFLICT (agent_id, key) DO UPDATE SET value = EXCLUDED.value, shared = EXCLUDED.shared
+    RETURNING version INTO v;
+  ELSIF p_expected_version = 0 THEN
+    INSERT INTO swarmpg.memory(agent_id, org_id, key, value, shared)
+    VALUES (swarmpg.current_agent(), swarmpg.current_org(), p_key, p_value, p_shared)
+    ON CONFLICT (agent_id, key) DO NOTHING
+    RETURNING version INTO v;
+  ELSE
+    -- a concurrent writer that got there first leaves no row matching the version
+    UPDATE swarmpg.memory SET value = p_value, shared = p_shared
+    WHERE agent_id = swarmpg.current_agent() AND key = p_key AND version = p_expected_version
+    RETURNING version INTO v;
+  END IF;
+  IF v IS NULL THEN
+    PERFORM swarmpg.memory_conflict(p_key, p_expected_version);
+  END IF;
+  RETURN v;
+END $$;
+
+-- Returns the version of the delete marker.
+CREATE OR REPLACE FUNCTION swarmpg.memory_delete(p_key text, p_expected_version bigint DEFAULT NULL)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE v bigint;
+BEGIN
+  DELETE FROM swarmpg.memory
+  WHERE agent_id = swarmpg.current_agent() AND key = p_key
+    AND (p_expected_version IS NULL OR version = p_expected_version)
+  RETURNING version + 1 INTO v;
+  IF v IS NULL AND p_expected_version IS NULL THEN
+    RAISE EXCEPTION 'memory key "%" not found', p_key USING ERRCODE = 'SW404';
+  END IF;
+  IF v IS NULL THEN
+    PERFORM swarmpg.memory_conflict(p_key, p_expected_version);
+  END IF;
+  RETURN v;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.memory_history(p_key text, p_limit int DEFAULT 50)
+RETURNS TABLE (version bigint, value jsonb, shared boolean, deleted boolean, changed_at timestamptz)
+LANGUAGE sql STABLE AS $$
+  SELECT h.version, h.value, h.shared, h.deleted, h.changed_at FROM swarmpg.memory_history h
+  WHERE h.agent_id = swarmpg.current_agent() AND h.key = p_key
+  ORDER BY h.version DESC LIMIT greatest(1, least(coalesce(p_limit, 50), 1000))
+$$;
+
+CREATE OR REPLACE FUNCTION swarmpg.memory_as_of(p_key text, p_at timestamptz)
+RETURNS TABLE (version bigint, value jsonb, shared boolean, deleted boolean, changed_at timestamptz)
+LANGUAGE sql STABLE AS $$
+  SELECT h.version, h.value, h.shared, h.deleted, h.changed_at FROM swarmpg.memory_history h
+  WHERE h.agent_id = swarmpg.current_agent() AND h.key = p_key AND h.changed_at <= p_at
+  ORDER BY h.version DESC LIMIT 1
+$$;
+
+CREATE OR REPLACE FUNCTION swarmpg.memory_at_version(p_key text, p_version bigint)
+RETURNS TABLE (version bigint, value jsonb, shared boolean, deleted boolean, changed_at timestamptz)
+LANGUAGE sql STABLE AS $$
+  SELECT h.version, h.value, h.shared, h.deleted, h.changed_at FROM swarmpg.memory_history h
+  WHERE h.agent_id = swarmpg.current_agent() AND h.key = p_key AND h.version = p_version
+$$;
+
+-- Restore the state before the latest change, or the state at p_to_version, as
+-- a new version. Restoring a "did not exist yet" or deleted state deletes the key.
+CREATE OR REPLACE FUNCTION swarmpg.memory_undo(p_key text, p_to_version bigint DEFAULT NULL,
+                                               p_expected_version bigint DEFAULT NULL)
+RETURNS TABLE (version bigint, restored_version bigint, deleted boolean)
+LANGUAGE plpgsql AS $$
+#variable_conflict use_column
+DECLARE
+  me uuid := swarmpg.current_agent();
+  live bigint;
+  latest bigint;
+  target swarmpg.memory_history%ROWTYPE;
+BEGIN
+  SELECT m.version INTO live FROM swarmpg.memory m WHERE m.agent_id = me AND m.key = p_key FOR UPDATE;
+  IF p_expected_version IS NOT NULL AND coalesce(live, 0) <> p_expected_version THEN
+    PERFORM swarmpg.memory_conflict(p_key, p_expected_version);
+  END IF;
+  SELECT max(h.version) INTO latest FROM swarmpg.memory_history h WHERE h.agent_id = me AND h.key = p_key;
+  IF latest IS NULL THEN
+    RAISE EXCEPTION 'memory key "%" has no history', p_key USING ERRCODE = 'SW404';
+  END IF;
+  IF p_to_version IS NULL THEN
+    SELECT h.* INTO target FROM swarmpg.memory_history h
+    WHERE h.agent_id = me AND h.key = p_key AND h.version < latest
+    ORDER BY h.version DESC LIMIT 1;
+  ELSE
+    SELECT h.* INTO target FROM swarmpg.memory_history h
+    WHERE h.agent_id = me AND h.key = p_key AND h.version = p_to_version;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'memory key "%" has no version %', p_key, p_to_version USING ERRCODE = 'SW404';
+    END IF;
+  END IF;
+
+  IF target.version IS NULL OR target.deleted THEN
+    IF live IS NULL THEN
+      RETURN QUERY SELECT latest, target.version, true;   -- already absent
+      RETURN;
+    END IF;
+    DELETE FROM swarmpg.memory m WHERE m.agent_id = me AND m.key = p_key;
+    RETURN QUERY SELECT live + 1, target.version, true;
+    RETURN;
+  END IF;
+  INSERT INTO swarmpg.memory(agent_id, org_id, key, value, shared)
+  VALUES (me, swarmpg.current_org(), p_key, target.value, target.shared)
+  ON CONFLICT (agent_id, key) DO UPDATE SET value = EXCLUDED.value, shared = EXCLUDED.shared;
+  RETURN QUERY SELECT m.version, target.version, false FROM swarmpg.memory m
+               WHERE m.agent_id = me AND m.key = p_key;
+END $$;
+
 -- General-purpose per-agent document store: the supported substitute for
 -- agent-created tables. Agents get arbitrary JSON in named collections without
 -- owning any database object, so there is nothing to leak across the pool.
@@ -279,6 +477,12 @@ CREATE POLICY memory_update ON swarmpg.memory FOR UPDATE
 CREATE POLICY memory_delete ON swarmpg.memory FOR DELETE
   USING (agent_id = swarmpg.current_agent());
 
+ALTER TABLE swarmpg.memory_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.memory_history FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS memory_history_select ON swarmpg.memory_history;
+CREATE POLICY memory_history_select ON swarmpg.memory_history FOR SELECT
+  USING (agent_id = swarmpg.current_agent());
+
 ALTER TABLE swarmpg.documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE swarmpg.documents FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS documents_isolation ON swarmpg.documents;
@@ -297,6 +501,7 @@ CREATE POLICY events_insert ON swarmpg.events FOR INSERT
   WITH CHECK (agent_id = swarmpg.current_agent() AND org_id = swarmpg.current_org());
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON swarmpg.memory TO agent_runtime;
+GRANT SELECT ON swarmpg.memory_history TO agent_runtime;   -- written only by the memory triggers
 GRANT SELECT, INSERT, UPDATE, DELETE ON swarmpg.documents TO agent_runtime;
 GRANT SELECT, INSERT ON swarmpg.events TO agent_runtime;
 GRANT USAGE, SELECT ON SEQUENCE swarmpg.events_id_seq TO agent_runtime;
