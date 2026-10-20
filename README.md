@@ -19,7 +19,7 @@ SwarmPG closes those gaps in three layers:
 
 | Layer | What it enforces |
 |---|---|
-| **Kernel** (`kernel/`) | `agent_id` is a *sealed* setting: once the gateway sets it for a transaction, no `SET`, `RESET` or `set_config()` can change it, and role defaults or startup options cannot pre-set it. With `agent_require_principal` on, the kernel refuses to run any query until an identity is sealed. |
+| **Kernel** (`kernel/`) | The agent's identity, agent and org together, is one *sealed* value: once the gateway sets it for a transaction, no `SET`, `RESET` or `set_config()` can change either half, and role defaults or startup options cannot pre-set it. With a server secret, it must also carry the gateway's HMAC signature, so SQL alone cannot claim any identity. No query runs until an identity is sealed. Per-agent budgets live in the executor: a cost gate refuses runaway plans before they start, and a row cap bounds what a statement returns or modifies. The gateway can lower budgets per agent; the agent cannot raise them. |
 | **Schema** (`sql/schema.sql`) | Forced row-level security on every agent table; no DDL; fleet-wide levers revoked (backend signalling, other agents' in-flight SQL, advisory locks, large objects, `set_config`); an append-only, hash-chained event journal; a server-side audit log agents cannot read or write. |
 | **Gateway** (`gateway/`) | Token auth, per-agent rate, row, byte, concurrency and time budgets, a statement guard, connection reset between agents, idempotent writes, and errors structured for an LLM to repair its own SQL. |
 
@@ -49,7 +49,7 @@ Needs Go 1.23+, and Postgres 14+ on `PATH` for the stock path.
 make test                         # Go vet and unit tests
 make e2e                          # stock Postgres: gateway + fleet load test + isolation probes
 make kernel && make kernel-check  # build the SwarmPG kernel and run the upstream regression suite
-make e2e KERNEL=1                 # the same end-to-end run on the kernel, plus kernel probes
+make e2e KERNEL=1                 # the same run on the kernel, plus kernel and budget probes
 ```
 
 ## What is verified
@@ -58,9 +58,12 @@ Every CI run asserts the isolation boundary. The load test drives a fleet throug
 gateway, then 27 probes attack it through the API: identity spoofing, privilege
 escalation, reading another agent's rows, DDL, pool leaks through temp tables or held
 cursors, terminating other backends, advisory locks, and reading or tampering with the
-registry, audit log and journal. On the kernel, 4 more probes connect to Postgres directly
-as the agent role, **bypassing the gateway**, and check that the kernel still refuses
-unsealed queries and identity changes.
+registry, audit log and journal. On the kernel, 11 more probes connect to Postgres directly
+as the agent role, **bypassing the gateway**: unsealed queries, half-set or forged
+identities, identity changes, reads of another agent's or org's rows, and attempts to
+raise a budget are all refused. 6 budget probes run through the gateway: an over-budget
+write fails as a whole, and runaway queries are refused before they run, including under
+`EXPLAIN ANALYZE` and inside `query_to_xml()`.
 
 A single laptop run (Apple M-series, stock Postgres 14): 2,000 agents on 32 backend
 connections, 6,120 requests/s, p99 519 ms, all probes passing. This is a smoke test, not a
@@ -68,9 +71,11 @@ benchmark.
 
 ## Known limits (v0.1)
 
-- Only `agent_id` is sealed in the kernel; `org_id` is protected by the gateway and revoked
-  functions, not sealed yet.
-- Budgets are enforced by the gateway, not yet in the executor.
+- On stock Postgres, identity and budgets depend on the gateway; the kernel is what makes
+  them hold for raw SQL.
+- The kernel row cap does not apply to SQL `FETCH` from a cursor (the gateway refuses
+  cursors; the cost budget still applies). There is no byte budget in the kernel yet;
+  the gateway enforces one.
 - No private DDL: agents use the shared `memory`, `documents` and `events` tables.
 - One gateway process; rate limits are in memory.
 

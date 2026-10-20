@@ -6,7 +6,7 @@
 --     agent cannot SET ROLE / RESET ROLE to anything more privileged.
 --   * Identity is a transaction-local setting (app.agent_id / app.org_id) the gateway
 --     establishes with SET LOCAL at the start of every transaction. On the SwarmPG
---     kernel this is the sealed `agent_id` GUC (immutable once set); on stock Postgres
+--     kernel this is the sealed `agent_principal` GUC (immutable once set); on stock Postgres
 --     the gateway's statement guard is the backstop. See DESIGN.md §7.
 --   * Agent-visible relations are tenant-scoped shared tables with FORCE ROW LEVEL
 --     SECURITY keyed on app.agent_id / app.org_id. This is DESIGN.md §1.2 "tier 1",
@@ -36,25 +36,26 @@ GRANT USAGE ON SCHEMA swarmpg TO agent_runtime;
 -- Current principal, read from the per-transaction settings the gateway sets.
 -- IMMUTABLE-ish STABLE; cast errors if the setting is not a uuid, which is a
 -- feature: a non-uuid identity cannot satisfy any policy.
--- On the SwarmPG kernel it reads only the sealed agent_id GUC, so a bare
--- SET app.agent_id from an agent changes nothing.
+-- On the SwarmPG kernel both read only the sealed agent_principal (agent and
+-- org established together), so a bare SET app.agent_id / app.org_id from an
+-- agent changes nothing.
 DO $$ BEGIN
-  IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'agent_id') THEN
+  IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'agent_principal') THEN
     CREATE OR REPLACE FUNCTION swarmpg.current_agent() RETURNS uuid
-    LANGUAGE sql STABLE AS $f$
-      SELECT NULLIF(pg_catalog.current_setting('agent_id', true), '')::uuid
-    $f$;
+    LANGUAGE sql STABLE AS $f$ SELECT pg_catalog.current_agent()::uuid $f$;
+    CREATE OR REPLACE FUNCTION swarmpg.current_org() RETURNS uuid
+    LANGUAGE sql STABLE AS $f$ SELECT pg_catalog.current_org()::uuid $f$;
   ELSE
     CREATE OR REPLACE FUNCTION swarmpg.current_agent() RETURNS uuid
     LANGUAGE sql STABLE AS $f$
       SELECT NULLIF(current_setting('app.agent_id', true), '')::uuid
     $f$;
+    CREATE OR REPLACE FUNCTION swarmpg.current_org() RETURNS uuid
+    LANGUAGE sql STABLE AS $f$
+      SELECT NULLIF(current_setting('app.org_id', true), '')::uuid
+    $f$;
   END IF;
 END $$;
-CREATE OR REPLACE FUNCTION swarmpg.current_org() RETURNS uuid
-LANGUAGE sql STABLE AS $$
-  SELECT NULLIF(current_setting('app.org_id', true), '')::uuid
-$$;
 
 -- Control-plane tables (gateway/admin only, never granted to agent_runtime).
 CREATE TABLE IF NOT EXISTS swarmpg.orgs (
@@ -74,6 +75,8 @@ CREATE TABLE IF NOT EXISTS swarmpg.agents (
   max_rows int NOT NULL DEFAULT 1000 CHECK (max_rows >= 0),
   max_result_bytes bigint NOT NULL DEFAULT 4194304 CHECK (max_result_bytes >= 0),
   max_concurrency int NOT NULL DEFAULT 4 CHECK (max_concurrency >= 0),
+  max_cost double precision NOT NULL DEFAULT 1000000 CHECK (max_cost >= 0),  -- planner cost budget (kernel only)
+
   statement_timeout_ms int NOT NULL DEFAULT 5000 CHECK (statement_timeout_ms >= 0),
   read_only boolean NOT NULL DEFAULT false,
   disabled boolean NOT NULL DEFAULT false,   -- kill switch
@@ -87,6 +90,8 @@ DO $$ BEGIN
   ALTER TABLE swarmpg.agents ADD COLUMN IF NOT EXISTS max_result_bytes bigint NOT NULL DEFAULT 4194304;
   ALTER TABLE swarmpg.agents ADD COLUMN IF NOT EXISTS max_concurrency int NOT NULL DEFAULT 4;
   ALTER TABLE swarmpg.agents ADD COLUMN IF NOT EXISTS token_expires_at timestamptz;
+  ALTER TABLE swarmpg.agents ADD COLUMN IF NOT EXISTS max_cost double precision NOT NULL DEFAULT 1000000;
+
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 
@@ -301,13 +306,16 @@ REVOKE ALL ON swarmpg.event_heads FROM PUBLIC;
 -- Defaults applied to every agent session regardless of gateway bugs.
 ALTER ROLE agent_runtime SET search_path = swarmpg;
 ALTER ROLE agent_runtime SET row_security = on;         -- cannot be a table owner, but be explicit
--- Fail-closed on the SwarmPG kernel: refuse to run any plan until a principal
--- is sealed. Harmless on stock Postgres (unknown GUC ignored with a warning;
--- remove the line there if it errors).
+-- On the SwarmPG kernel: refuse to run any plan until a principal is sealed,
+-- and cap every agent statement. The gateway lowers the budgets to each agent's
+-- own per transaction; neither it nor the agent can raise them past these
+-- ceilings. agent_max_rows also caps the rows one statement may modify.
 DO $$ BEGIN
   EXECUTE 'ALTER ROLE agent_runtime SET agent_require_principal = on';
+  EXECUTE 'ALTER ROLE agent_runtime SET agent_max_rows = 100001';
+  EXECUTE 'ALTER ROLE agent_runtime SET agent_max_cost = 1e9';
 EXCEPTION WHEN undefined_object OR syntax_error THEN
-  RAISE NOTICE 'agent_require_principal not available (stock Postgres); relying on gateway + RLS';
+  RAISE NOTICE 'SwarmPG kernel settings not available (stock Postgres); relying on gateway + RLS';
 END $$;
 
 -- ---------------------------------------------------------------------------

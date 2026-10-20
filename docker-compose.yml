@@ -1,11 +1,14 @@
 # Development quickstart: the SwarmPG kernel plus the gateway, published on localhost only.
-# Trust authentication and the default admin key make this unsuitable for anything else.
+# Trust authentication and the default admin key and principal secret make this unsuitable
+# for anything else.
 name: swarmpg
 services:
   db:
     build:
       context: .
       dockerfile: docker/kernel.Dockerfile
+    environment:
+      PRINCIPAL_SECRET: ${PRINCIPAL_SECRET:-dev-principal-secret}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -22,6 +25,7 @@ services:
     environment:
       DATABASE_URL: postgres://postgres@db:5432/swarmpg?sslmode=disable
       ADMIN_KEY: ${ADMIN_KEY:-dev-admin-key}
+      PRINCIPAL_SECRET: ${PRINCIPAL_SECRET:-dev-principal-secret}
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:

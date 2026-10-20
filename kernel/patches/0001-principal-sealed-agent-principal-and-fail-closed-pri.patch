@@ -1,0 +1,1057 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlmarionAI <150292831+AlmarionAI@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:04:53 +0100
+Subject: [PATCH 1/2] [principal] sealed agent principal and fail-closed
+ principal gate
+
+Add GUC_SEALED, a core GUC flag enforced in set_config_with_handle(): a
+sealed variable holding a value refuses every assignment and reset, and
+may only be established by the connected session itself (never by a
+role/database default, the command line, the environment or the startup
+packet).
+
+Add agent_principal, a sealed GUC carrying "agent=<id>,org=<id>" in one
+value, so agent and org are established by a single assignment and sealed
+as a group: a frontend can never leave a half-set principal for the agent
+to complete. current_agent() and current_org() expose the two fields.
+
+When agent_principal_secret (superuser-only, never accepted from a catalog
+or the startup packet) is set, the principal must also carry
+",sig=<hex HMAC-SHA256(secret, "agent=<id>,org=<id>")>", so a session that
+does not know the secret cannot establish any principal at all.
+
+Add agent_require_principal (PGC_SUSET), which makes standard_ExecutorStart
+refuse any plan while no principal is sealed. Bump MAX_GUC_FLAGS 6 -> 7 to
+match the push sites in pg_settings_get_flags. Regression test
+agent_identity.
+---
+ src/backend/executor/execMain.c              |  17 ++
+ src/backend/utils/misc/Makefile              |   1 +
+ src/backend/utils/misc/agent_principal.c     | 255 +++++++++++++++++
+ src/backend/utils/misc/guc.c                 |  70 +++++
+ src/backend/utils/misc/guc_funcs.c           |   4 +-
+ src/backend/utils/misc/guc_parameters.dat    |  36 +++
+ src/backend/utils/misc/guc_tables.c          |  12 +
+ src/backend/utils/misc/meson.build           |   1 +
+ src/include/catalog/catversion.h             |   2 +-
+ src/include/catalog/pg_proc.dat              |   6 +
+ src/include/utils/agent_principal.h          |  22 ++
+ src/include/utils/guc.h                      |   4 +
+ src/include/utils/guc_hooks.h                |   5 +
+ src/test/regress/expected/agent_identity.out | 272 +++++++++++++++++++
+ src/test/regress/parallel_schedule           |   3 +
+ src/test/regress/sql/agent_identity.sql      | 122 +++++++++
+ 16 files changed, 830 insertions(+), 2 deletions(-)
+ create mode 100644 src/backend/utils/misc/agent_principal.c
+ create mode 100644 src/include/utils/agent_principal.h
+ create mode 100644 src/test/regress/expected/agent_identity.out
+ create mode 100644 src/test/regress/sql/agent_identity.sql
+
+diff --git a/src/backend/executor/execMain.c b/src/backend/executor/execMain.c
+index 99d23be..be23640 100644
+--- a/src/backend/executor/execMain.c
++++ b/src/backend/executor/execMain.c
+@@ -60,6 +60,8 @@
+ #include "tcop/utility.h"
+ #include "utils/acl.h"
+ #include "utils/backend_status.h"
++#include "utils/agent_principal.h"
++#include "utils/guc.h"			/* SwarmPG: agent_require_principal */
+ #include "utils/lsyscache.h"
+ #include "utils/partcache.h"
+ #include "utils/rls.h"
+@@ -152,6 +154,21 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
+ 	/* caller must ensure the query's snapshot is active */
+ 	Assert(GetActiveSnapshot() == queryDesc->snapshot);
+ 
++	/*
++	 * SwarmPG: fail-closed principal check.  When agent_require_principal is on
++	 * (set per pool role, PGC_SUSET so the agent cannot clear it), no query
++	 * plan may run until the sealed agent_principal has been established for
++	 * this session or transaction.  This defends the RLS-protected data paths even
++	 * if the frontend ever hands out a backend without sealing, or an abort
++	 * clears a session-scoped seal: a subsequent unsealed read errors out
++	 * instead of returning another principal's rows.
++	 */
++	if (agent_require_principal && GetAgentPrincipalAgent() == NULL)
++		ereport(ERROR,
++				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
++				 errmsg("no agent principal established"),
++				 errdetail("agent_require_principal is on and agent_principal is not set for this session or transaction.")));
++
+ 	/*
+ 	 * If the transaction is read-only, we need to check if any writes are
+ 	 * planned to non-temporary tables.  EXPLAIN is considered read-only.
+diff --git a/src/backend/utils/misc/Makefile b/src/backend/utils/misc/Makefile
+index f142d17..7c08300 100644
+--- a/src/backend/utils/misc/Makefile
++++ b/src/backend/utils/misc/Makefile
+@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
+ override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
+ 
+ OBJS = \
++	agent_principal.o \
+ 	conffiles.o \
+ 	guc.o \
+ 	guc-file.o \
+diff --git a/src/backend/utils/misc/agent_principal.c b/src/backend/utils/misc/agent_principal.c
+new file mode 100644
+index 0000000..4051141
+--- /dev/null
++++ b/src/backend/utils/misc/agent_principal.c
+@@ -0,0 +1,255 @@
++/*-------------------------------------------------------------------------
++ *
++ * agent_principal.c
++ *	  SwarmPG: the sealed agent principal.
++ *
++ * The principal is one GUC_SEALED string, agent_principal, that names the
++ * agent and its org together:
++ *
++ *		agent=<id>,org=<id>[,sig=<hex>]
++ *
++ * Carrying both fields in one value is what seals them as a group: they are
++ * established by a single assignment and are immutable together (see the
++ * GUC_SEALED rules in guc.c), so a frontend can never leave a half-set
++ * principal for the agent to complete.  An id is 1 to 63 characters from
++ * [A-Za-z0-9_.:-], and the fields must appear in exactly this order, so the
++ * signed payload has one canonical spelling.
++ *
++ * When agent_principal_secret is set, the value must also carry
++ * sig = lowercase hex(HMAC-SHA256(secret, "agent=<id>,org=<id>")).  A session
++ * that does not know the secret then cannot establish any principal at all,
++ * even if the frontend never sealed one.  The secret is superuser-only and
++ * can only come from the server configuration or a superuser's own session.
++ *
++ * Portions Copyright (c) 2026, AlmarionAI
++ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *	  src/backend/utils/misc/agent_principal.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include "access/parallel.h"
++#include "common/hmac.h"
++#include "common/sha2.h"
++#include "fmgr.h"
++#include "utils/agent_principal.h"
++#include "utils/builtins.h"
++#include "utils/guc.h"
++#include "utils/guc_hooks.h"
++
++#define PRINCIPAL_ID_MAX	63
++#define PRINCIPAL_SIG_HEX	(PG_SHA256_DIGEST_LENGTH * 2)
++
++typedef struct AgentPrincipal
++{
++	char		agent[PRINCIPAL_ID_MAX + 1];
++	char		org[PRINCIPAL_ID_MAX + 1];
++} AgentPrincipal;
++
++/* The established principal (the GUC's "extra"), or NULL when none. */
++static const AgentPrincipal *current_principal = NULL;
++
++/*
++ * Parse "<key>=<id>" at *p into dst and advance *p past it.
++ */
++static bool
++parse_principal_field(const char **p, const char *key, char *dst)
++{
++	const char *s = *p;
++	size_t		klen = strlen(key);
++	size_t		n = 0;
++
++	if (strncmp(s, key, klen) != 0 || s[klen] != '=')
++		return false;
++	s += klen + 1;
++	while ((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') ||
++		   (*s >= '0' && *s <= '9') ||
++		   *s == '_' || *s == '.' || *s == ':' || *s == '-')
++	{
++		if (n == PRINCIPAL_ID_MAX)
++			return false;
++		dst[n++] = *s++;
++	}
++	if (n == 0)
++		return false;
++	dst[n] = '\0';
++	*p = s;
++	return true;
++}
++
++/*
++ * Does sig equal the HMAC-SHA256 of payload[0..len) under the secret?
++ * Compared in constant time; any HMAC failure counts as a mismatch.
++ */
++static bool
++principal_signature_matches(const char *payload, size_t len, const char *sig)
++{
++	pg_hmac_ctx *ctx;
++	uint8		digest[PG_SHA256_DIGEST_LENGTH];
++	char		expected[PRINCIPAL_SIG_HEX];
++	bool		ok = false;
++
++	if (strlen(sig) != PRINCIPAL_SIG_HEX)
++		return false;
++
++	ctx = pg_hmac_create(PG_SHA256);
++	if (ctx == NULL)
++		return false;
++	if (pg_hmac_init(ctx, (const uint8 *) agent_principal_secret,
++					 strlen(agent_principal_secret)) == 0 &&
++		pg_hmac_update(ctx, (const uint8 *) payload, len) == 0 &&
++		pg_hmac_final(ctx, digest, sizeof(digest)) == 0)
++	{
++		hex_encode((const char *) digest, sizeof(digest), expected);
++		ok = timingsafe_bcmp(expected, sig, PRINCIPAL_SIG_HEX) == 0;
++	}
++	pg_hmac_free(ctx);
++	explicit_bzero(digest, sizeof(digest));
++	explicit_bzero(expected, sizeof(expected));
++	return ok;
++}
++
++static bool
++principal_format_error(void)
++{
++	GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
++	GUC_check_errmsg("invalid agent principal");
++	GUC_check_errdetail("Expected \"agent=<id>,org=<id>\", optionally followed by \",sig=<hex>\". Both agent and org are required; an id is 1 to %d characters from [A-Za-z0-9_.:-].",
++						PRINCIPAL_ID_MAX);
++	return false;
++}
++
++bool
++check_agent_principal(char **newval, void **extra, GucSource source)
++{
++	AgentPrincipal parsed;
++	AgentPrincipal *result;
++	const char *p = *newval;
++	const char *payload_end;
++	const char *sig = NULL;
++	bool		have_secret;
++
++	/* Empty means "no principal"; guc.c decides when that is allowed. */
++	if (p == NULL || p[0] == '\0')
++	{
++		*extra = NULL;
++		return true;
++	}
++
++	if (!parse_principal_field(&p, "agent", parsed.agent) || *p++ != ',' ||
++		!parse_principal_field(&p, "org", parsed.org))
++		return principal_format_error();
++	payload_end = p;
++	if (strncmp(p, ",sig=", 5) == 0)
++		sig = p + 5;
++	else if (*p != '\0')
++		return principal_format_error();
++
++	/*
++	 * A parallel worker restores the leader's already-verified principal,
++	 * possibly before the secret itself has been restored, so it does not
++	 * re-verify.
++	 */
++	have_secret = agent_principal_secret != NULL && agent_principal_secret[0] != '\0';
++	if (!InitializingParallelWorker)
++	{
++		if (have_secret && sig == NULL)
++		{
++			GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
++			GUC_check_errmsg("agent principal is not signed");
++			GUC_check_errdetail("agent_principal_secret is set, so the principal must end with \",sig=<hex>\".");
++			return false;
++		}
++		if (have_secret &&
++			!principal_signature_matches(*newval, payload_end - *newval, sig))
++		{
++			GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
++			GUC_check_errmsg("invalid agent principal signature");
++			return false;
++		}
++		if (!have_secret && sig != NULL)
++		{
++			/* Fail closed: a signing frontend means the server is misconfigured. */
++			GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
++			GUC_check_errmsg("agent principal is signed but agent_principal_secret is not set");
++			return false;
++		}
++	}
++
++	result = (AgentPrincipal *) guc_malloc(LOG, sizeof(AgentPrincipal));
++	if (result == NULL)
++		return false;
++	memcpy(result, &parsed, sizeof(AgentPrincipal));
++	*extra = result;
++	return true;
++}
++
++void
++assign_agent_principal(const char *newval, void *extra)
++{
++	current_principal = (const AgentPrincipal *) extra;
++}
++
++/*
++ * The secret may only come from the server configuration (postgresql.conf,
++ * ALTER SYSTEM, the command line) or a superuser's own session: never from a
++ * per-role or per-database default, which would store it in a catalog, nor
++ * from the startup packet.
++ */
++bool
++check_agent_principal_secret(char **newval, void **extra, GucSource source)
++{
++	if (*newval == NULL || (*newval)[0] == '\0')
++		return true;
++	switch (source)
++	{
++		case PGC_S_GLOBAL:
++		case PGC_S_DATABASE:
++		case PGC_S_USER:
++		case PGC_S_DATABASE_USER:
++		case PGC_S_CLIENT:
++		case PGC_S_TEST:
++			GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
++			GUC_check_errmsg("agent_principal_secret can only be set in the server configuration");
++			return false;
++		default:
++			return true;
++	}
++}
++
++const char *
++GetAgentPrincipalAgent(void)
++{
++	return current_principal ? current_principal->agent : NULL;
++}
++
++const char *
++GetAgentPrincipalOrg(void)
++{
++	return current_principal ? current_principal->org : NULL;
++}
++
++/*
++ * current_agent() -- the agent id of the sealed principal, or NULL.
++ */
++Datum
++current_agent(PG_FUNCTION_ARGS)
++{
++	if (current_principal == NULL)
++		PG_RETURN_NULL();
++	PG_RETURN_TEXT_P(cstring_to_text(current_principal->agent));
++}
++
++/*
++ * current_org() -- the org id of the sealed principal, or NULL.
++ */
++Datum
++current_org(PG_FUNCTION_ARGS)
++{
++	if (current_principal == NULL)
++		PG_RETURN_NULL();
++	PG_RETURN_TEXT_P(cstring_to_text(current_principal->org));
++}
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 774bbc9..af44507 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -3562,6 +3562,76 @@ set_config_with_handle(const char *name, config_handle *handle,
+ 		}
+ 	}
+ 
++	/*
++	 * SwarmPG: sealing of a GUC_SEALED variable (e.g. the agent principal).
++	 *
++	 * Two rules, enforced at the single funnel that SET, SET LOCAL, RESET,
++	 * set_config() and function SET clauses all pass through:
++	 *
++	 * 1. ESTABLISHMENT.  A sealed variable may only be *established* by the
++	 *    connected session itself (PGC_S_SESSION, i.e. an explicit SET from the
++	 *    frontend), by the forced-default path (PGC_S_DEFAULT/PGC_S_OVERRIDE),
++	 *    or by parallel/background-worker state restore (is_reload, which copies
++	 *    the leader's already-sealed value).  Every non-interactive source is
++	 *    refused: per-role and per-database defaults (ALTER ROLE/DATABASE SET,
++	 *    sources PGC_S_GLOBAL..PGC_S_DATABASE_USER), the postmaster command line
++	 *    and environment (PGC_S_ARGV/PGC_S_ENV_VAR), and the startup packet /
++	 *    PGOPTIONS (PGC_S_CLIENT).  This stops an operator or a poisoned role
++	 *    default from pre-sealing every pooled connection, which would both lock
++	 *    the frontend out and let it run every agent under one forced identity.
++	 *    (GUC_DISALLOW_IN_FILE already covers postgresql.conf / ALTER SYSTEM.)
++	 *
++	 * 2. IMMUTABILITY.  Once it holds a non-empty value, no assignment, reset or
++	 *    save of any kind succeeds; only the GUC stack unwinding at the end of a
++	 *    SET LOCAL scope or function-call scope (which does not pass through
++	 *    here) can clear it.  This is what makes the identity trustworthy against
++	 *    arbitrary SQL issued by the agent in the same session or transaction.
++	 *
++	 * changeVal == false means this is a validation-only probe (PGC_S_TEST,
++	 * e.g. checking an ALTER ROLE ... SET clause at definition time, or the
++	 * two-pass assignment of a value).  We still reject establishment from a
++	 * disallowed source so the error surfaces at definition time, but we do not
++	 * raise the "already sealed" immutability error on a mere probe, which would
++	 * otherwise make ALTER ... RESET and routine re-validation fail confusingly.
++	 *
++	 * Only string variables support sealing for now; a non-string GUC_SEALED
++	 * variable is a programming error, so flag it in assert builds.
++	 */
++	if (record->flags & GUC_SEALED)
++	{
++		const char *cur;
++
++		Assert(record->vartype == PGC_STRING);
++
++		/* Rule 1: restrict who may establish the seal. */
++		if (changeVal && value != NULL && value[0] != '\0' &&
++			source != PGC_S_SESSION &&
++			source != PGC_S_DEFAULT &&
++			source != PGC_S_OVERRIDE &&
++			!is_reload)
++		{
++			ereport(elevel,
++					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
++					 errmsg("sealed parameter \"%s\" can only be set by the session itself",
++							record->name),
++					 errdetail("It cannot be set from a role or database default, the server command line, the environment, or the startup packet.")));
++			return 0;
++		}
++
++		/* Rule 2: once established, it is immutable for its scope. */
++		cur = (record->vartype == PGC_STRING) ? *record->_string.variable : NULL;
++		if (changeVal && cur != NULL && cur[0] != '\0')
++		{
++			ereport(elevel,
++					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
++					 errmsg("parameter \"%s\" is sealed and cannot be changed or reset",
++							record->name),
++					 errdetail("It is already set to \"%s\" for this session or transaction.",
++							   cur)));
++			return 0;
++		}
++	}
++
+ 	/* Disallow resetting and saving GUC_NO_RESET values */
+ 	if (record->flags & GUC_NO_RESET)
+ 	{
+diff --git a/src/backend/utils/misc/guc_funcs.c b/src/backend/utils/misc/guc_funcs.c
+index e2c2919..da81703 100644
+--- a/src/backend/utils/misc/guc_funcs.c
++++ b/src/backend/utils/misc/guc_funcs.c
+@@ -572,7 +572,7 @@ ShowAllGUCConfig(DestReceiver *dest)
+ Datum
+ pg_settings_get_flags(PG_FUNCTION_ARGS)
+ {
+-#define MAX_GUC_FLAGS	6
++#define MAX_GUC_FLAGS	7		/* SwarmPG: +1 for GUC_SEALED */
+ 	char	   *varname = TextDatumGetCString(PG_GETARG_DATUM(0));
+ 	struct config_generic *record;
+ 	int			cnt = 0;
+@@ -591,6 +591,8 @@ pg_settings_get_flags(PG_FUNCTION_ARGS)
+ 		flags[cnt++] = CStringGetTextDatum("NO_RESET");
+ 	if (record->flags & GUC_NO_RESET_ALL)
+ 		flags[cnt++] = CStringGetTextDatum("NO_RESET_ALL");
++	if (record->flags & GUC_SEALED)
++		flags[cnt++] = CStringGetTextDatum("SEALED");
+ 	if (record->flags & GUC_NO_SHOW_ALL)
+ 		flags[cnt++] = CStringGetTextDatum("NO_SHOW_ALL");
+ 	if (record->flags & GUC_NOT_IN_SAMPLE)
+diff --git a/src/backend/utils/misc/guc_parameters.dat b/src/backend/utils/misc/guc_parameters.dat
+index e41bd33..cd87fbe 100644
+--- a/src/backend/utils/misc/guc_parameters.dat
++++ b/src/backend/utils/misc/guc_parameters.dat
+@@ -36,6 +36,42 @@
+ # This setting itself cannot be set by ALTER SYSTEM to avoid an
+ # operator turning this setting off by using ALTER SYSTEM, without a
+ # way to turn it back on.
++# SwarmPG: the sealed agent principal, "agent=<id>,org=<id>[,sig=<hex>]".
++# Agent and org are established by one assignment and sealed together.
++{ name => 'agent_principal', type => 'string', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
++  short_desc => 'Sets the sealed agent principal (agent and org) for this session or transaction.',
++  long_desc => 'Format agent=<id>,org=<id>, plus ,sig=<hex> when agent_principal_secret is set. Can only be set while empty; once set it cannot be changed or reset until the enclosing SET LOCAL scope ends.',
++  flags => 'GUC_SEALED | GUC_NO_RESET_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE | GUC_NOT_WHILE_SEC_REST',
++  variable => 'agent_principal_string',
++  boot_val => '""',
++  check_hook => 'check_agent_principal',
++  assign_hook => 'assign_agent_principal',
++},
++
++# SwarmPG: HMAC-SHA256 key that agent_principal values must be signed with.
++# Superuser-only; never accepted from a role/database default or the startup
++# packet, so it is never stored in a catalog.
++{ name => 'agent_principal_secret', type => 'string', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
++  short_desc => 'Sets the key that agent principals must be signed with.',
++  long_desc => 'When set, agent_principal must carry sig = hex(HMAC-SHA256(key, "agent=<id>,org=<id>")). Empty means principals are not signed.',
++  flags => 'GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL | GUC_NO_RESET_ALL | GUC_NOT_IN_SAMPLE',
++  variable => 'agent_principal_secret',
++  boot_val => '""',
++  check_hook => 'check_agent_principal_secret',
++},
++
++# SwarmPG: fail-closed switch.  When on, a backend refuses to execute a query
++# plan unless a principal (agent_principal) has been established.  PGC_SUSET so an
++# agent connected as a non-superuser cannot clear it; set it per pool role with
++# ALTER ROLE <role> SET agent_require_principal = on.
++{ name => 'agent_require_principal', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
++  short_desc => 'Refuse to execute queries until an agent principal is established.',
++  long_desc => 'When on, any query plan execution errors out while current_agent() is NULL. Intended for pooled backends that run untrusted agent SQL.',
++  flags => 'GUC_NO_RESET_ALL | GUC_NOT_IN_SAMPLE',
++  variable => 'agent_require_principal',
++  boot_val => 'false',
++},
++
+ { name => 'allow_alter_system', type => 'bool', context => 'PGC_SIGHUP', group => 'COMPAT_OPTIONS_OTHER',
+   short_desc => 'Allows running the ALTER SYSTEM command.',
+   long_desc => 'Can be set to off for environments where global configuration changes should be made using a different method.',
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 463ca19..f6bbea3 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -666,6 +666,18 @@ static char *recovery_target_lsn_string;
+ /* should be static, but commands/variable.c needs to get at this */
+ char	   *role_string;
+ 
++/* SwarmPG: sealed agent principal; parsed by utils/misc/agent_principal.c */
++char	   *agent_principal_string;
++char	   *agent_principal_secret;
++
++/*
++ * SwarmPG: when true, a backend refuses to execute a query plan unless a
++ * principal (agent_principal) is established.  PGC_SUSET so an agent running as a
++ * non-superuser cannot turn it off; set it with ALTER ROLE <pool role> SET
++ * agent_require_principal = on so every pooled backend is fail-closed.
++ */
++bool		agent_require_principal = false;
++
+ /* should be static, but guc.c needs to get at this */
+ bool		in_hot_standby_guc;
+ 
+diff --git a/src/backend/utils/misc/meson.build b/src/backend/utils/misc/meson.build
+index 232e74d..94a8da8 100644
+--- a/src/backend/utils/misc/meson.build
++++ b/src/backend/utils/misc/meson.build
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2022-2026, PostgreSQL Global Development Group
+ 
+ backend_sources += files(
++  'agent_principal.c',
+   'conffiles.c',
+   'guc.c',
+   'guc_funcs.c',
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 9b6ef64..8837280 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -57,6 +57,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202610061
++#define CATALOG_VERSION_NO	202610202
+ 
+ #endif
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index 92f2907..1cfc19e 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -1601,6 +1601,12 @@
+ { oid => '745', descr => 'current user name',
+   proname => 'current_user', provolatile => 's', prorettype => 'name',
+   proargtypes => '', prosrc => 'current_user' },
++{ oid => '8520', descr => 'agent id of the sealed agent principal, or NULL',
++  proname => 'current_agent', provolatile => 's', proisstrict => 'f',
++  prorettype => 'text', proargtypes => '', prosrc => 'current_agent' },
++{ oid => '8521', descr => 'org id of the sealed agent principal, or NULL',
++  proname => 'current_org', provolatile => 's', proisstrict => 'f',
++  prorettype => 'text', proargtypes => '', prosrc => 'current_org' },
+ { oid => '746', descr => 'session user name',
+   proname => 'session_user', provolatile => 's', prorettype => 'name',
+   proargtypes => '', prosrc => 'session_user' },
+diff --git a/src/include/utils/agent_principal.h b/src/include/utils/agent_principal.h
+new file mode 100644
+index 0000000..ec82f4a
+--- /dev/null
++++ b/src/include/utils/agent_principal.h
+@@ -0,0 +1,22 @@
++/*-------------------------------------------------------------------------
++ *
++ * agent_principal.h
++ *	  SwarmPG: the sealed agent principal (agent and org, established together).
++ *
++ * Portions Copyright (c) 2026, AlmarionAI
++ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
++ *
++ * src/include/utils/agent_principal.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef AGENT_PRINCIPAL_H
++#define AGENT_PRINCIPAL_H
++
++/* The agent id of the established principal, or NULL when none is sealed. */
++extern const char *GetAgentPrincipalAgent(void);
++
++/* The org id of the established principal, or NULL when none is sealed. */
++extern const char *GetAgentPrincipalOrg(void);
++
++#endif							/* AGENT_PRINCIPAL_H */
+diff --git a/src/include/utils/guc.h b/src/include/utils/guc.h
+index dc406d6..c2cf312 100644
+--- a/src/include/utils/guc.h
++++ b/src/include/utils/guc.h
+@@ -228,6 +228,7 @@ typedef enum
+ 							   0x002000 /* can't set in PG_AUTOCONF_FILENAME */
+ #define GUC_RUNTIME_COMPUTED   0x004000 /* delay processing in 'postgres -C' */
+ #define GUC_ALLOW_IN_PARALLEL  0x008000 /* allow setting in parallel mode */
++#define GUC_SEALED			   0x010000 /* SwarmPG: once non-empty, cannot be set or reset */
+ 
+ #define GUC_UNIT_KB			 0x01000000 /* value is in kilobytes */
+ #define GUC_UNIT_BLOCKS		 0x02000000 /* value is in blocks */
+@@ -323,6 +324,9 @@ extern PGDLLIMPORT int tcp_keepalives_count;
+ extern PGDLLIMPORT int tcp_user_timeout;
+ 
+ extern PGDLLIMPORT char *role_string;
++extern PGDLLIMPORT char *agent_principal_string;
++extern PGDLLIMPORT char *agent_principal_secret;
++extern PGDLLIMPORT bool agent_require_principal;
+ extern PGDLLIMPORT bool in_hot_standby_guc;
+ extern PGDLLIMPORT bool trace_sort;
+ 
+diff --git a/src/include/utils/guc_hooks.h b/src/include/utils/guc_hooks.h
+index 307f4fb..d7bba6f 100644
+--- a/src/include/utils/guc_hooks.h
++++ b/src/include/utils/guc_hooks.h
+@@ -119,6 +119,11 @@ extern void assign_recovery_target_timeline(const char *newval, void *extra);
+ extern bool check_recovery_target_xid(char **newval, void **extra,
+ 									  GucSource source);
+ extern void assign_recovery_target_xid(const char *newval, void *extra);
++extern bool check_agent_principal(char **newval, void **extra,
++								  GucSource source);
++extern void assign_agent_principal(const char *newval, void *extra);
++extern bool check_agent_principal_secret(char **newval, void **extra,
++										 GucSource source);
+ extern bool check_role(char **newval, void **extra, GucSource source);
+ extern void assign_role(const char *newval, void *extra);
+ extern const char *show_role(void);
+diff --git a/src/test/regress/expected/agent_identity.out b/src/test/regress/expected/agent_identity.out
+new file mode 100644
+index 0000000..454a9c9
+--- /dev/null
++++ b/src/test/regress/expected/agent_identity.out
+@@ -0,0 +1,272 @@
++--
++-- SwarmPG: sealed agent principal (agent_principal GUC with GUC_SEALED,
++-- current_agent(), current_org())
++--
++SHOW agent_principal;
++ agent_principal 
++-----------------
++ 
++(1 row)
++
++SELECT current_agent() IS NULL AND current_org() IS NULL AS unset;
++ unset 
++-------
++ t
++(1 row)
++
++SELECT 'SEALED' = ANY(pg_settings_get_flags('agent_principal')) AS sealed_flag;
++ sealed_flag 
++-------------
++ t
++(1 row)
++
++-- a function SET clause is validated at creation, so create it while unsealed
++CREATE FUNCTION agent_identity_fn() RETURNS text LANGUAGE sql
++  SET agent_principal = 'agent=fn,org=fn-org' AS 'SELECT current_agent()';
++-- agent and org are one value: a half-set or malformed principal is refused
++SET agent_principal = 'agent=agent-A';                 -- fails: org missing
++ERROR:  invalid agent principal
++DETAIL:  Expected "agent=<id>,org=<id>", optionally followed by ",sig=<hex>". Both agent and org are required; an id is 1 to 63 characters from [A-Za-z0-9_.:-].
++SET agent_principal = 'org=org-1';                     -- fails: agent missing
++ERROR:  invalid agent principal
++DETAIL:  Expected "agent=<id>,org=<id>", optionally followed by ",sig=<hex>". Both agent and org are required; an id is 1 to 63 characters from [A-Za-z0-9_.:-].
++SET agent_principal = 'org=org-1,agent=agent-A';       -- fails: wrong order
++ERROR:  invalid agent principal
++DETAIL:  Expected "agent=<id>,org=<id>", optionally followed by ",sig=<hex>". Both agent and org are required; an id is 1 to 63 characters from [A-Za-z0-9_.:-].
++SET agent_principal = 'agent=agent-A,org=';            -- fails: empty org
++ERROR:  invalid agent principal
++DETAIL:  Expected "agent=<id>,org=<id>", optionally followed by ",sig=<hex>". Both agent and org are required; an id is 1 to 63 characters from [A-Za-z0-9_.:-].
++SET agent_principal = 'agent=agent A,org=org-1';       -- fails: bad character
++ERROR:  invalid agent principal
++DETAIL:  Expected "agent=<id>,org=<id>", optionally followed by ",sig=<hex>". Both agent and org are required; an id is 1 to 63 characters from [A-Za-z0-9_.:-].
++SET agent_principal = 'agent=agent-A,org=org-1,x=1';   -- fails: unknown field
++ERROR:  invalid agent principal
++DETAIL:  Expected "agent=<id>,org=<id>", optionally followed by ",sig=<hex>". Both agent and org are required; an id is 1 to 63 characters from [A-Za-z0-9_.:-].
++SET agent_principal = 'agent=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,org=o';  -- fails: id too long
++ERROR:  invalid agent principal
++DETAIL:  Expected "agent=<id>,org=<id>", optionally followed by ",sig=<hex>". Both agent and org are required; an id is 1 to 63 characters from [A-Za-z0-9_.:-].
++SET agent_principal = 'agent=agent-A,org=org-1,sig=00';  -- fails: signed, but no secret is set
++ERROR:  agent principal is signed but agent_principal_secret is not set
++SELECT current_agent() IS NULL AS still_unset;
++ still_unset 
++-------------
++ t
++(1 row)
++
++-- session-level seal: nothing may change or clear it, nor either half of it
++SET agent_principal = 'agent=agent-A,org=org-1';
++SHOW agent_principal;
++     agent_principal     
++-------------------------
++ agent=agent-A,org=org-1
++(1 row)
++
++SELECT current_agent(), current_org();
++ current_agent | current_org 
++---------------+-------------
++ agent-A       | org-1
++(1 row)
++
++SET agent_principal = 'agent=agent-A,org=org-1';    -- fails: even an identical re-assignment is refused
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=agent-A,org=org-1" for this session or transaction.
++SET agent_principal = 'agent=agent-A,org=org-2';    -- fails: the org cannot be changed
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=agent-A,org=org-1" for this session or transaction.
++SET agent_principal = 'agent=agent-B,org=org-1';    -- fails
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=agent-A,org=org-1" for this session or transaction.
++RESET agent_principal;                              -- fails
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=agent-A,org=org-1" for this session or transaction.
++SELECT set_config('agent_principal', 'agent=agent-C,org=org-1', false);  -- fails
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=agent-A,org=org-1" for this session or transaction.
++SELECT set_config('agent_principal', 'agent=agent-C,org=org-1', true);   -- fails
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=agent-A,org=org-1" for this session or transaction.
++DO $$ BEGIN PERFORM set_config('agent_principal', 'agent=agent-D,org=org-1', true); END $$;  -- fails
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=agent-A,org=org-1" for this session or transaction.
++CONTEXT:  SQL statement "SELECT set_config('agent_principal', 'agent=agent-D,org=org-1', true)"
++PL/pgSQL function inline_code_block line 1 at PERFORM
++RESET ALL;                         -- skips agent_principal (GUC_NO_RESET_ALL)
++DISCARD ALL;                       -- likewise
++SHOW agent_principal;
++     agent_principal     
++-------------------------
++ agent=agent-A,org=org-1
++(1 row)
++
++-- a function SET clause is a SAVE action and is refused while sealed
++SELECT agent_identity_fn();        -- fails
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=agent-A,org=org-1" for this session or transaction.
++SELECT current_agent(), current_org();
++ current_agent | current_org 
++---------------+-------------
++ agent-A       | org-1
++(1 row)
++
++-- transaction-local seal reverts at commit and abort through the GUC stack
++\c
++SHOW agent_principal;
++ agent_principal 
++-----------------
++ 
++(1 row)
++
++BEGIN;
++SET LOCAL agent_principal = 'agent=txn-1,org=org-1';
++SELECT current_agent(), current_org();
++ current_agent | current_org 
++---------------+-------------
++ txn-1         | org-1
++(1 row)
++
++SAVEPOINT s;
++SET LOCAL agent_principal = 'agent=txn-1,org=org-2';   -- fails: sealed within the transaction
++ERROR:  parameter "agent_principal" is sealed and cannot be changed or reset
++DETAIL:  It is already set to "agent=txn-1,org=org-1" for this session or transaction.
++ROLLBACK TO s;
++SELECT current_agent(), current_org();
++ current_agent | current_org 
++---------------+-------------
++ txn-1         | org-1
++(1 row)
++
++COMMIT;
++SELECT current_agent() IS NULL AND current_org() IS NULL AS unset_after_commit;
++ unset_after_commit 
++--------------------
++ t
++(1 row)
++
++BEGIN;
++SET LOCAL agent_principal = 'agent=txn-3,org=org-1';
++SELECT current_agent();
++ current_agent 
++---------------
++ txn-3
++(1 row)
++
++ROLLBACK;
++SELECT current_agent() IS NULL AS unset_after_rollback;
++ unset_after_rollback 
++----------------------
++ t
++(1 row)
++
++-- after a transaction-local seal ends, a new principal may be established
++BEGIN;
++SET LOCAL agent_principal = 'agent=txn-4,org=org-4';
++SELECT current_agent(), current_org();
++ current_agent | current_org 
++---------------+-------------
++ txn-4         | org-4
++(1 row)
++
++COMMIT;
++-- a function SET clause while unsealed applies for the call only
++SELECT agent_identity_fn();
++ agent_identity_fn 
++-------------------
++ fn
++(1 row)
++
++SELECT current_agent() IS NULL AS unset_after_fn;
++ unset_after_fn 
++----------------
++ t
++(1 row)
++
++DROP FUNCTION agent_identity_fn();
++-- not settable from a configuration file
++ALTER SYSTEM SET agent_principal = 'agent=x,org=y';
++ERROR:  parameter "agent_principal" cannot be changed
++-- a sealed parameter may only be ESTABLISHED by the session itself. A per-role
++-- default can be STORED (ALTER ROLE ... SET is not validated against the live
++-- value), but it is refused when a session tries to APPLY it at connect, so the
++-- session starts unsealed and the pool cannot be pre-sealed out from under the
++-- frontend.
++CREATE ROLE regress_agent_seal;
++ALTER ROLE regress_agent_seal SET agent_principal = 'agent=from-role,org=o';   -- stored, inert
++DROP ROLE regress_agent_seal;
++-- pg_settings_get_flags reports SEALED alongside the other flags without
++-- overrunning its fixed-size array (regression guard for MAX_GUC_FLAGS).
++SELECT array_length(pg_settings_get_flags('agent_principal'), 1) AS nflags;
++ nflags 
++--------
++      3
++(1 row)
++
++SELECT 'SEALED' = ANY(pg_settings_get_flags('agent_principal')) AS has_sealed;
++ has_sealed 
++------------
++ t
++(1 row)
++
++-- signed principals: with agent_principal_secret set, only a principal that
++-- carries a valid HMAC-SHA256 signature can be established
++SET agent_principal_secret = 'regress-secret';
++BEGIN;
++SET LOCAL agent_principal = 'agent=agent-S,org=org-S';   -- fails: not signed
++ERROR:  agent principal is not signed
++DETAIL:  agent_principal_secret is set, so the principal must end with ",sig=<hex>".
++ROLLBACK;
++BEGIN;
++-- fails: the signature of agent-T presented for agent-S
++SET LOCAL agent_principal = 'agent=agent-S,org=org-S,sig=7454eebe5c87b3851d49a2764a7e536be558937711190a043c00847965cc832b';
++ERROR:  invalid agent principal signature
++ROLLBACK;
++BEGIN;
++SET LOCAL agent_principal = 'agent=agent-S,org=org-S,sig=6CD17AB9638807239E2249313D4AC5B1287CEF0AC312211676407EA010BEC4DD';  -- fails: uppercase hex
++ERROR:  invalid agent principal signature
++ROLLBACK;
++BEGIN;
++SET LOCAL agent_principal = 'agent=agent-S,org=org-S,sig=6cd17ab9638807239e2249313d4ac5b1287cef0ac312211676407ea010bec4dd';
++SELECT current_agent(), current_org();
++ current_agent | current_org 
++---------------+-------------
++ agent-S       | org-S
++(1 row)
++
++COMMIT;
++RESET agent_principal_secret;
++-- the secret is superuser-only and never stored in a catalog
++CREATE ROLE regress_agent_nosu;
++ALTER ROLE regress_agent_nosu SET agent_principal_secret = 'k';  -- fails: catalog source
++ERROR:  agent_principal_secret can only be set in the server configuration
++SET ROLE regress_agent_nosu;
++SHOW agent_principal_secret;           -- fails: superuser only
++ERROR:  permission denied to examine "agent_principal_secret"
++DETAIL:  Only roles with privileges of the "pg_read_all_settings" role may examine this parameter.
++SET agent_principal_secret = 'k';      -- fails: permission denied
++ERROR:  permission denied to set parameter "agent_principal_secret"
++RESET ROLE;
++DROP ROLE regress_agent_nosu;
++-- fail-closed mode: with agent_require_principal on and no principal, query
++-- execution is refused; establishing the principal unblocks it.
++SET agent_require_principal = on;
++SELECT 1 AS blocked;                 -- fails: no agent principal established
++ERROR:  no agent principal established
++DETAIL:  agent_require_principal is on and agent_principal is not set for this session or transaction.
++BEGIN;
++SET LOCAL agent_principal = 'agent=txn-rp,org=org-rp';
++SELECT 1 AS allowed_with_principal;  -- succeeds inside the sealed scope
++ allowed_with_principal 
++------------------------
++                      1
++(1 row)
++
++COMMIT;
++SELECT 1 AS blocked_again;           -- fails again after the scope ends
++ERROR:  no agent principal established
++DETAIL:  agent_require_principal is on and agent_principal is not set for this session or transaction.
++SET agent_require_principal = off;
++SELECT 1 AS allowed_after_off;
++ allowed_after_off 
++-------------------
++                 1
++(1 row)
++
+diff --git a/src/test/regress/parallel_schedule b/src/test/regress/parallel_schedule
+index 75063f8..1a6fafe 100644
+--- a/src/test/regress/parallel_schedule
++++ b/src/test/regress/parallel_schedule
+@@ -143,6 +143,9 @@ test: event_trigger_login
+ # this test also uses event triggers, so likewise run it by itself
+ test: fast_default
+ 
++# SwarmPG: sealed agent principal; reconnects, so run it by itself
++test: agent_identity
++
+ # run tablespace test at the end because it drops the tablespace created during
+ # setup that other tests may use.
+ test: tablespace
+diff --git a/src/test/regress/sql/agent_identity.sql b/src/test/regress/sql/agent_identity.sql
+new file mode 100644
+index 0000000..f86cf98
+--- /dev/null
++++ b/src/test/regress/sql/agent_identity.sql
+@@ -0,0 +1,122 @@
++--
++-- SwarmPG: sealed agent principal (agent_principal GUC with GUC_SEALED,
++-- current_agent(), current_org())
++--
++SHOW agent_principal;
++SELECT current_agent() IS NULL AND current_org() IS NULL AS unset;
++SELECT 'SEALED' = ANY(pg_settings_get_flags('agent_principal')) AS sealed_flag;
++-- a function SET clause is validated at creation, so create it while unsealed
++CREATE FUNCTION agent_identity_fn() RETURNS text LANGUAGE sql
++  SET agent_principal = 'agent=fn,org=fn-org' AS 'SELECT current_agent()';
++
++-- agent and org are one value: a half-set or malformed principal is refused
++SET agent_principal = 'agent=agent-A';                 -- fails: org missing
++SET agent_principal = 'org=org-1';                     -- fails: agent missing
++SET agent_principal = 'org=org-1,agent=agent-A';       -- fails: wrong order
++SET agent_principal = 'agent=agent-A,org=';            -- fails: empty org
++SET agent_principal = 'agent=agent A,org=org-1';       -- fails: bad character
++SET agent_principal = 'agent=agent-A,org=org-1,x=1';   -- fails: unknown field
++SET agent_principal = 'agent=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,org=o';  -- fails: id too long
++SET agent_principal = 'agent=agent-A,org=org-1,sig=00';  -- fails: signed, but no secret is set
++SELECT current_agent() IS NULL AS still_unset;
++
++-- session-level seal: nothing may change or clear it, nor either half of it
++SET agent_principal = 'agent=agent-A,org=org-1';
++SHOW agent_principal;
++SELECT current_agent(), current_org();
++SET agent_principal = 'agent=agent-A,org=org-1';    -- fails: even an identical re-assignment is refused
++SET agent_principal = 'agent=agent-A,org=org-2';    -- fails: the org cannot be changed
++SET agent_principal = 'agent=agent-B,org=org-1';    -- fails
++RESET agent_principal;                              -- fails
++SELECT set_config('agent_principal', 'agent=agent-C,org=org-1', false);  -- fails
++SELECT set_config('agent_principal', 'agent=agent-C,org=org-1', true);   -- fails
++DO $$ BEGIN PERFORM set_config('agent_principal', 'agent=agent-D,org=org-1', true); END $$;  -- fails
++RESET ALL;                         -- skips agent_principal (GUC_NO_RESET_ALL)
++DISCARD ALL;                       -- likewise
++SHOW agent_principal;
++-- a function SET clause is a SAVE action and is refused while sealed
++SELECT agent_identity_fn();        -- fails
++SELECT current_agent(), current_org();
++
++-- transaction-local seal reverts at commit and abort through the GUC stack
++\c
++SHOW agent_principal;
++BEGIN;
++SET LOCAL agent_principal = 'agent=txn-1,org=org-1';
++SELECT current_agent(), current_org();
++SAVEPOINT s;
++SET LOCAL agent_principal = 'agent=txn-1,org=org-2';   -- fails: sealed within the transaction
++ROLLBACK TO s;
++SELECT current_agent(), current_org();
++COMMIT;
++SELECT current_agent() IS NULL AND current_org() IS NULL AS unset_after_commit;
++BEGIN;
++SET LOCAL agent_principal = 'agent=txn-3,org=org-1';
++SELECT current_agent();
++ROLLBACK;
++SELECT current_agent() IS NULL AS unset_after_rollback;
++-- after a transaction-local seal ends, a new principal may be established
++BEGIN;
++SET LOCAL agent_principal = 'agent=txn-4,org=org-4';
++SELECT current_agent(), current_org();
++COMMIT;
++-- a function SET clause while unsealed applies for the call only
++SELECT agent_identity_fn();
++SELECT current_agent() IS NULL AS unset_after_fn;
++DROP FUNCTION agent_identity_fn();
++-- not settable from a configuration file
++ALTER SYSTEM SET agent_principal = 'agent=x,org=y';
++
++-- a sealed parameter may only be ESTABLISHED by the session itself. A per-role
++-- default can be STORED (ALTER ROLE ... SET is not validated against the live
++-- value), but it is refused when a session tries to APPLY it at connect, so the
++-- session starts unsealed and the pool cannot be pre-sealed out from under the
++-- frontend.
++CREATE ROLE regress_agent_seal;
++ALTER ROLE regress_agent_seal SET agent_principal = 'agent=from-role,org=o';   -- stored, inert
++DROP ROLE regress_agent_seal;
++
++-- pg_settings_get_flags reports SEALED alongside the other flags without
++-- overrunning its fixed-size array (regression guard for MAX_GUC_FLAGS).
++SELECT array_length(pg_settings_get_flags('agent_principal'), 1) AS nflags;
++SELECT 'SEALED' = ANY(pg_settings_get_flags('agent_principal')) AS has_sealed;
++
++-- signed principals: with agent_principal_secret set, only a principal that
++-- carries a valid HMAC-SHA256 signature can be established
++SET agent_principal_secret = 'regress-secret';
++BEGIN;
++SET LOCAL agent_principal = 'agent=agent-S,org=org-S';   -- fails: not signed
++ROLLBACK;
++BEGIN;
++-- fails: the signature of agent-T presented for agent-S
++SET LOCAL agent_principal = 'agent=agent-S,org=org-S,sig=7454eebe5c87b3851d49a2764a7e536be558937711190a043c00847965cc832b';
++ROLLBACK;
++BEGIN;
++SET LOCAL agent_principal = 'agent=agent-S,org=org-S,sig=6CD17AB9638807239E2249313D4AC5B1287CEF0AC312211676407EA010BEC4DD';  -- fails: uppercase hex
++ROLLBACK;
++BEGIN;
++SET LOCAL agent_principal = 'agent=agent-S,org=org-S,sig=6cd17ab9638807239e2249313d4ac5b1287cef0ac312211676407ea010bec4dd';
++SELECT current_agent(), current_org();
++COMMIT;
++RESET agent_principal_secret;
++
++-- the secret is superuser-only and never stored in a catalog
++CREATE ROLE regress_agent_nosu;
++ALTER ROLE regress_agent_nosu SET agent_principal_secret = 'k';  -- fails: catalog source
++SET ROLE regress_agent_nosu;
++SHOW agent_principal_secret;           -- fails: superuser only
++SET agent_principal_secret = 'k';      -- fails: permission denied
++RESET ROLE;
++DROP ROLE regress_agent_nosu;
++
++-- fail-closed mode: with agent_require_principal on and no principal, query
++-- execution is refused; establishing the principal unblocks it.
++SET agent_require_principal = on;
++SELECT 1 AS blocked;                 -- fails: no agent principal established
++BEGIN;
++SET LOCAL agent_principal = 'agent=txn-rp,org=org-rp';
++SELECT 1 AS allowed_with_principal;  -- succeeds inside the sealed scope
++COMMIT;
++SELECT 1 AS blocked_again;           -- fails again after the scope ends
++SET agent_require_principal = off;
++SELECT 1 AS allowed_after_off;

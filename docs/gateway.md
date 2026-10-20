@@ -27,7 +27,7 @@ live in `./.pg`, which is git-ignored.
 | Call | Auth | Purpose |
 |---|---|---|
 | `POST /v1/orgs {name}` | admin | create an org |
-| `POST /v1/agents {org_id,name,rps_limit,max_rows,max_result_bytes,max_concurrency,statement_timeout_ms,read_only,ttl_seconds}` | admin | mint an agent + token (TTL optional) |
+| `POST /v1/agents {org_id,name,rps_limit,max_rows,max_result_bytes,max_concurrency,max_cost,statement_timeout_ms,read_only,ttl_seconds}` | admin | mint an agent + token (TTL optional; `max_cost` defaults to 1e6 and applies on the kernel) |
 | `POST /v1/agents/{id}/disable` | admin | kill switch |
 | `POST /v1/query {sql,params}` | agent | one statement, parameterised, row- and byte-capped, timed out |
 | `GET /v1/schema` | agent | compact schema text written for an LLM |
@@ -73,12 +73,19 @@ probe fails.
 ## Stock Postgres vs the SwarmPG kernel
 
 On stock Postgres a bare `SET app.agent_id = ...` is blocked by the gateway's guard, not by
-the database. On the SwarmPG kernel identity is sealed in core: `schema.sql` makes
-`swarmpg.current_agent()` read only the sealed `agent_id` and turns on
-`agent_require_principal` for `agent_runtime`, and the gateway detects the kernel at startup
-and seals `agent_id` in every transaction. An agent that reached Postgres directly could
-still not change its identity or run an unsealed query; the kernel probes in `make e2e
-KERNEL=1` check exactly that.
+the database. On the SwarmPG kernel identity is sealed in core. `schema.sql` makes
+`swarmpg.current_agent()` and `swarmpg.current_org()` read only the sealed `agent_principal`,
+turns on `agent_require_principal`, and sets budget ceilings on `agent_runtime`. The gateway
+detects the kernel at startup, and in every transaction:
+
+- seals `agent_principal = 'agent=<id>,org=<org>'`, adding `,sig=<HMAC-SHA256>` when
+  `PRINCIPAL_SECRET` is set (it must equal the server's `agent_principal_secret`);
+- lowers `agent_max_rows` to the agent's `max_rows + 1` and `agent_max_cost` to its `max_cost`.
+
+An agent that reached Postgres directly still could not change or forge its identity, read
+another agent's or org's rows, run an unsealed query, or raise a budget; the kernel probes in
+`make e2e KERNEL=1` check exactly that. On the kernel, `max_rows` also bounds the rows one
+statement may modify: a larger write fails with SQLSTATE 53400 and nothing is applied.
 
 All agents share one role, so Postgres would show each agent the others' in-flight SQL in
 `pg_stat_activity`. `schema.sql` revokes the view and its backing functions from `PUBLIC` on

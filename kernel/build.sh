@@ -8,14 +8,14 @@
 #   kernel/build.sh export   rewrite kernel/patches from the commits on top of BASE
 #
 # Environment: SWARMPG_SRC (default ./swarmpg-core), PREFIX (default ./.pginstall),
-# CONFIGURE_FLAGS (default: debug + assertions, for development).
+# CONFIGURE_FLAGS (default: debug + assertions + header dependency tracking, for development).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(dirname "$here")
 src=${SWARMPG_SRC:-$root/swarmpg-core}
 prefix=${PREFIX:-$root/.pginstall}
-flags=${CONFIGURE_FLAGS---enable-debug --enable-cassert}
+flags=${CONFIGURE_FLAGS---enable-debug --enable-cassert --enable-depend}
 base=$(cat "$here/BASE")
 upstream=https://github.com/postgres/postgres.git
 jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
@@ -28,6 +28,7 @@ fetch() {
 	git init -q "$src"
 	git -C "$src" fetch -q --depth 1 "$upstream" "$base"
 	git -C "$src" checkout -q FETCH_HEAD
+	echo /.swarmpg-configure >>"$src/.git/info/exclude"
 	git -C "$src" -c user.name=swarmpg -c user.email=swarmpg@localhost \
 		am -q --keep-non-patch --committer-date-is-author-date "$here"/patches/*.patch
 	git -C "$src" log --oneline "$base"..HEAD

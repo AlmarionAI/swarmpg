@@ -1,9 +1,12 @@
 # KERNEL=1 runs the cluster on the SwarmPG kernel (built by `make kernel`) instead of
-# the stock Postgres on PATH, on its own port and data directory.
+# the stock Postgres on PATH, on its own port and data directory. The kernel requires
+# agent principals signed with PRINCIPAL_SECRET, which the gateway and load test share.
 ifdef KERNEL
 PGBIN ?= $(CURDIR)/.pginstall/bin/
 PGDATA ?= $(CURDIR)/.pg-kernel
 PGPORT ?= 5511
+export PRINCIPAL_SECRET ?= dev-principal-secret
+PGOPTS = -c agent_principal_secret=$(PRINCIPAL_SECRET)
 else
 PGBIN ?=
 PGDATA ?= $(CURDIR)/.pg
@@ -13,7 +16,7 @@ export DATABASE_URL ?= postgres://$(USER)@127.0.0.1:$(PGPORT)/swarmpg?sslmode=di
 
 pg-start:
 	@test -d "$(PGDATA)" || $(PGBIN)initdb -D "$(PGDATA)" -U $(USER) --auth=trust >/dev/null
-	@$(PGBIN)pg_ctl -D "$(PGDATA)" -o "-p $(PGPORT) -c max_connections=100 -c shared_buffers=256MB" -l "$(PGDATA)/log" -w start >/dev/null || true
+	@$(PGBIN)pg_ctl -D "$(PGDATA)" -o "-p $(PGPORT) -c max_connections=100 -c shared_buffers=256MB $(PGOPTS)" -l "$(PGDATA)/log" -w start >/dev/null || true
 	@$(PGBIN)psql -h 127.0.0.1 -p $(PGPORT) -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='swarmpg'" | grep -q 1 || $(PGBIN)createdb -h 127.0.0.1 -p $(PGPORT) swarmpg
 	@$(PGBIN)psql -h 127.0.0.1 -p $(PGPORT) -d swarmpg -v ON_ERROR_STOP=1 -q -f sql/schema.sql
 	@echo "postgres ready on :$(PGPORT)"

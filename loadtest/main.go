@@ -3,6 +3,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,6 +28,8 @@ var (
 	nReq     = flag.Int("requests", 10, "requests per agent")
 	conc     = flag.Int("concurrency", 500, "max in-flight agents")
 	pgURL    = flag.String("pg", os.Getenv("DATABASE_URL"), "postgres URL for pg_stat_activity")
+
+	principalSecret = flag.String("principal-secret", os.Getenv("PRINCIPAL_SECRET"), "agent_principal_secret, to sign principals in the kernel probes")
 )
 
 var client = &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 1000, MaxConnsPerHost: 0}, Timeout: 30 * time.Second}
@@ -54,7 +59,16 @@ func call(method, path, token string, body any, admin bool) (int, []byte) {
 type agent struct{ ID, Token string }
 
 func createAgent(org string, i int) agent {
-	code, b := call("POST", "/v1/agents", "", map[string]any{"org_id": org, "name": fmt.Sprintf("agent-%d", i), "rps_limit": 50}, true)
+	return createAgentWith(org, fmt.Sprintf("agent-%d", i), nil)
+}
+
+// createAgentWith mints an agent with rps_limit 50 plus any extra budget fields.
+func createAgentWith(org, name string, extra map[string]any) agent {
+	body := map[string]any{"org_id": org, "name": name, "rps_limit": 50}
+	for k, v := range extra {
+		body[k] = v
+	}
+	code, b := call("POST", "/v1/agents", "", body, true)
 	if code != 201 {
 		fmt.Println("create agent failed:", string(b))
 		os.Exit(1)
@@ -64,15 +78,41 @@ func createAgent(org string, i int) agent {
 	return a
 }
 
-func main() {
-	flag.Parse()
-	code, b := call("POST", "/v1/orgs", "", map[string]string{"name": "loadtest"}, true)
+// mustOK stops the run when a probe's setup write fails, so a probe can never
+// pass vacuously against data that was never written.
+func mustOK(code int, body []byte) {
+	if code != 200 && code != 201 {
+		fmt.Println("probe setup failed:", code, string(body))
+		os.Exit(1)
+	}
+}
+
+func createOrg(name string) string {
+	code, b := call("POST", "/v1/orgs", "", map[string]string{"name": name}, true)
 	if code != 201 {
 		fmt.Println("org failed:", string(b))
 		os.Exit(1)
 	}
 	var org struct{ ID string }
 	_ = json.Unmarshal(b, &org)
+	return org.ID
+}
+
+// principal is the kernel's "agent=<id>,org=<id>" principal, signed the way
+// the gateway signs it when a principal secret is configured.
+func principal(agentID, orgID string) string {
+	p := "agent=" + agentID + ",org=" + orgID
+	if *principalSecret != "" {
+		m := hmac.New(sha256.New, []byte(*principalSecret))
+		m.Write([]byte(p))
+		p += ",sig=" + hex.EncodeToString(m.Sum(nil))
+	}
+	return p
+}
+
+func main() {
+	flag.Parse()
+	org := struct{ ID string }{createOrg("loadtest")}
 
 	fmt.Printf("provisioning %d agents...\n", *nAgents)
 	agents := make([]agent, *nAgents)
@@ -161,7 +201,7 @@ func main() {
 	A, B := agents[0], agents[1]
 	// First, agent B writes a private memory row so cross-agent reads have a
 	// concrete target to fail to find.
-	_, _ = call("PUT", "/v1/memory/secret", B.Token, map[string]any{"value": map[string]any{"pw": "B-private"}}, false)
+	mustOK(call("PUT", "/v1/memory/secret", B.Token, map[string]any{"value": map[string]any{"pw": "B-private"}}, false))
 
 	var probePass, probeFail int
 	// want: "reject" means the probe MUST be refused (error or 0 rows);
@@ -177,9 +217,13 @@ func main() {
 		rejected := r.Error != nil || code >= 400
 		var ok bool
 		var res string
+		wantCode := ""
+		if code, found := strings.CutPrefix(want, "reject:"); found {
+			want, wantCode = "reject", code
+		}
 		switch want {
 		case "reject":
-			ok = rejected
+			ok = rejected && (wantCode == "" || r.Error["code"] == wantCode)
 			if rejected {
 				res = fmt.Sprintf("rejected (%v)", r.Error["code"])
 			} else {
@@ -240,10 +284,19 @@ func main() {
 	probe("write own document", "allow", A.Token, "INSERT INTO swarmpg.documents(agent_id,org_id,collection,body) VALUES(swarmpg.current_agent(),swarmpg.current_org(),'c',jsonb_build_object('ok',true))")
 
 	// ---- kernel probes: raw SQL as agent_runtime with the gateway bypassed
-	// entirely. Only the SwarmPG kernel can pass these, so they run only there.
-	if *pgURL != "" && psqlOut(*pgURL, "SELECT EXISTS (SELECT 1 FROM pg_settings WHERE name = 'agent_id')") == "t" {
+	// entirely, then budget probes through the gateway. Only the SwarmPG
+	// kernel can pass these, so they run only there.
+	if *pgURL != "" && psqlOut(*pgURL, "SELECT EXISTS (SELECT 1 FROM pg_settings WHERE name = 'agent_principal')") == "t" {
+		// A second org with an org-shared memory row, for the cross-org probe.
+		org2 := createOrg("loadtest-other")
+		D := createAgentWith(org2, "other-org", nil)
+		mustOK(call("PUT", "/v1/memory/shared-plan", D.Token, map[string]any{"value": map[string]any{"org": "other"}, "shared": true}, false))
+
 		fmt.Println("\n== kernel probes (gateway bypassed: raw SQL as agent_runtime) ==")
 		rt := runtimeURL(*pgURL)
+		seal := func(agentID string) string {
+			return fmt.Sprintf("SET LOCAL agent_principal = '%s'", principal(agentID, org.ID))
+		}
 		kprobe := func(name, want string, stmts ...string) {
 			out, err := psqlAs(rt, stmts...)
 			var ok bool
@@ -264,13 +317,44 @@ func main() {
 		}
 		kprobe("unsealed query refused", "no agent principal established",
 			"SELECT count(*) FROM swarmpg.memory")
+		kprobe("half-set principal refused (org missing)", "invalid agent principal",
+			"BEGIN", fmt.Sprintf("SET LOCAL agent_principal = 'agent=%s'", A.ID), "COMMIT")
 		kprobe("re-seal to another agent refused", "is sealed",
-			"BEGIN", fmt.Sprintf("SET LOCAL agent_id = '%s'", A.ID), fmt.Sprintf("SET LOCAL agent_id = '%s'", B.ID), "COMMIT")
-		kprobe("RESET of a sealed identity refused", "is sealed",
-			"BEGIN", fmt.Sprintf("SET LOCAL agent_id = '%s'", A.ID), "RESET agent_id", "COMMIT")
+			"BEGIN", seal(A.ID), seal(B.ID), "COMMIT")
+		kprobe("RESET of a sealed principal refused", "is sealed",
+			"BEGIN", seal(A.ID), "RESET agent_principal", "COMMIT")
 		kprobe("SET app.agent_id cannot read peer rows", "zero",
-			"BEGIN", fmt.Sprintf("SET LOCAL agent_id = '%s'", A.ID), fmt.Sprintf("SET LOCAL app.agent_id = '%s'", B.ID),
+			"BEGIN", seal(A.ID), fmt.Sprintf("SET LOCAL app.agent_id = '%s'", B.ID),
 			fmt.Sprintf("SELECT count(*) FROM swarmpg.memory WHERE agent_id = '%s'", B.ID), "COMMIT")
+		kprobe("SET app.org_id cannot read another org's rows", "zero",
+			"BEGIN", seal(A.ID), fmt.Sprintf("SET LOCAL app.org_id = '%s'", org2),
+			fmt.Sprintf("SELECT count(*) FROM swarmpg.memory WHERE org_id = '%s'", org2), "COMMIT")
+		if *principalSecret != "" {
+			kprobe("forge an unsigned principal", "not signed",
+				"BEGIN", fmt.Sprintf("SET LOCAL agent_principal = 'agent=%s,org=%s'", B.ID, org.ID), "COMMIT")
+			kprobe("forge a principal with a bad signature", "invalid agent principal signature",
+				"BEGIN", fmt.Sprintf("SET LOCAL agent_principal = 'agent=%s,org=%s,sig=%s'", B.ID, org.ID, strings.Repeat("0", 64)), "COMMIT")
+		} else {
+			fmt.Println("  [SKIP] forged principals: PRINCIPAL_SECRET is not set, so principals are unsigned")
+		}
+		kprobe("raise the row budget refused", "can only be lowered",
+			"BEGIN", seal(A.ID), "SET LOCAL agent_max_rows = 0", "COMMIT")
+		kprobe("raise the cost budget refused", "can only be lowered",
+			"BEGIN", seal(A.ID), "SET LOCAL agent_max_cost = 0", "COMMIT")
+		kprobe("change the role's budget defaults refused", "permission denied",
+			"ALTER ROLE agent_runtime SET agent_max_rows = 0")
+
+		fmt.Println("\n== kernel budget probes (through the gateway: max_rows=5, max_cost=1000) ==")
+		C := createAgentWith(org.ID, "budgeted", map[string]any{"max_rows": 5, "max_cost": 1000})
+		runaway := "SELECT count(*) FROM generate_series(1, 100000) a, generate_series(1, 100000) b"
+		probe("write over the row budget refused", "reject:53400", C.Token,
+			"INSERT INTO swarmpg.documents(agent_id, org_id, collection, body) SELECT swarmpg.current_agent(), swarmpg.current_org(), 'bulk', '{}' FROM generate_series(1, 10)")
+		probe("refused write left nothing behind", "zero", C.Token,
+			"SELECT 1 FROM swarmpg.documents WHERE collection = 'bulk'")
+		probe("runaway query refused before it runs", "reject:53400", C.Token, runaway)
+		probe("EXPLAIN ANALYZE cannot dodge the cost budget", "reject:53400", C.Token, "EXPLAIN ANALYZE "+runaway)
+		probe("query_to_xml cannot dodge the cost budget", "reject:53400", C.Token, "SELECT query_to_xml($1, false, false, '')", runaway)
+		probe("EXPLAIN still shows the estimate", "allow", C.Token, "EXPLAIN "+runaway)
 	}
 
 	fmt.Printf("\nisolation probes: %d passed, %d failed\n", probePass, probeFail)

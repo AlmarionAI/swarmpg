@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -20,6 +21,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +45,7 @@ type Agent struct {
 	RPS, MaxRows       int
 	MaxResultBytes     int64
 	MaxConcurrency     int
+	MaxCost            float64
 	StatementTimeoutMS int
 	ReadOnly, Disabled bool
 	Expired            bool
@@ -52,7 +55,14 @@ type Gateway struct {
 	admin    *pgxpool.Pool // privileged: agent registry + audit
 	runtime  *pgxpool.Pool // logged in as agent_runtime: all agent SQL
 	adminKey string
-	sealed   bool // SwarmPG kernel: identity goes in the sealed agent_id GUC
+
+	// SwarmPG kernel only: the principal is sealed in core, optionally signed,
+	// and the row/cost budgets are enforced by the executor up to the
+	// ceilings set on agent_runtime.
+	sealed          bool
+	principalSecret []byte
+	ceilRows        int
+	ceilCost        float64
 
 	cache   sync.Map // tokenHash -> *cachedAgent
 	buckets sync.Map // agentID -> *bucket
@@ -136,10 +146,10 @@ func (g *Gateway) authenticate(ctx context.Context, r *http.Request) (*Agent, er
 	var expiresAt *time.Time
 	err := g.admin.QueryRow(ctx, `
 		SELECT id::text, org_id::text, name, shard, rps_limit, max_rows, max_result_bytes,
-		       max_concurrency, statement_timeout_ms, read_only, disabled, token_expires_at
+		       max_concurrency, max_cost, statement_timeout_ms, read_only, disabled, token_expires_at
 		FROM swarmpg.agents WHERE token_hash = $1`, h).
 		Scan(&a.ID, &a.OrgID, &a.Name, &a.Shard, &a.RPS, &a.MaxRows, &a.MaxResultBytes,
-			&a.MaxConcurrency, &a.StatementTimeoutMS, &a.ReadOnly, &a.Disabled, &expiresAt)
+			&a.MaxConcurrency, &a.MaxCost, &a.StatementTimeoutMS, &a.ReadOnly, &a.Disabled, &expiresAt)
 	if err != nil {
 		return nil, errAuth("invalid token")
 	}
@@ -386,10 +396,7 @@ func (g *Gateway) withConn(ctx context.Context, a *Agent, fn func(ctx context.Co
 	// validated as UUIDs at creation.
 	seal := ""
 	if g.sealed {
-		// SwarmPG kernel: seal the principal in core. It is immutable for the
-		// rest of the transaction, even against a bare SET, and
-		// agent_require_principal refuses to run any plan without it.
-		seal = fmt.Sprintf("SET LOCAL agent_id = '%s'; ", a.ID)
+		seal = g.kernelSetup(a)
 	}
 	stmtTimeout := a.StatementTimeoutMS
 	setup := seal + fmt.Sprintf(
@@ -407,6 +414,44 @@ func (g *Gateway) withConn(ctx context.Context, a *Agent, fn func(ctx context.Co
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// kernelSetup seals the agent's principal (agent and org in one value, signed
+// when a secret is configured) and lowers the executor budgets to this agent's,
+// all transaction-local. Once sealed, nothing the agent runs in the transaction
+// can change its identity or raise its budgets.
+func (g *Gateway) kernelSetup(a *Agent) string {
+	principal := "agent=" + a.ID + ",org=" + a.OrgID
+	if len(g.principalSecret) > 0 {
+		m := hmac.New(sha256.New, g.principalSecret)
+		m.Write([]byte(principal))
+		principal += ",sig=" + hex.EncodeToString(m.Sum(nil))
+	}
+	setup := fmt.Sprintf("SET LOCAL agent_principal = '%s'; ", principal)
+	// One row past max_rows, so the gateway still sees that a result was cut
+	// and reports it as truncated; writes over that fail in the executor.
+	if rows := capInt(a.MaxRows+1, g.ceilRows); rows > 0 {
+		setup += fmt.Sprintf("SET LOCAL agent_max_rows = %d; ", rows)
+	}
+	if cost := capFloat(a.MaxCost, g.ceilCost); cost > 0 {
+		setup += "SET LOCAL agent_max_cost = " + strconv.FormatFloat(cost, 'f', -1, 64) + "; "
+	}
+	return setup
+}
+
+// capInt and capFloat bound v by a ceiling, where 0 means "no limit" for both.
+func capInt(v, ceil int) int {
+	if ceil > 0 && (v <= 0 || v > ceil) {
+		return ceil
+	}
+	return v
+}
+
+func capFloat(v, ceil float64) float64 {
+	if ceil > 0 && (v <= 0 || v > ceil) {
+		return ceil
+	}
+	return v
 }
 
 // approxBytes is a cheap size estimate for the byte budget (not exact JSON size).
@@ -816,16 +861,17 @@ func (g *Gateway) routes() http.Handler {
 
 	mux.HandleFunc("POST /v1/agents", g.withAdmin(func(w http.ResponseWriter, r *http.Request) {
 		in := struct {
-			OrgID              string `json:"org_id"`
-			Name               string `json:"name"`
-			RPS                int    `json:"rps_limit"`
-			MaxRows            int    `json:"max_rows"`
-			MaxResultBytes     int64  `json:"max_result_bytes"`
-			MaxConcurrency     int    `json:"max_concurrency"`
-			StatementTimeoutMS int    `json:"statement_timeout_ms"`
-			ReadOnly           bool   `json:"read_only"`
-			TTLSeconds         int    `json:"ttl_seconds"`
-		}{RPS: 20, MaxRows: 1000, MaxResultBytes: 4 << 20, MaxConcurrency: 4, StatementTimeoutMS: 5000}
+			OrgID              string  `json:"org_id"`
+			Name               string  `json:"name"`
+			RPS                int     `json:"rps_limit"`
+			MaxRows            int     `json:"max_rows"`
+			MaxResultBytes     int64   `json:"max_result_bytes"`
+			MaxConcurrency     int     `json:"max_concurrency"`
+			MaxCost            float64 `json:"max_cost"`
+			StatementTimeoutMS int     `json:"statement_timeout_ms"`
+			ReadOnly           bool    `json:"read_only"`
+			TTLSeconds         int     `json:"ttl_seconds"`
+		}{RPS: 20, MaxRows: 1000, MaxResultBytes: 4 << 20, MaxConcurrency: 4, MaxCost: 1e6, StatementTimeoutMS: 5000}
 		if err := readJSON(r, &in); err != nil {
 			writeErr(w, errBadReq(err.Error()))
 			return
@@ -834,7 +880,7 @@ func (g *Gateway) routes() http.Handler {
 			writeErr(w, errBadReq("org_id required"))
 			return
 		}
-		if in.RPS < 0 || in.MaxRows < 0 || in.MaxResultBytes < 0 || in.MaxConcurrency < 0 || in.StatementTimeoutMS < 0 {
+		if in.RPS < 0 || in.MaxRows < 0 || in.MaxResultBytes < 0 || in.MaxConcurrency < 0 || in.MaxCost < 0 || in.StatementTimeoutMS < 0 {
 			writeErr(w, errBadReq("budget values must be >= 0"))
 			return
 		}
@@ -845,9 +891,9 @@ func (g *Gateway) routes() http.Handler {
 		tok := newToken()
 		var id string
 		err := g.admin.QueryRow(r.Context(), `
-			INSERT INTO swarmpg.agents(org_id, name, token_hash, rps_limit, max_rows, max_result_bytes, max_concurrency, statement_timeout_ms, read_only, token_expires_at)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id::text`,
-			in.OrgID, in.Name, hashToken(tok), in.RPS, in.MaxRows, in.MaxResultBytes, in.MaxConcurrency, in.StatementTimeoutMS, in.ReadOnly, expires).Scan(&id)
+			INSERT INTO swarmpg.agents(org_id, name, token_hash, rps_limit, max_rows, max_result_bytes, max_concurrency, max_cost, statement_timeout_ms, read_only, token_expires_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id::text`,
+			in.OrgID, in.Name, hashToken(tok), in.RPS, in.MaxRows, in.MaxResultBytes, in.MaxConcurrency, in.MaxCost, in.StatementTimeoutMS, in.ReadOnly, expires).Scan(&id)
 		if err != nil {
 			writeErr(w, classifyPg(err))
 			return
@@ -992,6 +1038,29 @@ func (g *Gateway) routes() http.Handler {
 	return mux
 }
 
+// readCeilings reads the budget ceilings set on agent_runtime, which the
+// gateway may lower per agent but cannot raise. SHOW is a utility statement,
+// so it runs before any principal is sealed.
+func (g *Gateway) readCeilings(ctx context.Context) error {
+	conn, err := g.runtime.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	var rows, cost string
+	if err := conn.QueryRow(ctx, "SHOW agent_max_rows").Scan(&rows); err != nil {
+		return err
+	}
+	if err := conn.QueryRow(ctx, "SHOW agent_max_cost").Scan(&cost); err != nil {
+		return err
+	}
+	if g.ceilRows, err = strconv.Atoi(rows); err != nil {
+		return err
+	}
+	g.ceilCost, err = strconv.ParseFloat(cost, 64)
+	return err
+}
+
 func mustPool(ctx context.Context, url string, max int32, reset bool) *pgxpool.Pool {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
@@ -1047,12 +1116,24 @@ func main() {
 		runtime:  mustPool(ctx, runtimeURL, 32, true),
 		adminKey: adminKey,
 	}
-	if err := g.admin.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_settings WHERE name = 'agent_id')`).Scan(&g.sealed); err != nil {
+	if err := g.admin.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_settings WHERE name = 'agent_principal')`).Scan(&g.sealed); err != nil {
 		log.Fatalf("detect kernel: %v", err)
 	}
+	secret := os.Getenv("PRINCIPAL_SECRET")
 	if g.sealed {
-		log.Printf("SwarmPG kernel detected: agent identity is sealed in core")
+		g.principalSecret = []byte(secret)
+		if err := g.readCeilings(ctx); err != nil {
+			log.Fatalf("read kernel budget ceilings: %v", err)
+		}
+		signed := "unsigned (set PRINCIPAL_SECRET and agent_principal_secret to sign them)"
+		if secret != "" {
+			signed = "signed"
+		}
+		log.Printf("SwarmPG kernel detected: principals are sealed in core, %s; budget ceilings rows=%d cost=%g", signed, g.ceilRows, g.ceilCost)
 	} else {
+		if secret != "" {
+			log.Printf("WARNING: PRINCIPAL_SECRET is ignored on stock Postgres")
+		}
 		log.Printf("stock Postgres: agent identity is enforced by RLS plus the gateway's statement guard")
 	}
 	addr := env("ADDR", ":8080")

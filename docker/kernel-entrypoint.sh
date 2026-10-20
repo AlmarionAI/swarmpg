@@ -14,4 +14,6 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
 	echo "swarmpg: cluster initialised with the agent schema (trust auth: development only)"
 fi
 
-exec postgres -D "$PGDATA" -c unix_socket_directories=/tmp
+# With PRINCIPAL_SECRET set, agent principals must be signed with it (the gateway does).
+exec postgres -D "$PGDATA" -c unix_socket_directories=/tmp \
+	${PRINCIPAL_SECRET:+-c agent_principal_secret=$PRINCIPAL_SECRET}
