@@ -283,6 +283,65 @@ func main() {
 	probe("read own memory", "allow", A.Token, "SELECT count(*) FROM swarmpg.memory")
 	probe("write own document", "allow", A.Token, "INSERT INTO swarmpg.documents(agent_id,org_id,collection,body) VALUES(swarmpg.current_agent(),swarmpg.current_org(),'c',jsonb_build_object('ok',true))")
 
+	// ---- MCP: the same agents through the /mcp endpoint
+	fmt.Println("\n== MCP probes (/mcp, agent tokens) ==")
+	check := func(name string, ok bool, res string) {
+		mark := "PASS"
+		if ok {
+			probePass++
+		} else {
+			mark = "FAIL"
+			probeFail++
+		}
+		fmt.Printf("  [%s] %-50s -> %s\n", mark, name, res)
+	}
+	code, initMsg := mcpRPC(A.Token, false, "initialize", map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "loadtest", "version": "1"}}, nil)
+	initRes, _ := initMsg["result"].(map[string]any)
+	check("legacy initialize negotiates 2025-06-18", code == 200 && initRes["protocolVersion"] == "2025-06-18", fmt.Sprintf("%d %v", code, initRes["protocolVersion"]))
+	code, disc := mcpRPC(A.Token, true, "server/discover", nil, nil)
+	discRes, _ := disc["result"].(map[string]any)
+	check("2026-07-28 server/discover", code == 200 && discRes["resultType"] == "complete", fmt.Sprintf("%d %v", code, discRes["resultType"]))
+	code, list := mcpRPC(A.Token, true, "tools/list", nil, nil)
+	listRes, _ := list["result"].(map[string]any)
+	tools, _ := listRes["tools"].([]any)
+	check("tools/list returns the 5 tools", code == 200 && len(tools) == 5, fmt.Sprintf("%d tools", len(tools)))
+	code, _ = mcpRPC("", true, "tools/list", nil, nil)
+	check("no token refused", code == 401, fmt.Sprint(code))
+	code, _ = mcpRPC("spg_not_a_real_token", true, "tools/list", nil, nil)
+	check("invalid token refused", code == 401, fmt.Sprint(code))
+	code, _ = mcpRPC(A.Token, true, "tools/list", nil, map[string]string{"Origin": "https://evil.example"})
+	check("foreign Origin refused (DNS rebinding)", code == 403, fmt.Sprint(code))
+
+	tool := func(token, name string, args map[string]any) (bool, map[string]any, string) {
+		_, msg := mcpRPC(token, true, "tools/call", map[string]any{"name": name, "arguments": args}, nil)
+		res, _ := msg["result"].(map[string]any)
+		sc, _ := res["structuredContent"].(map[string]any)
+		text := ""
+		if content, _ := res["content"].([]any); len(content) > 0 {
+			text, _ = content[0].(map[string]any)["text"].(string)
+		}
+		return res["isError"] == true, sc, text
+	}
+	isErr, _, text := tool(A.Token, "schema", map[string]any{})
+	check("schema tool describes the tables", !isErr && strings.Contains(text, "swarmpg.memory"), firstLine(text))
+	isErr, _, _ = tool(A.Token, "memory_put", map[string]any{"key": "mcp-plan", "value": map[string]any{"step": 7}})
+	_, got, _ := tool(A.Token, "memory_get", map[string]any{"key": "mcp-plan"})
+	value, _ := json.Marshal(got["value"])
+	check("memory_put then memory_get round-trips", !isErr && string(value) == `{"step":7}`, string(value))
+	isErr, sc, _ := tool(A.Token, "memory_get", map[string]any{"key": "secret"})
+	errBody, _ := sc["error"].(map[string]any)
+	check("memory_get cannot read a peer's private key", isErr && errBody["code"] == "not_found", fmt.Sprint(errBody["code"]))
+	isErr, sc, _ = tool(A.Token, "query", map[string]any{"sql": "SELECT * FROM swarmpg.memory WHERE agent_id = $1", "params": []any{B.ID}})
+	check("query cannot read a peer's rows", !isErr && sc["row_count"] == float64(0), fmt.Sprintf("rows=%v", sc["row_count"]))
+	isErr, sc, _ = tool(A.Token, "query", map[string]any{"sql": fmt.Sprintf("SET app.agent_id = '%s'", B.ID)})
+	errBody, _ = sc["error"].(map[string]any)
+	check("query cannot change identity", isErr, fmt.Sprintf("isError (%v)", errBody["code"]))
+	key := fmt.Sprintf("mcp-%d", time.Now().UnixNano())
+	_, first, _ := tool(A.Token, "events_append", map[string]any{"kind": "mcp_probe", "idempotency_key": key})
+	_, again, _ := tool(A.Token, "events_append", map[string]any{"kind": "mcp_probe", "idempotency_key": key})
+	check("events_append retry with the same key is replayed", first["id"] != nil && first["id"] == again["id"] && again["replayed"] == true,
+		fmt.Sprintf("id %v then %v, replayed=%v", first["id"], again["id"], again["replayed"]))
+
 	// ---- kernel probes: raw SQL as agent_runtime with the gateway bypassed
 	// entirely, then budget probes through the gateway. Only the SwarmPG
 	// kernel can pass these, so they run only there.
@@ -355,12 +414,65 @@ func main() {
 		probe("EXPLAIN ANALYZE cannot dodge the cost budget", "reject:53400", C.Token, "EXPLAIN ANALYZE "+runaway)
 		probe("query_to_xml cannot dodge the cost budget", "reject:53400", C.Token, "SELECT query_to_xml($1, false, false, '')", runaway)
 		probe("EXPLAIN still shows the estimate", "allow", C.Token, "EXPLAIN "+runaway)
+		_, msg := mcpRPC(C.Token, true, "tools/call", map[string]any{"name": "query", "arguments": map[string]any{"sql": runaway}}, nil)
+		res, _ := msg["result"].(map[string]any)
+		sc, _ := res["structuredContent"].(map[string]any)
+		errBody, _ := sc["error"].(map[string]any)
+		ok := res["isError"] == true && errBody["code"] == "53400"
+		if ok {
+			probePass++
+		} else {
+			probeFail++
+		}
+		fmt.Printf("  [%s] %-50s -> %v\n", map[bool]string{true: "PASS", false: "FAIL"}[ok], "MCP query tool is held to the same budget", errBody["code"])
 	}
 
 	fmt.Printf("\nisolation probes: %d passed, %d failed\n", probePass, probeFail)
 	if probeFail > 0 {
 		os.Exit(1)
 	}
+}
+
+// mcpRPC sends one JSON-RPC request to /mcp, as a 2026-07-28 client (modern:
+// version and capabilities in _meta, mirrored in headers) or a 2025-06-18 one,
+// and returns the HTTP status and the decoded reply.
+func mcpRPC(token string, modern bool, method string, params map[string]any, extra map[string]string) (int, map[string]any) {
+	if params == nil {
+		params = map[string]any{}
+	}
+	h := map[string]string{"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+	if modern {
+		params["_meta"] = map[string]any{
+			"io.modelcontextprotocol/protocolVersion":    "2026-07-28",
+			"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+			"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "loadtest", "version": "1"},
+		}
+		h["MCP-Protocol-Version"], h["Mcp-Method"] = "2026-07-28", method
+		if name, ok := params["name"].(string); ok {
+			h["Mcp-Name"] = name
+		}
+	} else if method != "initialize" {
+		h["MCP-Protocol-Version"] = "2025-06-18"
+	}
+	for k, v := range extra {
+		h[k] = v
+	}
+	b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+	req, _ := http.NewRequest("POST", *base+"/mcp", bytes.NewReader(b))
+	for k, v := range h {
+		req.Header.Set(k, v)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
 }
 
 // runtimeURL is the admin URL with the user swapped for agent_runtime.

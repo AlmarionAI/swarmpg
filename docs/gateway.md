@@ -33,10 +33,42 @@ live in `./.pg`, which is git-ignored.
 | `GET /v1/schema` | agent | compact schema text written for an LLM |
 | `PUT/GET /v1/memory/{key}` | agent | per-agent JSON memory (org-shareable; GET also returns an org-shared key) |
 | `POST /v1/events {kind,payload}` | agent | hash-chained append-only journal; honours `Idempotency-Key` |
+| `POST /mcp` | agent | the same operations as MCP tools (see below) |
 
 Writes honour an `Idempotency-Key` header: a retry after a timeout replays the stored response
 instead of duplicating the write. Query errors carry the SQLSTATE `code`, `detail`, `hint`,
 `position` and a `retryable` flag so an agent's control loop can decide retry vs repair.
+
+## MCP endpoint
+
+`POST /mcp` serves the Model Context Protocol over Streamable HTTP. It is stateless: one
+JSON-RPC message per POST, one JSON response (202 for a notification), no sessions, no
+server-sent events. `GET` and `DELETE` return 405.
+
+| Tool | Does | Same as |
+|---|---|---|
+| `schema` | describes the agent's tables and the SQL rules | `GET /v1/schema` |
+| `query` `{sql, params}` | one parameterised statement, budget-capped | `POST /v1/query` |
+| `memory_get` `{key}` | own key, else an org-shared key of that name | `GET /v1/memory/{key}` |
+| `memory_put` `{key, value, shared}` | upsert an own key | `PUT /v1/memory/{key}` |
+| `events_append` `{kind, payload, idempotency_key}` | append to the journal; a repeated key replays | `POST /v1/events` |
+
+- **Versions.** 2026-07-28 requests carry `io.modelcontextprotocol/protocolVersion` and
+  `clientCapabilities` in `params._meta`, mirrored in the `MCP-Protocol-Version`,
+  `Mcp-Method` and (for `tools/call`) `Mcp-Name` headers. A mismatch returns 400 with
+  -32020, and an unsupported version returns 400 with -32022 listing the supported ones.
+  `server/discover` describes the server. Older clients use `initialize` (2025-11-25,
+  2025-06-18, 2025-03-26) and get the same tools.
+- **Auth and limits.** `Authorization: Bearer <agent token>` on every request; a missing or
+  bad token is 401 with `WWW-Authenticate`. Rate, concurrency and every budget apply as on
+  the REST API.
+- **Origin.** A request with an `Origin` header is refused with 403 unless that origin is in
+  `MCP_ALLOWED_ORIGINS` (comma-separated), which blocks DNS-rebinding attacks from
+  browsers. Server-side agents send no `Origin`.
+- **Errors.** Unknown tools and malformed requests are JSON-RPC errors. A tool that runs and
+  fails (bad SQL, budget exceeded, not found, invalid arguments) returns a result with
+  `isError: true` and the same error body as the REST API, so the model can read it and
+  repair its call.
 
 ## What the database enforces (not the prompt, not the gateway)
 

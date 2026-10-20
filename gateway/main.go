@@ -56,6 +56,8 @@ type Gateway struct {
 	runtime  *pgxpool.Pool // logged in as agent_runtime: all agent SQL
 	adminKey string
 
+	mcpOrigins map[string]bool // Origins allowed to call /mcp; requests without one are allowed
+
 	// SwarmPG kernel only: the principal is sealed in core, optionally signed,
 	// and the row/cost budgets are enforced by the executor up to the
 	// ceilings set on agent_runtime.
@@ -714,7 +716,9 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_, _ = w.Write(buf)
 }
 
-func writeErr(w http.ResponseWriter, err *apiError) {
+// errorBody is an error as agents see it, over REST and MCP alike: the code,
+// message and, when present, the detail, hint, position and retryable flag.
+func errorBody(err *apiError) map[string]any {
 	body := map[string]any{"code": err.Code, "message": err.Message}
 	if err.Detail != "" {
 		body["detail"] = err.Detail
@@ -728,37 +732,49 @@ func writeErr(w http.ResponseWriter, err *apiError) {
 	if err.Retryable {
 		body["retryable"] = true
 	}
-	writeJSON(w, err.Status, map[string]any{"error": body})
+	return body
+}
+
+func writeErr(w http.ResponseWriter, err *apiError) {
+	writeJSON(w, err.Status, map[string]any{"error": errorBody(err)})
+}
+
+// admit authenticates an agent request and applies the kill switch, token
+// expiry, rate limit and per-agent concurrency cap. On success the caller must
+// call release when the request is done.
+func (g *Gateway) admit(r *http.Request) (a *Agent, release func(), aerr *apiError) {
+	g.stats.requests.Add(1)
+	a, err := g.authenticate(r.Context(), r)
+	if err != nil {
+		return nil, nil, err.(*apiError)
+	}
+	if a.Disabled {
+		return nil, nil, errForbidden("agent disabled")
+	}
+	if a.Expired {
+		return nil, nil, errForbidden("token expired")
+	}
+	g.touchLastSeen(a)
+	if !g.allow(a) {
+		g.stats.limited.Add(1)
+		return nil, nil, &apiError{Status: 429, Code: "rate_limited", Message: fmt.Sprintf("rate limit %d req/s exceeded", a.RPS), Retryable: true}
+	}
+	release, ok := g.acquireSlot(a)
+	if !ok {
+		g.stats.limited.Add(1)
+		return nil, nil, &apiError{Status: 429, Code: "concurrency_limited", Message: fmt.Sprintf("concurrency limit %d exceeded", a.MaxConcurrency), Retryable: true}
+	}
+	return a, release, nil
 }
 
 func (g *Gateway) withAgent(h func(http.ResponseWriter, *http.Request, *Agent)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		g.stats.requests.Add(1)
-		a, err := g.authenticate(r.Context(), r)
-		if err != nil {
-			writeErr(w, err.(*apiError))
-			return
-		}
-		if a.Disabled {
-			writeErr(w, errForbidden("agent disabled"))
-			return
-		}
-		if a.Expired {
-			writeErr(w, errForbidden("token expired"))
-			return
-		}
-		g.touchLastSeen(a)
-		if !g.allow(a) {
-			g.stats.limited.Add(1)
-			w.Header().Set("Retry-After", "1")
-			writeErr(w, &apiError{Status: 429, Code: "rate_limited", Message: fmt.Sprintf("rate limit %d req/s exceeded", a.RPS), Retryable: true})
-			return
-		}
-		release, ok := g.acquireSlot(a)
-		if !ok {
-			g.stats.limited.Add(1)
-			w.Header().Set("Retry-After", "1")
-			writeErr(w, &apiError{Status: 429, Code: "concurrency_limited", Message: fmt.Sprintf("concurrency limit %d exceeded", a.MaxConcurrency), Retryable: true})
+		a, release, aerr := g.admit(r)
+		if aerr != nil {
+			if aerr.Status == 429 {
+				w.Header().Set("Retry-After", "1")
+			}
+			writeErr(w, aerr)
 			return
 		}
 		defer release()
@@ -833,6 +849,76 @@ func (g *Gateway) idempotentWrite(ctx context.Context, a *Agent, key string, do 
 		return nil, false, classifyPg(err)
 	}
 	return out, replay, nil
+}
+
+// memoryPut upserts the agent's own memory key; shared makes it readable by
+// the agent's org.
+func (g *Gateway) memoryPut(ctx context.Context, a *Agent, key string, value json.RawMessage, shared bool) *apiError {
+	if key == "" {
+		return errBadReq("key required")
+	}
+	if len(value) == 0 {
+		return errBadReq("value required")
+	}
+	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO swarmpg.memory(agent_id, org_id, key, value, shared)
+			VALUES(swarmpg.current_agent(), swarmpg.current_org(), $1, $2, $3)
+			ON CONFLICT (agent_id, key) DO UPDATE SET value = EXCLUDED.value, shared = EXCLUDED.shared, updated_at = now()`,
+			key, string(value), shared)
+		return err
+	})
+	if err != nil {
+		return classifyPg(err)
+	}
+	return nil
+}
+
+// memoryGet reads the agent's own key, falling back to an org-shared key of
+// the same name.
+func (g *Gateway) memoryGet(ctx context.Context, a *Agent, key string) (json.RawMessage, bool, *apiError) {
+	if key == "" {
+		return nil, false, errBadReq("key required")
+	}
+	var v json.RawMessage
+	var shared bool
+	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT value, shared FROM swarmpg.memory
+			WHERE key = $1 AND (agent_id = swarmpg.current_agent()
+			                    OR (shared AND org_id = swarmpg.current_org()))
+			ORDER BY (agent_id = swarmpg.current_agent()) DESC LIMIT 1`, key).Scan(&v, &shared)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, &apiError{Status: 404, Code: "not_found", Message: "not found"}
+	}
+	if err != nil {
+		return nil, false, classifyPg(err)
+	}
+	return v, shared, nil
+}
+
+// appendEvent appends to the agent's hash-chained journal. With an
+// idempotency key, a retry replays the stored response (replay = true).
+func (g *Gateway) appendEvent(ctx context.Context, a *Agent, kind string, payload json.RawMessage, idemKey string) (json.RawMessage, bool, *apiError) {
+	if kind == "" {
+		return nil, false, errBadReq("kind required")
+	}
+	if len(payload) == 0 {
+		payload = json.RawMessage("{}")
+	}
+	return g.idempotentWrite(ctx, a, idemKey, func(ctx context.Context, tx pgx.Tx) (json.RawMessage, error) {
+		var id, seq int64
+		var hash []byte
+		err := tx.QueryRow(ctx, `
+			INSERT INTO swarmpg.events(agent_id, org_id, kind, payload)
+			VALUES(swarmpg.current_agent(), swarmpg.current_org(), $1, $2) RETURNING id, seq, hash`,
+			kind, string(payload)).Scan(&id, &seq, &hash)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]any{"id": id, "seq": seq, "hash": hex.EncodeToString(hash)})
+	})
 }
 
 func (g *Gateway) routes() http.Handler {
@@ -950,42 +1036,17 @@ func (g *Gateway) routes() http.Handler {
 			writeErr(w, errBadReq(err.Error()))
 			return
 		}
-		if len(in.Value) == 0 {
-			writeErr(w, errBadReq("value required"))
-			return
-		}
-		err := g.withConn(r.Context(), a, func(ctx context.Context, tx pgx.Tx) error {
-			_, err := tx.Exec(ctx, `
-				INSERT INTO swarmpg.memory(agent_id, org_id, key, value, shared)
-				VALUES(swarmpg.current_agent(), swarmpg.current_org(), $1, $2, $3)
-				ON CONFLICT (agent_id, key) DO UPDATE SET value = EXCLUDED.value, shared = EXCLUDED.shared, updated_at = now()`,
-				r.PathValue("key"), string(in.Value), in.Shared)
-			return err
-		})
-		if err != nil {
-			writeErr(w, classifyPg(err))
+		if aerr := g.memoryPut(r.Context(), a, r.PathValue("key"), in.Value, in.Shared); aerr != nil {
+			writeErr(w, aerr)
 			return
 		}
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	}))
 
 	mux.HandleFunc("GET /v1/memory/{key}", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
-		var v json.RawMessage
-		var shared bool
-		err := g.withConn(r.Context(), a, func(ctx context.Context, tx pgx.Tx) error {
-			// Own key first; fall back to an org-shared key of the same name.
-			return tx.QueryRow(ctx, `
-				SELECT value, shared FROM swarmpg.memory
-				WHERE key = $1 AND (agent_id = swarmpg.current_agent()
-				                    OR (shared AND org_id = swarmpg.current_org()))
-				ORDER BY (agent_id = swarmpg.current_agent()) DESC LIMIT 1`, r.PathValue("key")).Scan(&v, &shared)
-		})
-		if errors.Is(err, pgx.ErrNoRows) {
-			writeErr(w, &apiError{Status: 404, Code: "not_found", Message: "not found"})
-			return
-		}
-		if err != nil {
-			writeErr(w, classifyPg(err))
+		v, shared, aerr := g.memoryGet(r.Context(), a, r.PathValue("key"))
+		if aerr != nil {
+			writeErr(w, aerr)
 			return
 		}
 		writeJSON(w, 200, map[string]any{"key": r.PathValue("key"), "value": v, "shared": shared})
@@ -1000,27 +1061,7 @@ func (g *Gateway) routes() http.Handler {
 			writeErr(w, errBadReq(err.Error()))
 			return
 		}
-		if in.Kind == "" {
-			writeErr(w, errBadReq("kind required"))
-			return
-		}
-		if len(in.Payload) == 0 {
-			in.Payload = json.RawMessage("{}")
-		}
-		key := r.Header.Get("Idempotency-Key")
-		out, replay, aerr := g.idempotentWrite(r.Context(), a, key, func(ctx context.Context, tx pgx.Tx) (json.RawMessage, error) {
-			var id int64
-			var hash []byte
-			var seq int64
-			err := tx.QueryRow(ctx, `
-				INSERT INTO swarmpg.events(agent_id, org_id, kind, payload)
-				VALUES(swarmpg.current_agent(), swarmpg.current_org(), $1, $2) RETURNING id, seq, hash`,
-				in.Kind, string(in.Payload)).Scan(&id, &seq, &hash)
-			if err != nil {
-				return nil, err
-			}
-			return json.Marshal(map[string]any{"id": id, "seq": seq, "hash": hex.EncodeToString(hash)})
-		})
+		out, replay, aerr := g.appendEvent(r.Context(), a, in.Kind, in.Payload, r.Header.Get("Idempotency-Key"))
 		if aerr != nil {
 			g.stats.errors.Add(1)
 			writeErr(w, aerr)
@@ -1034,6 +1075,8 @@ func (g *Gateway) routes() http.Handler {
 		w.WriteHeader(code)
 		_, _ = w.Write(out)
 	}))
+
+	mux.HandleFunc("/mcp", g.handleMCP)
 
 	return mux
 }
@@ -1135,6 +1178,12 @@ func main() {
 			log.Printf("WARNING: PRINCIPAL_SECRET is ignored on stock Postgres")
 		}
 		log.Printf("stock Postgres: agent identity is enforced by RLS plus the gateway's statement guard")
+	}
+	g.mcpOrigins = map[string]bool{}
+	for _, o := range strings.Split(os.Getenv("MCP_ALLOWED_ORIGINS"), ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			g.mcpOrigins[o] = true
+		}
 	}
 	addr := env("ADDR", ":8080")
 	srv := &http.Server{
