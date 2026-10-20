@@ -70,8 +70,10 @@ type Gateway struct {
 	buckets sync.Map // agentID -> *bucket
 	sems    sync.Map // agentID -> chan struct{} (per-agent concurrency)
 	seen    sync.Map // agentID -> *lastSeen (throttled last_seen_at writes)
+	auditCh chan auditRecord
+	seenCh  chan string
 	stats   struct {
-		requests, rejected, errors, limited atomic.Int64
+		requests, rejected, errors, limited, auditLost atomic.Int64
 	}
 }
 
@@ -164,8 +166,8 @@ func (g *Gateway) authenticate(ctx context.Context, r *http.Request) (*Agent, er
 
 type lastSeen struct{ at atomic.Int64 }
 
-// Throttle last_seen_at writes to at most once per 60s per agent, async, so the
-// registry is not a write hotspot on the auth hot path.
+// Throttle last_seen_at writes to at most once per 60s per agent, batched by
+// seenWriter, so the registry is not a write hotspot on the auth hot path.
 func (g *Gateway) touchLastSeen(a *Agent) {
 	v, _ := g.seen.LoadOrStore(a.ID, &lastSeen{})
 	ls := v.(*lastSeen)
@@ -174,11 +176,10 @@ func (g *Gateway) touchLastSeen(a *Agent) {
 	if now-prev < 60 || !ls.at.CompareAndSwap(prev, now) {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_, _ = g.admin.Exec(ctx, `UPDATE swarmpg.agents SET last_seen_at = now() WHERE id = $1`, a.ID)
-	}()
+	select {
+	case g.seenCh <- a.ID:
+	default: // best effort: a full queue skips one update
+	}
 }
 
 // ---- statement guard (fast path + defense in depth; the DB is the real control).
@@ -484,8 +485,11 @@ func approxBytes(v any) int64 {
 
 func (g *Gateway) query(ctx context.Context, a *Agent, q QueryRequest) (*QueryResponse, *apiError) {
 	if err := guard(q.SQL, a); err != nil {
+		// Refused statements are audited too: they are the attempts worth seeing.
 		g.stats.rejected.Add(1)
-		return nil, err.(*apiError)
+		ae := err.(*apiError)
+		g.audit(a, q.SQL, len(q.Params), 0, 0, 0, 0, ae)
+		return nil, ae
 	}
 	params, perr := decodeParams(q.Params)
 	if perr != nil {
@@ -547,20 +551,6 @@ func (g *Gateway) query(ctx context.Context, a *Agent, q QueryRequest) (*QueryRe
 	}
 	g.audit(a, q.SQL, len(params), resp.RowCount, resp.Bytes, resp.Affected, resp.Duration, nil)
 	return resp, nil
-}
-
-// audit records what actually executed in a store agents cannot touch.
-func (g *Gateway) audit(a *Agent, sql string, nparams, nrows int, nbytes, affected int64, ms float64, ae *apiError) {
-	var sqlstate, errmsg any
-	if ae != nil {
-		sqlstate, errmsg = ae.Code, ae.Message
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_, _ = g.admin.Exec(ctx, `SELECT swarmpg.record_audit($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-			a.ID, a.OrgID, sql, nparams, nrows, nbytes, affected, ms, sqlstate, errmsg)
-	}()
 }
 
 // decodeParams converts JSON params to pgx-compatible values WITHOUT losing
@@ -1065,7 +1055,7 @@ func (g *Gateway) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
 			"ok": true, "requests": g.stats.requests.Load(), "rejected": g.stats.rejected.Load(),
-			"errors": g.stats.errors.Load(), "rate_limited": g.stats.limited.Load(),
+			"errors": g.stats.errors.Load(), "rate_limited": g.stats.limited.Load(), "audit_lost": g.stats.auditLost.Load(),
 			"runtime_pool": g.runtime.Stat().TotalConns(), "admin_pool": g.admin.Stat().TotalConns(),
 		})
 	})
@@ -1365,6 +1355,7 @@ func main() {
 		runtime:  mustPool(ctx, runtimeURL, 32, true),
 		adminKey: adminKey,
 	}
+	g.startWriters()
 	if err := g.admin.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_settings WHERE name = 'agent_principal')`).Scan(&g.sealed); err != nil {
 		log.Fatalf("detect kernel: %v", err)
 	}

@@ -3,6 +3,7 @@
 # patch series in kernel/patches.
 #
 #   kernel/build.sh fetch    clone upstream at BASE into $SWARMPG_SRC and apply the series
+#                            (SWARMPG_UPSTREAM=1: leave it unpatched, for comparisons)
 #   kernel/build.sh build    configure (when needed), compile and install into $PREFIX
 #   kernel/build.sh check    run the upstream regression suite (needs build first on macOS)
 #   kernel/build.sh export   rewrite kernel/patches from the commits on top of BASE
@@ -29,6 +30,9 @@ fetch() {
 	git -C "$src" fetch -q --depth 1 "$upstream" "$base"
 	git -C "$src" checkout -q FETCH_HEAD
 	echo /.swarmpg-configure >>"$src/.git/info/exclude"
+	if [ -n "${SWARMPG_UPSTREAM:-}" ]; then
+		return
+	fi
 	git -C "$src" -c user.name=swarmpg -c user.email=swarmpg@localhost \
 		am -q --keep-non-patch --committer-date-is-author-date "$here"/patches/*.patch
 	git -C "$src" log --oneline "$base"..HEAD

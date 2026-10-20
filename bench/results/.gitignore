@@ -1,0 +1,3 @@
+# raw memory samples and run markers
+*/*.mem
+*/.stop

@@ -126,8 +126,10 @@ LANGUAGE sql SECURITY DEFINER SET search_path = swarmpg, pg_catalog AS $$
   VALUES (p_agent, p_org, sha256(convert_to(coalesce(p_sql,''), 'UTF8')),
           left(coalesce(p_sql,''), 200), p_params, p_rows, p_bytes, p_affected, p_ms, p_sqlstate, p_error)
 $$;
+-- Only the gateway's admin connection writes audit records. An agent able to
+-- call this could file records in another agent's name.
 REVOKE ALL ON FUNCTION swarmpg.record_audit(uuid,uuid,text,int,int,bigint,bigint,double precision,text,text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION swarmpg.record_audit(uuid,uuid,text,int,int,bigint,bigint,double precision,text,text) TO agent_runtime;
+REVOKE ALL ON FUNCTION swarmpg.record_audit(uuid,uuid,text,int,int,bigint,bigint,double precision,text,text) FROM agent_runtime;
 
 -- Idempotency: a client retry after a timeout must not duplicate a write. The
 -- gateway claims (agent_id, idempotency_key) before the write and replays the
@@ -504,7 +506,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON swarmpg.memory TO agent_runtime;
 GRANT SELECT ON swarmpg.memory_history TO agent_runtime;   -- written only by the memory triggers
 GRANT SELECT, INSERT, UPDATE, DELETE ON swarmpg.documents TO agent_runtime;
 GRANT SELECT, INSERT ON swarmpg.events TO agent_runtime;
-GRANT USAGE, SELECT ON SEQUENCE swarmpg.events_id_seq TO agent_runtime;
+-- USAGE is enough for the id default; SELECT would reveal the fleet-wide event count.
+GRANT USAGE ON SEQUENCE swarmpg.events_id_seq TO agent_runtime;
+REVOKE SELECT ON SEQUENCE swarmpg.events_id_seq FROM agent_runtime;
 -- agent_runtime gets NO privileges on orgs, agents, audit, event_heads.
 REVOKE ALL ON swarmpg.event_heads FROM PUBLIC;
 
@@ -607,10 +611,25 @@ DO $$ BEGIN
   EXECUTE 'REVOKE pg_read_all_stats FROM agent_runtime';
 EXCEPTION WHEN OTHERS THEN NULL; END $$;
 REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION pg_catalog.pg_stat_get_activity(integer) FROM PUBLIC;
-DO $$ BEGIN
-  EXECUTE 'REVOKE EXECUTE ON FUNCTION pg_catalog.pg_stat_get_backend_activity(integer) FROM PUBLIC';
-EXCEPTION WHEN OTHERS THEN NULL; END $$;
+GRANT SELECT ON pg_catalog.pg_stat_activity TO pg_monitor;
+
+-- The same goes for every statistics function. The pg_stat_* views call them,
+-- and they expose fleet-wide counts (how many agents, rows written, audit
+-- volume) to any role. Monitoring keeps working through pg_monitor.
+DO $$
+DECLARE fn regprocedure;
+BEGIN
+  FOR fn IN SELECT p.oid::regprocedure FROM pg_proc p
+            WHERE p.pronamespace = 'pg_catalog'::regnamespace AND p.proname LIKE 'pg\_stat\_get\_%'
+  LOOP
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', fn);
+    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO pg_monitor', fn);
+  END LOOP;
+END $$;
+
+-- No cross-agent messaging: pg_notify() would let one agent signal another
+-- through the shared database (the gateway also refuses LISTEN and NOTIFY).
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_notify(text, text) FROM PUBLIC;
 
 -- Block ALL DDL and other object creation from agents (defense in depth; agents
 -- have no DDL need now that scratch is gone). Keyed on session_user because the

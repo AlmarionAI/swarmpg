@@ -15,5 +15,6 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
 fi
 
 # With PRINCIPAL_SECRET set, agent principals must be signed with it (the gateway does).
+# Arguments are passed on to postgres (e.g. -c shared_buffers=512MB).
 exec postgres -D "$PGDATA" -c unix_socket_directories=/tmp \
-	${PRINCIPAL_SECRET:+-c agent_principal_secret=$PRINCIPAL_SECRET}
+	${PRINCIPAL_SECRET:+-c agent_principal_secret=$PRINCIPAL_SECRET} "$@"

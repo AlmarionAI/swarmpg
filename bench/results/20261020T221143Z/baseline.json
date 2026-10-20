@@ -1,0 +1,37 @@
+{
+  "label": "PgBouncer + RLS (baseline)",
+  "target": "pgbouncer",
+  "agents": 10000,
+  "requests_per_agent": 20,
+  "concurrency": 1000,
+  "total": 200000,
+  "ok": 200000,
+  "errors": 0,
+  "setup_seconds": 0.460876625,
+  "seconds": 18.681003509,
+  "requests_per_second": 10706.06297480997,
+  "p50_ms": 89.187,
+  "p95_ms": 114.817,
+  "p99_ms": 128.15,
+  "max_ms": 163.222,
+  "peak_agent_backends": 32,
+  "agent_connections": 10000,
+  "probes": [
+    {
+      "name": "read another agent's memory by changing identity (SET LOCAL)",
+      "blocked": false,
+      "detail": "rows=5 err=\u003cnil\u003e"
+    },
+    {
+      "name": "runaway query is refused before it runs",
+      "blocked": false,
+      "detail": "held a server connection for 5s, then: ERROR: canceling statement due to statement timeout (SQLSTATE 57014)"
+    },
+    {
+      "name": "session-level SET of the identity is refused",
+      "blocked": false,
+      "detail": "err=\u003cnil\u003e (a SET without LOCAL persists on the pooled server connection)"
+    }
+  ],
+  "environment": "Darwin arm64; Docker 29.7.2; 16 CPUs and 15 GiB for containers; 2 unrelated containers running"
+}

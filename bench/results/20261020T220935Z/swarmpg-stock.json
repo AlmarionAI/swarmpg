@@ -1,0 +1,20 @@
+{
+  "label": "SwarmPG gateway + stock Postgres",
+  "target": "gateway",
+  "agents": 10000,
+  "requests_per_agent": 20,
+  "concurrency": 1000,
+  "total": 200000,
+  "ok": 200000,
+  "errors": 0,
+  "setup_seconds": 0.844535543,
+  "seconds": 7.55276192,
+  "requests_per_second": 26480.379246483648,
+  "p50_ms": 36.499,
+  "p95_ms": 47.245,
+  "p99_ms": 74.995,
+  "max_ms": 127.514,
+  "peak_agent_backends": 32,
+  "agent_connections": 1000,
+  "environment": "Darwin arm64; Docker 29.7.2; 16 CPUs and 15 GiB for containers; 2 unrelated containers running"
+}

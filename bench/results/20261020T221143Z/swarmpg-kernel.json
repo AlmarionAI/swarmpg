@@ -1,0 +1,20 @@
+{
+  "label": "SwarmPG gateway + SwarmPG kernel",
+  "target": "gateway",
+  "agents": 10000,
+  "requests_per_agent": 20,
+  "concurrency": 1000,
+  "total": 200000,
+  "ok": 200000,
+  "errors": 0,
+  "setup_seconds": 0.837537584,
+  "seconds": 9.065263421,
+  "requests_per_second": 22062.238096324152,
+  "p50_ms": 43.364,
+  "p95_ms": 63.23,
+  "p99_ms": 78.483,
+  "max_ms": 209.523,
+  "peak_agent_backends": 32,
+  "agent_connections": 1000,
+  "environment": "Darwin arm64; Docker 29.7.2; 16 CPUs and 15 GiB for containers; 2 unrelated containers running"
+}

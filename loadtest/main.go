@@ -309,10 +309,20 @@ func main() {
 	probe("read peer SQL text (pg_stat_activity)", "reject", A.Token, "SELECT query FROM pg_stat_activity WHERE usename = current_user")
 	probe("read peer SQL text (backend function)", "reject", A.Token, "SELECT pg_stat_get_backend_activity(s) FROM pg_stat_get_backend_idset() s")
 	probe("session advisory lock", "reject", A.Token, "SELECT pg_advisory_lock(1)")
+	probe("signal other agents (pg_notify)", "reject", A.Token, "SELECT pg_notify('fleet', 'hello')")
+	// No fleet-wide metadata: counts and statistics describe every agent's rows.
+	if *pgURL != "" { // statistics exist only once the tables are analysed
+		psqlOut(*pgURL, "ANALYZE swarmpg.memory, swarmpg.memory_history, swarmpg.events, swarmpg.documents")
+	}
+	probe("read planner statistics of agent tables (pg_stats)", "zero", A.Token, "SELECT * FROM pg_stats WHERE schemaname = 'swarmpg'")
+	probe("read fleet-wide row counters (pg_stat_user_tables)", "reject", A.Token, "SELECT relname, n_live_tup FROM pg_stat_user_tables")
+	probe("read the fleet-wide event sequence", "reject", A.Token, "SELECT last_value FROM swarmpg.events_id_seq")
 	probe("large object spam", "reject", A.Token, "SELECT lo_create(0)")
 	// Control-plane confidentiality and log integrity.
 	probe("read agent registry (token hashes)", "reject", A.Token, "SELECT token_hash FROM swarmpg.agents")
 	probe("read server audit log", "reject", A.Token, "SELECT * FROM swarmpg.audit")
+	probe("forge an audit record for another agent", "reject", A.Token,
+		"SELECT swarmpg.record_audit($1, NULL, 'forged', 0, 0, 0, 0, 0, NULL, NULL)", B.ID)
 	probe("tamper with event log (DELETE)", "reject", A.Token, "DELETE FROM swarmpg.events")
 	probe("truncate event log", "reject", A.Token, "TRUNCATE swarmpg.events")
 	// Legitimate operations still work.

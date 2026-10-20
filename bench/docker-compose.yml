@@ -1,0 +1,80 @@
+# Benchmark stack. bench/run.sh starts one profile at a time on a fresh volume:
+#   baseline        PgBouncer (transaction pooling) + Postgres with row-level security
+#   swarmpg-stock   SwarmPG gateway + the same Postgres, unpatched
+#   swarmpg-kernel  SwarmPG gateway + the SwarmPG kernel
+# Both Postgres images are built from the same upstream commit (kernel/BASE).
+# Trust authentication and fixed secrets: for benchmarking on one machine only.
+name: swarmpg-bench
+
+x-postgres: &postgres
+  command: ["-c", "shared_buffers=512MB", "-c", "max_connections=200"]
+  healthcheck:
+    test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "swarmpg"]
+    interval: 2s
+    retries: 60
+
+services:
+  pg-upstream:
+    <<: *postgres
+    profiles: ["baseline", "swarmpg-stock"]
+    image: swarmpg-bench/postgres-upstream
+    build:
+      context: ..
+      dockerfile: docker/kernel.Dockerfile
+      args:
+        UPSTREAM: "1"
+
+  pg-kernel:
+    <<: *postgres
+    profiles: ["swarmpg-kernel"]
+    image: swarmpg-bench/postgres-kernel
+    build:
+      context: ..
+      dockerfile: docker/kernel.Dockerfile
+    environment:
+      PRINCIPAL_SECRET: bench-principal-secret
+
+  pgbouncer:
+    profiles: ["baseline"]
+    image: swarmpg-bench/pgbouncer
+    build:
+      context: ..
+      dockerfile: docker/pgbouncer.Dockerfile
+    ulimits:
+      nofile: 65536
+    depends_on:
+      pg-upstream:
+        condition: service_healthy
+
+  gateway-stock:
+    profiles: ["swarmpg-stock"]
+    image: swarmpg-bench/gateway
+    build:
+      context: ..
+      dockerfile: docker/gateway.Dockerfile
+    environment:
+      DATABASE_URL: postgres://postgres@pg-upstream:5432/swarmpg?sslmode=disable
+    depends_on:
+      pg-upstream:
+        condition: service_healthy
+
+  gateway-kernel:
+    profiles: ["swarmpg-kernel"]
+    image: swarmpg-bench/gateway
+    environment:
+      DATABASE_URL: postgres://postgres@pg-kernel:5432/swarmpg?sslmode=disable
+      PRINCIPAL_SECRET: bench-principal-secret
+    depends_on:
+      pg-kernel:
+        condition: service_healthy
+
+  bench:
+    profiles: ["client"]
+    image: swarmpg-bench/client
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile
+    ulimits:
+      nofile: 65536
+    volumes:
+      - ./results:/results

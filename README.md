@@ -104,26 +104,41 @@ make e2e KERNEL=1                 # the same run on the kernel, plus kernel and 
 
 ## What is verified
 
-Every CI run asserts the isolation boundary. The load test drives a fleet through the
-gateway, then 27 probes attack it through the API: identity spoofing, privilege
-escalation, reading another agent's rows, DDL, pool leaks through temp tables or held
-cursors, terminating other backends, advisory locks, and reading or tampering with the
-registry, audit log and journal. On the kernel, 11 more probes connect to Postgres directly
-as the agent role, **bypassing the gateway**: unsealed queries, half-set or forged
-identities, identity changes, reads of another agent's or org's rows, and attempts to
-raise a budget are all refused. 6 budget probes run through the gateway: an over-budget
-write fails as a whole, and runaway queries are refused before they run, including under
-`EXPLAIN ANALYZE` and inside `query_to_xml()`. 21 memory probes check compare-and-set
-(including 20 concurrent writers at one version, of which exactly one wins), reads of the
-past, history, undo and undoing a delete, that raw SQL cannot forge a version or rewrite
-history, and that no agent can see another's history. 12 MCP probes check the `/mcp` endpoint:
-both protocol eras, token and Origin checks, every tool, and the same isolation through
-the tools. One more checks that the MCP `query` tool is held to the kernel budget. The
-official TypeScript (1.32) and Python (1.9) MCP SDKs connect and call every tool.
+Every CI run attacks the isolation boundary: 65 probes on stock Postgres and 83 on the
+kernel. [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) maps each one to the threat it covers.
 
-A single laptop run (Apple M-series, stock Postgres 14): 2,000 agents on 32 backend
-connections, 6,120 requests/s, p99 519 ms, all probes passing. This is a smoke test, not a
-benchmark.
+- **Through the API (32):** identity spoofing, privilege escalation, reading another
+  agent's rows, DDL, pool leaks through temp tables or held cursors, terminating other
+  backends, advisory locks, signalling other agents, fleet-wide statistics and counters,
+  and reading, forging or tampering with the registry, audit log and journal.
+- **Versioned memory (21):** compare-and-set, including 20 concurrent writers at one
+  version of which exactly one wins; reads of the past, history, undo and undoing a
+  delete; raw SQL cannot forge a version or rewrite history; no agent sees another's
+  history.
+- **MCP (12):** both protocol eras, token and Origin checks, every tool, and the same
+  isolation through the tools. The official TypeScript (1.32) and Python (1.9) MCP SDKs
+  connect and call every tool.
+- **Kernel, raw SQL as the agent role, bypassing the gateway (11):** unsealed queries,
+  half-set or forged identities, identity changes, reads of another agent's or org's
+  rows, and attempts to raise a budget are all refused.
+- **Kernel budgets (7):** an over-budget write fails as a whole; runaway queries are
+  refused before they run, including under `EXPLAIN ANALYZE`, inside `query_to_xml()`
+  and through MCP.
+
+## Benchmark
+
+10,000 agents, 200,000 requests per setup, the same Postgres build and the same 32 server
+connections everywhere ([method and both runs](bench/README.md)):
+
+| Setup | Req/s | p95 ms | p99 ms | Another agent's rows via `SET LOCAL` |
+|---|---:|---:|---:|---|
+| PgBouncer + row-level security | 10.7–11.0k | 110–115 | 115–128 | readable |
+| SwarmPG gateway + stock Postgres | 22.0–26.5k | 47–65 | 75–121 | refused (gateway) |
+| SwarmPG gateway + SwarmPG kernel | 22.1–25.8k | 48–63 | 59–79 | refused, even with raw SQL |
+
+The gateway runs each transaction next to the database instead of across the agent's
+round trips, so the same connections serve 2.0–2.4× the requests. The kernel's checks
+cost nothing measurable. Run `bench/run.sh` to reproduce on your machine.
 
 ## Known limits (v0.1)
 
@@ -142,6 +157,9 @@ benchmark.
 ## Docs
 
 - [docs/gateway.md](docs/gateway.md): the HTTP API and the security model in detail
+- [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md): attackers, threats, controls, the probe for
+  each, and the residual risks
+- [bench/README.md](bench/README.md): the benchmark method, results and how to reproduce them
 - [docs/DESIGN.md](docs/DESIGN.md): the long-term architecture and its risks
 - [kernel/README.md](kernel/README.md): the kernel patch series and how to work on it
 - [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md)
