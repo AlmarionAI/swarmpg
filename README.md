@@ -1,36 +1,46 @@
 # SwarmPG
 
-**Postgres for agent fleets.** Every agent gets its own identity, enforced by the database
-itself, plus isolation, budgets and an audit trail, while thousands of agents share a few
-dozen Postgres connections.
+[![ci](https://github.com/AlmarionAI/swarmpg/actions/workflows/ci.yml/badge.svg)](https://github.com/AlmarionAI/swarmpg/actions/workflows/ci.yml)
 
-> **Status: v0.1, pre-release.** The gateway and agent schema work on stock Postgres 14+.
-> The SwarmPG kernel (PostgreSQL 19 plus a small patch series) adds an agent identity that
-> SQL cannot change. The storage rebuild in [docs/DESIGN.md](docs/DESIGN.md) (branching,
-> time travel, millions of lightweight per-agent spaces) is the long-term direction and is
-> **not** built yet.
+**Postgres for agent fleets.** Give thousands of AI agents their own slice of one Postgres
+database: an identity they cannot change, data no other agent can read, budgets they
+cannot raise, and memory they can safely share, roll back and audit. They write ordinary
+SQL, over REST, MCP or both.
 
-## Why
+Agents are the new database users, and the usual setup was built for trusted application
+code. If an agent can send SQL on a connection, it can change the setting row-level
+security trusts and read another agent's data, run a query that occupies the database for
+minutes, or overwrite another agent's work. SwarmPG closes each of those in the database
+itself, and the [test suite attacks every one of them](docs/THREAT-MODEL.md) on every change.
 
-Agents write their own SQL. On plain Postgres, row-level security keyed on a session
-setting is only as strong as the agent's inability to change that setting, a shared role
-lets one looping agent exhaust the fleet, and nothing records what each agent actually ran.
-SwarmPG closes those gaps in three layers:
+## What agents get
 
-| Layer | What it enforces |
-|---|---|
-| **Kernel** (`kernel/`) | The agent's identity, agent and org together, is one *sealed* value: once the gateway sets it for a transaction, no `SET`, `RESET` or `set_config()` can change either half, and role defaults or startup options cannot pre-set it. With a server secret, it must also carry the gateway's HMAC signature, so SQL alone cannot claim any identity. No query runs until an identity is sealed. Per-agent budgets live in the executor: a cost gate refuses runaway plans before they start, and a row cap bounds what a statement returns or modifies. The gateway can lower budgets per agent; the agent cannot raise them. |
-| **Schema** (`sql/schema.sql`) | Forced row-level security on every agent table; no DDL; fleet-wide levers revoked (backend signalling, other agents' in-flight SQL, advisory locks, large objects, `set_config`); versioned memory with compare-and-set writes, read-only history, reads of the past and undo; an append-only, hash-chained event journal; a server-side audit log agents cannot read or write. |
-| **Gateway** (`gateway/`) | Token auth, per-agent rate, row, byte, concurrency and time budgets, a statement guard, connection reset between agents, idempotent writes, and errors structured for an LLM to repair its own SQL. Served over a REST API and a built-in MCP endpoint. |
+- **An identity the database enforces.** Agent and org are sealed into the transaction;
+  no `SET`, function or role trick can change them. On the SwarmPG kernel the identity is
+  also signed, so it holds even for SQL that never went through the gateway.
+- **Isolation by default.** Forced row-level security on every agent table, no DDL, and
+  no view of other agents' queries or of fleet-wide statistics.
+- **Budgets.** Rate, concurrency, row, byte and time limits per agent. On the kernel they
+  live in the executor: a query whose estimated cost exceeds the agent's budget is refused
+  before it runs, a write over the row budget fails as a whole, and no agent can raise its
+  own.
+- **Memory built for agents.** Every write is versioned. Compare-and-set makes
+  read-think-write safe without holding a transaction open, and any key can be read as it
+  was, or undone.
+- **MCP and REST.** A built-in MCP endpoint (protocol 2026-07-28 and earlier) with eight
+  tools, the same operations over REST and as SQL functions, and errors written for a model
+  to repair its own SQL.
+- **A record of what happened.** An append-only, hash-chained journal per agent, and a
+  server-side audit log of every SQL statement an agent sends, refused ones included.
 
 ## Quickstart
 
+<!-- doctest: skip -->
 ```bash
-docker compose up --build        # kernel + gateway on localhost; first build compiles Postgres (~10 min)
+docker compose up --build    # the kernel and the gateway on localhost:8080 (first build ~10 min)
 ```
 
-Then mint an agent and query as it:
-
+<!-- doctest: expect swarmpg.memory -->
 ```bash
 ORG=$(curl -s -H 'X-Admin-Key: dev-admin-key' -d '{"name":"demo"}' localhost:8080/v1/orgs | jq -r .id)
 TOKEN=$(curl -s -H 'X-Admin-Key: dev-admin-key' -d "{\"org_id\":\"$ORG\",\"name\":\"a1\"}" localhost:8080/v1/agents | jq -r .token)
@@ -38,97 +48,15 @@ curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/v1/schema
 curl -s -H "Authorization: Bearer $TOKEN" -d '{"sql":"SELECT count(*) FROM swarmpg.memory"}' localhost:8080/v1/query
 ```
 
-The quickstart uses trust authentication and a default admin key. It is for local
-development only.
-
-## Connect an agent over MCP
-
-The gateway serves the Model Context Protocol at `POST /mcp` (Streamable HTTP, stateless,
-JSON responses). Point any MCP client at it with the agent's token:
-
-```json
-{
-  "mcpServers": {
-    "swarmpg": {
-      "url": "http://localhost:8080/mcp",
-      "headers": { "Authorization": "Bearer <agent token>" }
-    }
-  }
-}
-```
-
-The agent gets eight tools: `schema`, `query`, `memory_get`, `memory_put`, `memory_delete`,
-`memory_history`, `memory_undo` and `events_append`. They run under the same identity,
-budgets and limits as the REST API. A
-failed call comes back as a tool error carrying the SQLSTATE, hint and position, so the
-model can fix its SQL and retry. Protocol versions 2026-07-28, 2025-11-25, 2025-06-18 and
-2025-03-26 are supported.
-
-## Versioned memory
-
-Agents read, think (often for many seconds), then write. Holding a transaction open across
-that pause would pin a database connection, so SwarmPG makes the write itself safe instead:
-
-- Every write to a memory key gets a new version. Triggers record each one in a read-only
-  history, so this holds for writes made with raw SQL too, and an agent cannot set a version
-  or edit history.
-- `expected_version` makes a write compare-and-set: `0` creates the key only if it is
-  absent, `N` writes only if the key is still at version `N`. Otherwise nothing is written
-  and the agent gets `409 version_conflict` with the `current_version`, re-reads, and
-  retries.
-- Read any key as it was, by `version` or `as_of` a time, list its history, and undo the
-  latest change or restore any version. Undo writes a new version, so it can itself be
-  undone, and a deleted key can be brought back.
-
-```bash
-curl -s -X PUT -H "Authorization: Bearer $TOKEN" -d '{"value":{"plan":"a"},"expected_version":0}' localhost:8080/v1/memory/plan
-curl -s -X PUT -H "Authorization: Bearer $TOKEN" -d '{"value":{"plan":"b"},"expected_version":1}' localhost:8080/v1/memory/plan
-curl -s -H "Authorization: Bearer $TOKEN" "localhost:8080/v1/memory/plan?version=1"
-curl -s -X POST -H "Authorization: Bearer $TOKEN" localhost:8080/v1/memory/plan/undo
-```
-
-The same operations are SQL functions agents can call from `query`
-(`swarmpg.memory_put`, `memory_history`, `memory_as_of`, `memory_at_version`,
-`memory_undo`, `memory_delete`) and MCP tools.
-
-## From source
-
-Needs Go 1.23+, and Postgres 14+ on `PATH` for the stock path.
-
-```bash
-make test                         # Go vet and unit tests
-make e2e                          # stock Postgres: gateway + fleet load test + isolation probes
-make kernel && make kernel-check  # build the SwarmPG kernel and run the upstream regression suite
-make e2e KERNEL=1                 # the same run on the kernel, plus kernel and budget probes
-```
-
-## What is verified
-
-Every CI run attacks the isolation boundary: 65 probes on stock Postgres and 83 on the
-kernel. [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) maps each one to the threat it covers.
-
-- **Through the API (32):** identity spoofing, privilege escalation, reading another
-  agent's rows, DDL, pool leaks through temp tables or held cursors, terminating other
-  backends, advisory locks, signalling other agents, fleet-wide statistics and counters,
-  and reading, forging or tampering with the registry, audit log and journal.
-- **Versioned memory (21):** compare-and-set, including 20 concurrent writers at one
-  version of which exactly one wins; reads of the past, history, undo and undoing a
-  delete; raw SQL cannot forge a version or rewrite history; no agent sees another's
-  history.
-- **MCP (12):** both protocol eras, token and Origin checks, every tool, and the same
-  isolation through the tools. The official TypeScript (1.32) and Python (1.9) MCP SDKs
-  connect and call every tool.
-- **Kernel, raw SQL as the agent role, bypassing the gateway (11):** unsealed queries,
-  half-set or forged identities, identity changes, reads of another agent's or org's
-  rows, and attempts to raise a budget are all refused.
-- **Kernel budgets (7):** an over-budget write fails as a whole; runaway queries are
-  refused before they run, including under `EXPLAIN ANALYZE`, inside `query_to_xml()`
-  and through MCP.
+Then connect an MCP client to `http://localhost:8080/mcp` with the header
+`Authorization: Bearer <token>`. [Getting started](docs/getting-started.md) walks through
+REST, MCP, SQL, versioned memory and the error codes; every command in it runs in CI. The
+quickstart uses development credentials; see the deploy checklist at the end of that guide.
 
 ## Benchmark
 
-10,000 agents, 200,000 requests per setup, the same Postgres build and the same 32 server
-connections everywhere ([method and both runs](bench/README.md)):
+10,000 agents, 200,000 requests per setup, the same Postgres build and the same 32 database
+connections everywhere ([method, both runs, caveats](bench/README.md)):
 
 | Setup | Req/s | p95 ms | p99 ms | Another agent's rows via `SET LOCAL` |
 |---|---:|---:|---:|---|
@@ -136,39 +64,51 @@ connections everywhere ([method and both runs](bench/README.md)):
 | SwarmPG gateway + stock Postgres | 22.0–26.5k | 47–65 | 75–121 | refused (gateway) |
 | SwarmPG gateway + SwarmPG kernel | 22.1–25.8k | 48–63 | 59–79 | refused, even with raw SQL |
 
-The gateway runs each transaction next to the database instead of across the agent's
-round trips, so the same connections serve 2.0–2.4× the requests. The kernel's checks
-cost nothing measurable. Run `bench/run.sh` to reproduce on your machine.
+The gateway runs each transaction next to the database instead of across the agent's round
+trips, so the same connections serve 2.0–2.4× the requests. `bench/run.sh` reproduces it.
 
-## Known limits (v0.1)
+## How it works
 
-- On stock Postgres, identity and budgets depend on the gateway; the kernel is what makes
-  them hold for raw SQL.
-- The kernel row cap does not apply to SQL `FETCH` from a cursor (the gateway refuses
-  cursors; the cost budget still applies). There is no byte budget in the kernel yet;
-  the gateway enforces one.
-- No private DDL: agents use the shared `memory`, `documents` and `events` tables.
-- One gateway process; rate limits are in memory.
-- Memory history is kept indefinitely (no retention policy yet), and versioning, reads of
-  the past and undo cover memory only, not documents.
-- MCP is tools-only: no resources, prompts or server-sent events, and authentication uses
-  agent bearer tokens rather than OAuth.
+| Layer | Enforces |
+|---|---|
+| **Gateway** (`gateway/`, Go) | Agent tokens, rate and concurrency limits, result caps, a statement guard, a clean connection for every request, REST and MCP |
+| **Schema** (`sql/schema.sql`) | Row-level security, revoked fleet-wide levers, versioned memory, the journal, the audit log. Works on stock Postgres 14+ |
+| **Kernel** (`kernel/`, PostgreSQL 19 + 2 patches) | The sealed, signed agent principal and a fail-closed gate; tighten-only row and cost budgets in the executor |
+
+The gateway and schema run on any Postgres 14+. The kernel is PostgreSQL 19 plus a patch
+series of about 1,200 lines (half of it tests), rebased on upstream; use it wherever an
+agent could reach Postgres without the gateway.
+
+## Status
+
+**v0.1, the first public release.** What is here is tested end to end: 65 attack probes on
+stock Postgres and 83 on the kernel, the upstream Postgres regression suite (241/241 on
+the kernel), the official TypeScript and Python MCP SDKs, and the benchmark above.
+
+[docs/DESIGN.md](docs/DESIGN.md) describes where SwarmPG is going: storage-level branching
+and time travel, millions of lightweight per-agent spaces, scale to zero. **None of that
+is built yet**; the design marks what v0.1 ships. [Known limits](docs/THREAT-MODEL.md#residual-risks)
+are listed in the threat model.
 
 ## Docs
 
-- [docs/gateway.md](docs/gateway.md): the HTTP API and the security model in detail
-- [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md): attackers, threats, controls, the probe for
-  each, and the residual risks
-- [bench/README.md](bench/README.md): the benchmark method, results and how to reproduce them
-- [docs/DESIGN.md](docs/DESIGN.md): the long-term architecture and its risks
-- [kernel/README.md](kernel/README.md): the kernel patch series and how to work on it
-- [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md)
+- [Getting started](docs/getting-started.md): REST, MCP and SQL, step by step
+- [Gateway reference](docs/gateway.md): the API, configuration and what each layer enforces
+- [Threat model](docs/THREAT-MODEL.md): attackers, controls, the probe for each, residual risks
+- [Benchmark](bench/README.md): method, results, how to reproduce
+- [Kernel](kernel/README.md): the patch series and how to build it
+- [Design](docs/DESIGN.md): the long-term architecture
+
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Contributions
+require the [CLA](CLA.md). Report security issues privately as described in
+[SECURITY.md](SECURITY.md).
 
 ## License
 
 Apache-2.0 ([LICENSE](LICENSE)), except the kernel patches in `kernel/`, which modify
 PostgreSQL and are under the PostgreSQL License ([kernel/LICENSE](kernel/LICENSE)).
-Contributions require the [CLA](CLA.md).
 
 PostgreSQL is a trademark of the PostgreSQL Community Association of Canada. SwarmPG is an
 independent project, not affiliated with or endorsed by the PostgreSQL Global Development

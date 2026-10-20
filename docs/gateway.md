@@ -1,26 +1,36 @@
-# SwarmPG gateway (out-of-tree frontend prototype)
+# Gateway reference
 
-Postgres for agent fleets: one gateway in front of Postgres gives every agent its own identity,
-database-enforced isolation, budgets, an append-only audit journal, a server-side audit log and an
-LLM-friendly API, while thousands of agents share a few dozen backend connections.
+The gateway sits between agents and Postgres. It authenticates each agent's token, applies
+its limits, runs its request as one transaction on a pooled connection under the agent's
+identity, cleans the connection, and records what ran. It serves a REST API and an MCP
+endpoint, and works on stock Postgres 14+ or the SwarmPG kernel. For a walkthrough, start
+with [getting-started.md](getting-started.md).
 
-This is the phase-1 prototype and the executable specification for the in-core frontend
-(`DESIGN.md`, milestone M4). It runs on **stock Postgres 14+**; on the SwarmPG kernel
-(`../swarmpg-core`) the sealed principal and `agent_require_principal` replace the gateway's
-statement guard as the primary control.
+## Run it
 
-## Quickstart (macOS/Linux, Postgres 14+ and Go 1.23+ installed)
-
+<!-- doctest: skip -->
 ```bash
-make pg-start          # throwaway cluster in ./.pg on :5499, schema applied
-make gateway           # :8080, admin key "dev-admin-key" (override with ADMIN_KEY)
-make loadtest AGENTS=2000 REQUESTS=10   # in another shell; exits non-zero if any isolation probe fails
-make pg-stop
+make pg-start && make gateway                         # stock Postgres on :5499, gateway on :8080
+make pg-start KERNEL=1 && make gateway KERNEL=1       # the same on the SwarmPG kernel (after make kernel)
 ```
 
-`make pg-start` assumes Homebrew/packaged Postgres on `PATH` with `trust` auth and the current OS
-user as a superuser (prototype convenience — not a deployment posture). The cluster and its WAL
-live in `./.pg`, which is git-ignored.
+`make pg-start` creates a throwaway cluster in `./.pg` (or `./.pg-kernel`) with `trust`
+authentication and the current OS user as superuser: a development setup, not a
+deployment.
+
+## Configuration
+
+| Variable | Default | |
+|---|---|---|
+| `DATABASE_URL` | `postgres://127.0.0.1:5499/swarmpg?sslmode=disable` | Admin connection (a superuser or the schema owner): the agent registry and the audit log |
+| `RUNTIME_DATABASE_URL` | `agent_runtime` on the same host and database | The connection all agent SQL runs on; must log in as `agent_runtime` |
+| `ADMIN_KEY` | `dev-admin-key` (logged as a warning) | Required in `X-Admin-Key` on admin calls |
+| `ADDR` | `:8080` | Listen address. Plain HTTP: terminate TLS in front |
+| `PRINCIPAL_SECRET` | none | Kernel only: signs each sealed principal; must equal the server's `agent_principal_secret` |
+| `MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `/mcp`; requests with any other `Origin` get 403 |
+
+The runtime pool holds 32 connections and the admin pool 4. The gateway detects the
+kernel at startup and logs which mode it runs in.
 
 ## API
 
@@ -38,9 +48,11 @@ live in `./.pg`, which is git-ignored.
 | `POST /v1/memory/{key}/undo {to_version,expected_version}` | agent | restore the state before the latest change, or `to_version`, as a new version |
 | `POST /v1/events {kind,payload}` | agent | hash-chained append-only journal; honours `Idempotency-Key` |
 | `POST /mcp` | agent | the same operations as MCP tools (see below) |
+| `GET /healthz` | none | liveness, request and error counters, pool sizes |
 
-Writes honour an `Idempotency-Key` header: a retry after a timeout replays the stored response
-instead of duplicating the write. Query errors carry the SQLSTATE `code`, `detail`, `hint`,
+`POST /v1/events` honours an `Idempotency-Key` header: a retry after a timeout replays the
+stored response instead of appending twice. Memory writes get the same safety from
+`expected_version`. Query errors carry the SQLSTATE `code`, `detail`, `hint`,
 `position` and a `retryable` flag so an agent's control loop can decide retry vs repair.
 
 ## MCP endpoint
@@ -77,37 +89,37 @@ server-sent events. `GET` and `DELETE` return 405.
   `isError: true` and the same error body as the REST API, so the model can read it and
   repair its call.
 
-## What the database enforces (not the prompt, not the gateway)
+## What the database enforces
 
-Every agent query runs as one shared low-privilege role, `agent_runtime`, with identity carried in
-transaction-local `app.agent_id`/`app.org_id`. `sql/schema.sql`:
+Every agent query runs as one shared low-privilege role, `agent_runtime`. `sql/schema.sql`
+makes these hold whatever SQL an agent sends:
 
-- **Isolation** — agent data lives in tenant-scoped shared tables (`memory`, `documents`, `events`)
-  with `FORCE ROW LEVEL SECURITY` keyed on the principal. Org-shared memory rows are readable by
-  peers but writable only by the owner (separate per-command policies).
-- **No DDL / no object ownership** — agents cannot `CREATE` anything. A shared DDL scratch schema
-  cannot be isolated per-agent on stock Postgres under pooling, so "private DDL" is deferred
-  (DESIGN.md tier 2). Agents use `swarmpg.documents` (arbitrary JSON in named collections) instead.
-- **No fleet-wide levers** — `set_config`, `pg_terminate_backend`/`pg_cancel_backend`, the advisory
-  lock family and large objects are revoked from `PUBLIC`; `plpgsql`/`sql` languages are revoked
-  from agents; an event trigger blocks all agent DDL.
-- **Tamper-evident journal** — `swarmpg.events` is append-only and hash-chained; the chain is
-  serialized per agent (a chain-head row under `FOR UPDATE`), so concurrent appends never fork, and
-  each hash binds the agent, sequence and canonical payload so an auditor can recompute it.
-- **Server-side audit** — `swarmpg.audit` records what the gateway actually executed (statement
-  hash, rows, bytes, duration, SQLSTATE) through a `SECURITY DEFINER` function agents cannot read or
-  write. This is the real audit trail; `events` is the agent's own journal.
+- **Isolation.** Agent data lives in shared tables (`memory`, `memory_history`,
+  `documents`, `events`) with forced row-level security keyed on the agent's identity.
+  Org-shared memory is readable by peers and writable only by its owner.
+- **No objects.** Agents cannot create anything; an event trigger refuses all agent DDL.
+  `documents` (JSON in named collections) stands in for private tables.
+- **No fleet-wide levers.** Revoked from agents: `set_config`, backend signalling, the
+  advisory-lock family, large objects, `pg_notify`, `pg_stat_activity` and every
+  `pg_stat_get_*` statistics function (still granted to `pg_monitor`), and `SELECT` on the
+  event sequence. Procedural languages are revoked, so agents cannot write functions.
+- **Versioned memory.** Triggers version every memory write and keep a read-only history;
+  the compare-and-set, history and undo functions run with the agent's own rights.
+- **A tamper-evident journal.** `events` is append-only and hash-chained per agent; each
+  hash binds the agent, sequence and canonical payload, so an auditor can recompute it.
+- **A server-side audit log.** `audit` records every SQL statement the gateway ran or
+  refused for an agent: a hash and the first 200 characters of the statement, rows, bytes,
+  duration and SQLSTATE. Agents can neither read nor write it.
 
-The gateway adds, on top of the database boundary: a byte budget and per-agent concurrency cap
-(one agent cannot exhaust the pool or OOM the frontend), a statement guard that strips comments and
-normalises whitespace before classifying, per-request connection reset (`CLOSE ALL; RESET ALL;
-DISCARD TEMP; DISCARD SEQUENCES`) so nothing leaks across the pool, precision-preserving parameter
-decoding, request-body and server timeouts, and a constant-time admin-key check.
+On top of that the gateway applies each agent's rate, concurrency, row, byte and time
+limits; a statement guard that refuses `SET`, transaction control, DDL, `COPY`, cursors and
+multiple statements after stripping comments and normalising whitespace; and a reset of
+every connection after every request (`CLOSE ALL; RESET ALL; DISCARD TEMP; DISCARD
+SEQUENCES`). Audit records and last-seen times are written in batches in the background,
+so they never queue in front of agent requests.
 
-`make loadtest` drives thousands of agents through the gateway and then runs 25 isolation probes
-that **assert** their outcome (identity spoofing, RLS reads, DDL, pool-leak via temp/cursor,
-backend termination, advisory locks, registry/audit reads, log tampering); it exits non-zero if any
-probe fails.
+The probes that check all of this, and what is not covered, are in
+[THREAT-MODEL.md](THREAT-MODEL.md).
 
 ## Stock Postgres vs the SwarmPG kernel
 
@@ -125,7 +137,3 @@ An agent that reached Postgres directly still could not change or forge its iden
 another agent's or org's rows, run an unsealed query, or raise a budget; the kernel probes in
 `make e2e KERNEL=1` check exactly that. On the kernel, `max_rows` also bounds the rows one
 statement may modify: a larger write fails with SQLSTATE 53400 and nothing is applied.
-
-All agents share one role, so Postgres would show each agent the others' in-flight SQL in
-`pg_stat_activity`. `schema.sql` revokes the view and its backing functions from `PUBLIC` on
-both stock Postgres and the kernel.

@@ -496,7 +496,7 @@ func (g *Gateway) query(ctx context.Context, a *Agent, q QueryRequest) (*QueryRe
 		return nil, errBadReq(perr.Error())
 	}
 	start := time.Now()
-	resp := &QueryResponse{Rows: [][]any{}}
+	resp := &QueryResponse{Columns: []string{}, Types: []string{}, Rows: [][]any{}}
 	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, q.SQL, params...)
 		if err != nil {

@@ -46,3 +46,6 @@ See [kernel/FORK-NOTES.md](kernel/FORK-NOTES.md) for the mechanism notes behind 
 - CI must pass: Go vet and tests, the end-to-end run on stock Postgres and on the kernel,
   and the kernel regression suite.
 - A change to the isolation boundary needs a probe in `loadtest/` that fails without it.
+- The README, `docs/getting-started.md` and `docs/gateway.md` are run as written in CI
+  (`scripts/check-docs.sh`). Keep their `bash` blocks runnable against a local gateway, or
+  mark a block `<!-- doctest: skip -->`; `<!-- doctest: expect TEXT -->` asserts its output.

@@ -36,6 +36,11 @@ jobs:
       - run: which psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
       - run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f sql/schema.sql
       - run: AGENTS=1000 REQUESTS=8 scripts/e2e.sh
+      - name: docs run as written
+        run: |
+          .bin/gateway &
+          for i in $(seq 1 50); do curl -sf -o /dev/null localhost:8080/healthz && break; sleep 0.2; done
+          scripts/check-docs.sh README.md docs/getting-started.md docs/gateway.md
 
   kernel:
     runs-on: ubuntu-latest
