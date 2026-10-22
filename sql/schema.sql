@@ -115,6 +115,10 @@ CREATE TABLE IF NOT EXISTS swarmpg.audit (
   error text
 );
 CREATE INDEX IF NOT EXISTS audit_agent_idx ON swarmpg.audit(agent_id, id);
+-- Stable gateway receipt IDs make asynchronous batch retries idempotent,
+-- including a lost commit acknowledgement and replay after gateway restart.
+ALTER TABLE swarmpg.audit ADD COLUMN IF NOT EXISTS receipt_id uuid;
+CREATE UNIQUE INDEX IF NOT EXISTS audit_receipt_idx ON swarmpg.audit(receipt_id);
 
 CREATE OR REPLACE FUNCTION swarmpg.record_audit(
   p_agent uuid, p_org uuid, p_sql text, p_params int,
@@ -130,6 +134,20 @@ $$;
 -- call this could file records in another agent's name.
 REVOKE ALL ON FUNCTION swarmpg.record_audit(uuid,uuid,text,int,int,bigint,bigint,double precision,text,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION swarmpg.record_audit(uuid,uuid,text,int,int,bigint,bigint,double precision,text,text) FROM agent_runtime;
+
+CREATE OR REPLACE FUNCTION swarmpg.record_audit_receipt(
+  p_receipt uuid, p_agent uuid, p_org uuid, p_at timestamptz,
+  p_hash text, p_sample text, p_params int, p_rows int, p_bytes bigint,
+  p_affected bigint, p_ms double precision, p_sqlstate text, p_error text) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = swarmpg, pg_catalog AS $$
+  INSERT INTO swarmpg.audit(receipt_id, agent_id, org_id, at, sql_hash, sql_sample, params_count,
+                            rows_returned, bytes_returned, affected, duration_ms, sqlstate, error)
+  VALUES (p_receipt, p_agent, p_org, p_at, decode(p_hash, 'hex'), left(p_sample, 200),
+          p_params, p_rows, p_bytes, p_affected, p_ms, p_sqlstate, left(p_error, 1000))
+  ON CONFLICT (receipt_id) DO NOTHING
+$$;
+REVOKE ALL ON FUNCTION swarmpg.record_audit_receipt(uuid,uuid,uuid,timestamptz,text,text,int,int,bigint,bigint,double precision,text,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION swarmpg.record_audit_receipt(uuid,uuid,uuid,timestamptz,text,text,int,int,bigint,bigint,double precision,text,text) FROM agent_runtime;
 
 -- Idempotency: a client retry after a timeout must not duplicate a write. The
 -- gateway claims (agent_id, idempotency_key) before the write and replays the

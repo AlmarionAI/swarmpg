@@ -118,12 +118,16 @@ var mcpTools = []mcpTool{
 		Name:  "memory_get",
 		Title: "Read a memory key",
 		Description: "Read one of your memory keys with its version. If you have no such key, an org-shared key " +
-			"of the same name is returned (own is false). Pass version, or as_of (an RFC 3339 time), to read " +
-			"your own key as it was then.",
+			"of the same name is returned (own is false), ordered by version descending then agent_id ascending. " +
+			"The result identifies its producer with agent_id. Pass from to select one visible live producer, " +
+			"or list_shared to list every org-shared producer. Pass version, or as_of (an RFC 3339 time), to read " +
+			"your own key as it was then. from, list_shared and historical selectors cannot be combined.",
 		InputSchema: object(map[string]any{
-			"key":     map[string]any{"type": "string", "description": "The memory key."},
-			"version": map[string]any{"type": "integer", "description": "Read this version from your history."},
-			"as_of":   map[string]any{"type": "string", "format": "date-time", "description": "Read the value as it was at this time."},
+			"key":         map[string]any{"type": "string", "description": "The memory key."},
+			"version":     map[string]any{"type": "integer", "minimum": 1, "description": "Read this version from your history."},
+			"as_of":       map[string]any{"type": "string", "format": "date-time", "description": "Read your value as it was at this time."},
+			"from":        map[string]any{"type": "string", "format": "uuid", "description": "Read the live key from this agent; other agents' keys must be shared with your org."},
+			"list_shared": map[string]any{"type": "boolean", "description": "Return {key, memories} with all org-shared live producers, ordered by version descending then agent_id ascending. Errors if the complete list exceeds your result budget."},
 		}, "key"),
 		Annotations: annotations("Read a memory key", true, false, true),
 	}, toolMemoryGet},
@@ -240,14 +244,26 @@ func toolQuery(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) 
 
 func toolMemoryGet(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) map[string]any {
 	var in struct {
-		Key     string     `json:"key"`
-		Version *int64     `json:"version"`
-		AsOf    *time.Time `json:"as_of"`
+		Key        string     `json:"key"`
+		Version    *int64     `json:"version"`
+		AsOf       *time.Time `json:"as_of"`
+		From       *string    `json:"from"`
+		ListShared bool       `json:"list_shared"`
 	}
 	if aerr := decodeArgs(args, &in); aerr != nil {
 		return toolError(aerr)
 	}
-	m, aerr := g.memoryGet(ctx, a, in.Key, in.Version, in.AsOf)
+	if aerr := validateMemoryRead(in.Key, in.Version, in.AsOf, in.From, in.ListShared); aerr != nil {
+		return toolError(aerr)
+	}
+	if in.ListShared {
+		out, aerr := g.memoryShared(ctx, a, in.Key)
+		if aerr != nil {
+			return toolError(aerr)
+		}
+		return toolJSON(out)
+	}
+	m, aerr := g.memoryGet(ctx, a, in.Key, in.Version, in.AsOf, in.From)
 	if aerr != nil {
 		return toolError(aerr)
 	}

@@ -10,6 +10,19 @@ mkdir -p "$root/.bin"
 (cd "$root/gateway" && go build -o "$root/.bin/gateway" .)
 (cd "$root/loadtest" && go build -o "$root/.bin/loadtest" .)
 
+# Integration regressions use generated fixture identities in this disposable
+# test database, including audit outage/recovery and shared-producer isolation.
+(cd "$root/gateway" && SWARMPG_TEST_DATABASE_URL="$DATABASE_URL" \
+	SWARMPG_TEST_PRINCIPAL_SECRET="${PRINCIPAL_SECRET:-}" go test -race -count=1 ./...)
+
+# GNU make exports command-line KERNEL=1 to recipes, including the kernel CI
+# job. Stock runs leave it unset and do not execute kernel-only wire tests.
+# Use the same disposable admin DATABASE_URL; the protocol client resolves it
+# directly, with optional PGHOST/PGPORT/PGUSER/PGDATABASE overrides.
+if [ "${KERNEL:-}" = "1" ]; then
+	python3 "$root/kernel/tests/agent_budget_protocol.py"
+fi
+
 ADDR=":$port" "$root/.bin/gateway" &
 gw=$!
 trap 'kill $gw 2>/dev/null || true' EXIT

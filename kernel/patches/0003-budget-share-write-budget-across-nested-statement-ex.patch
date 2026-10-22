@@ -1,0 +1,606 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlmarionAI <150292831+AlmarionAI@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 10:26:24 +0100
+Subject: [PATCH] [budget] share write budget across nested statement execution
+
+Keep cumulative write accounting on the outer executing portal, share it across nested SPI and SQL executors, and retain it across suspended protocol execution. Restore the dynamic scope on all portal error paths. A sticky exceeded limit prevents exception handlers from committing earlier writes after catching SQLSTATE 53400. Preserve the existing ModifyTable input-row charge point, including trigger bookkeeping, and executor-local accounting for portal-less internal work.
+---
+ src/backend/commands/portalcmds.c          |  25 ++++-
+ src/backend/executor/nodeModifyTable.c     |  15 +--
+ src/backend/tcop/pquery.c                  |  83 ++++++++++++++
+ src/include/nodes/execnodes.h              |   4 +-
+ src/include/tcop/pquery.h                  |   6 ++
+ src/include/utils/portal.h                 |   2 +
+ src/test/regress/expected/agent_budget.out | 119 +++++++++++++++++++++
+ src/test/regress/sql/agent_budget.sql      |  76 +++++++++++++
+ 8 files changed, 315 insertions(+), 15 deletions(-)
+
+diff --git a/src/backend/commands/portalcmds.c b/src/backend/commands/portalcmds.c
+index 01efac3..09c1a3c 100644
+--- a/src/backend/commands/portalcmds.c
++++ b/src/backend/commands/portalcmds.c
+@@ -300,16 +300,30 @@ PortalCleanup(Portal portal)
+ 		if (portal->status != PORTAL_FAILED)
+ 		{
+ 			ResourceOwner saveResourceOwner;
++			Portal		saveAgentRowBudget;
+ 
+ 			/* We must make the portal's resource owner current */
+ 			saveResourceOwner = CurrentResourceOwner;
+ 			if (portal->resowner)
+ 				CurrentResourceOwner = portal->resowner;
+ 
+-			ExecutorFinish(queryDesc);
+-			ExecutorEnd(queryDesc);
+-			FreeQueryDesc(queryDesc);
++			saveAgentRowBudget = BeginAgentRowBudget(portal);
++			PG_TRY();
++			{
++				ExecutorFinish(queryDesc);
++				ExecutorEnd(queryDesc);
++				FreeQueryDesc(queryDesc);
++				CheckAgentRowBudget();
++			}
++			PG_CATCH();
++			{
++				RestoreAgentRowBudget(saveAgentRowBudget);
++				CurrentResourceOwner = saveResourceOwner;
++				PG_RE_THROW();
++			}
++			PG_END_TRY();
+ 
++			RestoreAgentRowBudget(saveAgentRowBudget);
+ 			CurrentResourceOwner = saveResourceOwner;
+ 		}
+ 	}
+@@ -328,6 +342,7 @@ PersistHoldablePortal(Portal portal)
+ {
+ 	QueryDesc  *queryDesc = portal->queryDesc;
+ 	Portal		saveActivePortal;
++	Portal		saveAgentRowBudget;
+ 	ResourceOwner saveResourceOwner;
+ 	MemoryContext savePortalContext;
+ 	MemoryContext oldcxt;
+@@ -367,6 +382,7 @@ PersistHoldablePortal(Portal portal)
+ 	saveActivePortal = ActivePortal;
+ 	saveResourceOwner = CurrentResourceOwner;
+ 	savePortalContext = PortalContext;
++	saveAgentRowBudget = BeginAgentRowBudget(portal);
+ 	PG_TRY();
+ 	{
+ 		ScanDirection direction = ForwardScanDirection;
+@@ -471,6 +487,7 @@ PersistHoldablePortal(Portal portal)
+ 					elog(ERROR, "unexpected end of tuple stream");
+ 			}
+ 		}
++		CheckAgentRowBudget();
+ 	}
+ 	PG_CATCH();
+ 	{
+@@ -478,6 +495,7 @@ PersistHoldablePortal(Portal portal)
+ 		MarkPortalFailed(portal);
+ 
+ 		/* Restore global vars and propagate error */
++		RestoreAgentRowBudget(saveAgentRowBudget);
+ 		ActivePortal = saveActivePortal;
+ 		CurrentResourceOwner = saveResourceOwner;
+ 		PortalContext = savePortalContext;
+@@ -486,6 +504,7 @@ PersistHoldablePortal(Portal portal)
+ 	}
+ 	PG_END_TRY();
+ 
++	RestoreAgentRowBudget(saveAgentRowBudget);
+ 	MemoryContextSwitchTo(oldcxt);
+ 
+ 	/* Mark portal not active */
+diff --git a/src/backend/executor/nodeModifyTable.c b/src/backend/executor/nodeModifyTable.c
+index 87dc54e..85c3baf 100644
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -70,9 +70,9 @@
+ #include "rewrite/rewriteHandler.h"
+ #include "rewrite/rewriteManip.h"
+ #include "storage/lmgr.h"
++#include "tcop/pquery.h"			/* SwarmPG: statement write budget */
+ #include "utils/builtins.h"
+ #include "utils/datum.h"
+-#include "utils/guc.h"			/* SwarmPG: agent_max_rows */
+ #include "utils/injection_point.h"
+ #include "utils/rel.h"
+ #include "utils/snapmgr.h"
+@@ -4504,16 +4504,11 @@ ExecModifyTable(PlanState *pstate)
+ 
+ 		/*
+ 		 * SwarmPG: agent_max_rows also caps the rows one statement may modify,
+-		 * counted across all of its ModifyTable nodes, so a data-modifying CTE
+-		 * counts too.  The statement fails as a whole rather than half-apply.
++		 * including nested functions, triggers and data-modifying CTEs.  Keep
++		 * charging input rows, including attempts skipped by ON CONFLICT or
++		 * a BEFORE trigger, as before.  The owning portal shares the count.
+ 		 */
+-		if (agent_max_rows > 0 &&
+-			++estate->es_agent_rows_modified > (uint64) agent_max_rows)
+-			ereport(ERROR,
+-					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+-					 errmsg("statement would modify more rows than the agent row budget of %d",
+-							agent_max_rows),
+-					 errhint("Modify fewer rows per statement, for example with a more selective WHERE clause.")));
++		CountAgentRowModification(&estate->es_agent_rows_modified);
+ 
+ 		/*
+ 		 * When there are multiple result relations, each tuple contains a
+diff --git a/src/backend/tcop/pquery.c b/src/backend/tcop/pquery.c
+index fa2ef20..8af1ff9 100644
+--- a/src/backend/tcop/pquery.c
++++ b/src/backend/tcop/pquery.c
+@@ -25,6 +25,7 @@
+ #include "pg_trace.h"
+ #include "tcop/pquery.h"
+ #include "tcop/utility.h"
++#include "utils/guc.h"
+ #include "utils/memutils.h"
+ #include "utils/snapmgr.h"
+ 
+@@ -35,6 +36,71 @@
+  */
+ Portal		ActivePortal = NULL;
+ 
++/*
++ * SwarmPG: the outermost executing portal owns the write budget.  SPI and
++ * SQL functions create separate EStates, and nested EXECUTE/FETCH can change
++ * ActivePortal, but none of them starts a new client statement.  The count
++ * lives in the portal so protocol-level suspension does not replenish it.
++ * These scopes must restore the pointer on ERROR as well as normal return.
++ */
++static Portal agentRowBudgetPortal = NULL;
++
++Portal
++BeginAgentRowBudget(Portal portal)
++{
++	Portal		previous = agentRowBudgetPortal;
++
++	if (previous == NULL)
++		agentRowBudgetPortal = portal;
++	return previous;
++}
++
++void
++RestoreAgentRowBudget(Portal previous)
++{
++	agentRowBudgetPortal = previous;
++}
++
++static void
++AgentRowBudgetError(int limit)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
++			 errmsg("statement would modify more rows than the agent row budget of %d",
++					limit),
++			 errhint("Modify fewer rows per statement, for example with a more selective WHERE clause.")));
++}
++
++void
++CheckAgentRowBudget(void)
++{
++	/* A PL/pgSQL exception handler must not turn a budget failure into success. */
++	if (agentRowBudgetPortal != NULL &&
++		agentRowBudgetPortal->agent_rows_exceeded != 0)
++		AgentRowBudgetError(agentRowBudgetPortal->agent_rows_exceeded);
++}
++
++void
++CountAgentRowModification(uint64 *fallback_rows)
++{
++	uint64	   *rows = agentRowBudgetPortal != NULL ?
++		&agentRowBudgetPortal->agent_rows_modified : fallback_rows;
++
++	CheckAgentRowBudget();
++	if (agent_max_rows <= 0)
++		return;
++
++	/* Retain executor-local accounting for server-internal, portal-less work. */
++	if (*rows < PG_UINT64_MAX)
++		(*rows)++;
++	if (*rows > (uint64) agent_max_rows)
++	{
++		if (agentRowBudgetPortal != NULL)
++			agentRowBudgetPortal->agent_rows_exceeded = agent_max_rows;
++		AgentRowBudgetError(agent_max_rows);
++	}
++}
++
+ 
+ static void ProcessQuery(PlannedStmt *plan,
+ 						 const char *sourceText,
+@@ -435,6 +501,7 @@ PortalStart(Portal portal, ParamListInfo params,
+ 			int eflags, Snapshot snapshot)
+ {
+ 	Portal		saveActivePortal;
++	Portal		saveAgentRowBudget;
+ 	ResourceOwner saveResourceOwner;
+ 	MemoryContext savePortalContext;
+ 	MemoryContext oldContext;
+@@ -450,6 +517,7 @@ PortalStart(Portal portal, ParamListInfo params,
+ 	saveActivePortal = ActivePortal;
+ 	saveResourceOwner = CurrentResourceOwner;
+ 	savePortalContext = PortalContext;
++	saveAgentRowBudget = BeginAgentRowBudget(portal);
+ 	PG_TRY();
+ 	{
+ 		ActivePortal = portal;
+@@ -586,6 +654,7 @@ PortalStart(Portal portal, ParamListInfo params,
+ 				portal->tupDesc = NULL;
+ 				break;
+ 		}
++		CheckAgentRowBudget();
+ 	}
+ 	PG_CATCH();
+ 	{
+@@ -593,6 +662,7 @@ PortalStart(Portal portal, ParamListInfo params,
+ 		MarkPortalFailed(portal);
+ 
+ 		/* Restore global vars and propagate error */
++		RestoreAgentRowBudget(saveAgentRowBudget);
+ 		ActivePortal = saveActivePortal;
+ 		CurrentResourceOwner = saveResourceOwner;
+ 		PortalContext = savePortalContext;
+@@ -603,6 +673,7 @@ PortalStart(Portal portal, ParamListInfo params,
+ 
+ 	MemoryContextSwitchTo(oldContext);
+ 
++	RestoreAgentRowBudget(saveAgentRowBudget);
+ 	ActivePortal = saveActivePortal;
+ 	CurrentResourceOwner = saveResourceOwner;
+ 	PortalContext = savePortalContext;
+@@ -691,6 +762,7 @@ PortalRun(Portal portal, long count, bool isTopLevel,
+ 	ResourceOwner saveTopTransactionResourceOwner;
+ 	MemoryContext saveTopTransactionContext;
+ 	Portal		saveActivePortal;
++	Portal		saveAgentRowBudget;
+ 	ResourceOwner saveResourceOwner;
+ 	MemoryContext savePortalContext;
+ 	MemoryContext saveMemoryContext;
+@@ -735,6 +807,7 @@ PortalRun(Portal portal, long count, bool isTopLevel,
+ 	saveResourceOwner = CurrentResourceOwner;
+ 	savePortalContext = PortalContext;
+ 	saveMemoryContext = CurrentMemoryContext;
++	saveAgentRowBudget = BeginAgentRowBudget(portal);
+ 	PG_TRY();
+ 	{
+ 		ActivePortal = portal;
+@@ -776,6 +849,7 @@ PortalRun(Portal portal, long count, bool isTopLevel,
+ 				}
+ 
+ 				/* Mark portal not active */
++				CheckAgentRowBudget();
+ 				portal->status = PORTAL_READY;
+ 
+ 				/*
+@@ -788,6 +862,8 @@ PortalRun(Portal portal, long count, bool isTopLevel,
+ 				PortalRunMulti(portal, isTopLevel, false,
+ 							   dest, altdest, qc);
+ 
++				/* Check while errors may still mark the portal failed. */
++				CheckAgentRowBudget();
+ 				/* Prevent portal's commands from being re-executed */
+ 				MarkPortalDone(portal);
+ 
+@@ -808,6 +884,7 @@ PortalRun(Portal portal, long count, bool isTopLevel,
+ 		MarkPortalFailed(portal);
+ 
+ 		/* Restore global vars and propagate error */
++		RestoreAgentRowBudget(saveAgentRowBudget);
+ 		if (saveMemoryContext == saveTopTransactionContext)
+ 			MemoryContextSwitchTo(TopTransactionContext);
+ 		else
+@@ -823,6 +900,7 @@ PortalRun(Portal portal, long count, bool isTopLevel,
+ 	}
+ 	PG_END_TRY();
+ 
++	RestoreAgentRowBudget(saveAgentRowBudget);
+ 	if (saveMemoryContext == saveTopTransactionContext)
+ 		MemoryContextSwitchTo(TopTransactionContext);
+ 	else
+@@ -1382,6 +1460,7 @@ PortalRunFetch(Portal portal,
+ {
+ 	uint64		result;
+ 	Portal		saveActivePortal;
++	Portal		saveAgentRowBudget;
+ 	ResourceOwner saveResourceOwner;
+ 	MemoryContext savePortalContext;
+ 	MemoryContext oldContext;
+@@ -1399,6 +1478,7 @@ PortalRunFetch(Portal portal,
+ 	saveActivePortal = ActivePortal;
+ 	saveResourceOwner = CurrentResourceOwner;
+ 	savePortalContext = PortalContext;
++	saveAgentRowBudget = BeginAgentRowBudget(portal);
+ 	PG_TRY();
+ 	{
+ 		ActivePortal = portal;
+@@ -1436,6 +1516,7 @@ PortalRunFetch(Portal portal,
+ 				result = 0;		/* keep compiler quiet */
+ 				break;
+ 		}
++		CheckAgentRowBudget();
+ 	}
+ 	PG_CATCH();
+ 	{
+@@ -1443,6 +1524,7 @@ PortalRunFetch(Portal portal,
+ 		MarkPortalFailed(portal);
+ 
+ 		/* Restore global vars and propagate error */
++		RestoreAgentRowBudget(saveAgentRowBudget);
+ 		ActivePortal = saveActivePortal;
+ 		CurrentResourceOwner = saveResourceOwner;
+ 		PortalContext = savePortalContext;
+@@ -1456,6 +1538,7 @@ PortalRunFetch(Portal portal,
+ 	/* Mark portal not active */
+ 	portal->status = PORTAL_READY;
+ 
++	RestoreAgentRowBudget(saveAgentRowBudget);
+ 	ActivePortal = saveActivePortal;
+ 	CurrentResourceOwner = saveResourceOwner;
+ 	PortalContext = savePortalContext;
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index 3411896..7a1617d 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -729,8 +729,8 @@ typedef struct EState
+ 								 * ExecutorRun() call. */
+ 	uint64		es_total_processed; /* total # of tuples aggregated across all
+ 									 * ExecutorRun() calls. */
+-	uint64		es_agent_rows_modified; /* SwarmPG: rows fed to ModifyTable
+-										 * nodes, for agent_max_rows */
++	uint64		es_agent_rows_modified; /* SwarmPG: fallback write count when
++										 * there is no statement portal */
+ 
+ 	int			es_top_eflags;	/* eflags passed to ExecutorStart */
+ 	int			es_instrument;	/* OR of InstrumentOption flags */
+diff --git a/src/include/tcop/pquery.h b/src/include/tcop/pquery.h
+index aabb81e..1eda4bb 100644
+--- a/src/include/tcop/pquery.h
++++ b/src/include/tcop/pquery.h
+@@ -22,6 +22,12 @@ typedef struct PlannedStmt PlannedStmt; /* avoid including plannodes.h here */
+ 
+ extern PGDLLIMPORT Portal ActivePortal;
+ 
++/* SwarmPG: share a statement's write budget across nested execution. */
++extern Portal BeginAgentRowBudget(Portal portal);
++extern void RestoreAgentRowBudget(Portal previous);
++extern void CheckAgentRowBudget(void);
++extern void CountAgentRowModification(uint64 *fallback_rows);
++
+ 
+ extern PortalStrategy ChoosePortalStrategy(List *stmts);
+ 
+diff --git a/src/include/utils/portal.h b/src/include/utils/portal.h
+index a7bedb1..1c1aad2 100644
+--- a/src/include/utils/portal.h
++++ b/src/include/utils/portal.h
+@@ -136,6 +136,8 @@ typedef struct PortalData
+ 	const char *sourceText;		/* text of query (as of 8.4, never NULL) */
+ 	CommandTag	commandTag;		/* command tag for original query */
+ 	QueryCompletion qc;			/* command completion data for executed query */
++	uint64		agent_rows_modified; /* SwarmPG: cumulative statement writes */
++	int			agent_rows_exceeded; /* sticky limit that was exceeded, or zero */
+ 	List	   *stmts;			/* list of PlannedStmts */
+ 	CachedPlan *cplan;			/* CachedPlan, if stmts are from one */
+ 
+diff --git a/src/test/regress/expected/agent_budget.out b/src/test/regress/expected/agent_budget.out
+index e9ac646..4143719 100644
+--- a/src/test/regress/expected/agent_budget.out
++++ b/src/test/regress/expected/agent_budget.out
+@@ -74,6 +74,125 @@ SELECT count(*), max(id) FROM agent_budget_t;            -- unchanged: 20 rows,
+ (1 row)
+ 
+ RESET agent_max_rows;
++-- nested SPI, SQL functions and trigger writes share the outer statement cap
++CREATE TABLE agent_budget_nested (id int);
++CREATE TABLE agent_budget_history (id int);
++CREATE FUNCTION agent_budget_record() RETURNS trigger LANGUAGE plpgsql AS $$
++BEGIN
++  INSERT INTO agent_budget_history VALUES (NEW.id);
++  RETURN NEW;
++END $$;
++CREATE TRIGGER agent_budget_record AFTER INSERT ON agent_budget_nested
++  FOR EACH ROW EXECUTE FUNCTION agent_budget_record();
++CREATE FUNCTION agent_budget_put(i int) RETURNS int LANGUAGE plpgsql AS $$
++BEGIN
++  INSERT INTO agent_budget_nested VALUES (i);
++  RETURN i;
++END $$;
++CREATE FUNCTION agent_budget_sql_put(i int) RETURNS int LANGUAGE sql AS $$
++  SELECT agent_budget_put(i)
++$$;
++CREATE FUNCTION agent_budget_catch() RETURNS int LANGUAGE plpgsql AS $$
++BEGIN
++  PERFORM agent_budget_put(40);
++  BEGIN
++    PERFORM sum(agent_budget_put(g)) FROM generate_series(1, 3) g;
++  EXCEPTION WHEN configuration_limit_exceeded THEN
++    RETURN 0;
++  END;
++  RETURN 1;
++END $$;
++SET agent_max_rows = 4;
++SELECT sum(agent_budget_sql_put(g)) FROM generate_series(1, 2) g; -- exactly four writes
++ sum 
++-----
++   3
++(1 row)
++
++SELECT (SELECT count(*) FROM agent_budget_nested) AS live,
++       (SELECT count(*) FROM agent_budget_history) AS history;
++ live | history 
++------+---------
++    2 |       2
++(1 row)
++
++TRUNCATE agent_budget_nested, agent_budget_history;
++\set VERBOSITY terse
++SELECT sum(agent_budget_put(g)) FROM generate_series(1, 3) g; -- one result, six writes
++ERROR:  statement would modify more rows than the agent row budget of 4
++\echo :SQLSTATE
++53400
++WITH d AS (INSERT INTO agent_budget_nested VALUES (10) RETURNING id)
++  SELECT sum(agent_budget_sql_put(g)) FROM generate_series(1, 2) g;
++ERROR:  statement would modify more rows than the agent row budget of 4
++\echo :SQLSTATE
++53400
++SELECT agent_budget_catch(); -- catching the inner error cannot commit the first write
++ERROR:  statement would modify more rows than the agent row budget of 4
++\echo :SQLSTATE
++53400
++DO $$ BEGIN PERFORM agent_budget_catch(); END $$; -- utility has no outer executor
++ERROR:  statement would modify more rows than the agent row budget of 4
++\echo :SQLSTATE
++53400
++PREPARE agent_budget_prepared AS
++  SELECT sum(agent_budget_put(g)) FROM generate_series(1, 3) g;
++EXECUTE agent_budget_prepared; -- a nested portal also inherits the budget
++ERROR:  statement would modify more rows than the agent row budget of 4
++\echo :SQLSTATE
++53400
++DEALLOCATE agent_budget_prepared;
++DECLARE agent_budget_held CURSOR WITH HOLD FOR
++  SELECT agent_budget_put(g) FROM generate_series(1, 3) g; -- materialization also shares a budget
++ERROR:  statement would modify more rows than the agent row budget of 4
++\echo :SQLSTATE
++53400
++\set VERBOSITY default
++SELECT (SELECT count(*) FROM agent_budget_nested) AS live,
++       (SELECT count(*) FROM agent_budget_history) AS history; -- both empty
++ live | history 
++------+---------
++    0 |       0
++(1 row)
++
++-- separate statements get fresh budgets, including after subtransaction abort
++SET agent_max_rows = 2;
++BEGIN;
++SELECT agent_budget_put(1);
++ agent_budget_put 
++------------------
++                1
++(1 row)
++
++SAVEPOINT agent_budget_save;
++\set VERBOSITY terse
++SELECT sum(agent_budget_put(g)) FROM generate_series(2, 3) g;
++ERROR:  statement would modify more rows than the agent row budget of 2
++\echo :SQLSTATE
++53400
++\set VERBOSITY default
++ROLLBACK TO agent_budget_save;
++SELECT agent_budget_put(2);
++ agent_budget_put 
++------------------
++                2
++(1 row)
++
++COMMIT;
++SELECT (SELECT count(*) FROM agent_budget_nested) AS live,
++       (SELECT count(*) FROM agent_budget_history) AS history; -- two each
++ live | history 
++------+---------
++    2 |       2
++(1 row)
++
++RESET agent_max_rows;
++DROP FUNCTION agent_budget_catch();
++DROP FUNCTION agent_budget_sql_put(int);
++DROP FUNCTION agent_budget_put(int);
++DROP TABLE agent_budget_nested;
++DROP FUNCTION agent_budget_record();
++DROP TABLE agent_budget_history;
+ -- cost budget: an over-budget plan is refused before it runs
+ SET agent_max_cost = 1000;
+ SELECT count(*) FROM agent_budget_t;                     -- cheap: allowed
+diff --git a/src/test/regress/sql/agent_budget.sql b/src/test/regress/sql/agent_budget.sql
+index d9840eb..e83017d 100644
+--- a/src/test/regress/sql/agent_budget.sql
++++ b/src/test/regress/sql/agent_budget.sql
+@@ -31,6 +31,82 @@ INSERT INTO agent_budget_t SELECT g FROM generate_series(1, 6) g;  -- fails
+ SELECT count(*), max(id) FROM agent_budget_t;            -- unchanged: 20 rows, max 20
+ RESET agent_max_rows;
+ 
++-- nested SPI, SQL functions and trigger writes share the outer statement cap
++CREATE TABLE agent_budget_nested (id int);
++CREATE TABLE agent_budget_history (id int);
++CREATE FUNCTION agent_budget_record() RETURNS trigger LANGUAGE plpgsql AS $$
++BEGIN
++  INSERT INTO agent_budget_history VALUES (NEW.id);
++  RETURN NEW;
++END $$;
++CREATE TRIGGER agent_budget_record AFTER INSERT ON agent_budget_nested
++  FOR EACH ROW EXECUTE FUNCTION agent_budget_record();
++CREATE FUNCTION agent_budget_put(i int) RETURNS int LANGUAGE plpgsql AS $$
++BEGIN
++  INSERT INTO agent_budget_nested VALUES (i);
++  RETURN i;
++END $$;
++CREATE FUNCTION agent_budget_sql_put(i int) RETURNS int LANGUAGE sql AS $$
++  SELECT agent_budget_put(i)
++$$;
++CREATE FUNCTION agent_budget_catch() RETURNS int LANGUAGE plpgsql AS $$
++BEGIN
++  PERFORM agent_budget_put(40);
++  BEGIN
++    PERFORM sum(agent_budget_put(g)) FROM generate_series(1, 3) g;
++  EXCEPTION WHEN configuration_limit_exceeded THEN
++    RETURN 0;
++  END;
++  RETURN 1;
++END $$;
++SET agent_max_rows = 4;
++SELECT sum(agent_budget_sql_put(g)) FROM generate_series(1, 2) g; -- exactly four writes
++SELECT (SELECT count(*) FROM agent_budget_nested) AS live,
++       (SELECT count(*) FROM agent_budget_history) AS history;
++TRUNCATE agent_budget_nested, agent_budget_history;
++\set VERBOSITY terse
++SELECT sum(agent_budget_put(g)) FROM generate_series(1, 3) g; -- one result, six writes
++\echo :SQLSTATE
++WITH d AS (INSERT INTO agent_budget_nested VALUES (10) RETURNING id)
++  SELECT sum(agent_budget_sql_put(g)) FROM generate_series(1, 2) g;
++\echo :SQLSTATE
++SELECT agent_budget_catch(); -- catching the inner error cannot commit the first write
++\echo :SQLSTATE
++DO $$ BEGIN PERFORM agent_budget_catch(); END $$; -- utility has no outer executor
++\echo :SQLSTATE
++PREPARE agent_budget_prepared AS
++  SELECT sum(agent_budget_put(g)) FROM generate_series(1, 3) g;
++EXECUTE agent_budget_prepared; -- a nested portal also inherits the budget
++\echo :SQLSTATE
++DEALLOCATE agent_budget_prepared;
++DECLARE agent_budget_held CURSOR WITH HOLD FOR
++  SELECT agent_budget_put(g) FROM generate_series(1, 3) g; -- materialization also shares a budget
++\echo :SQLSTATE
++\set VERBOSITY default
++SELECT (SELECT count(*) FROM agent_budget_nested) AS live,
++       (SELECT count(*) FROM agent_budget_history) AS history; -- both empty
++-- separate statements get fresh budgets, including after subtransaction abort
++SET agent_max_rows = 2;
++BEGIN;
++SELECT agent_budget_put(1);
++SAVEPOINT agent_budget_save;
++\set VERBOSITY terse
++SELECT sum(agent_budget_put(g)) FROM generate_series(2, 3) g;
++\echo :SQLSTATE
++\set VERBOSITY default
++ROLLBACK TO agent_budget_save;
++SELECT agent_budget_put(2);
++COMMIT;
++SELECT (SELECT count(*) FROM agent_budget_nested) AS live,
++       (SELECT count(*) FROM agent_budget_history) AS history; -- two each
++RESET agent_max_rows;
++DROP FUNCTION agent_budget_catch();
++DROP FUNCTION agent_budget_sql_put(int);
++DROP FUNCTION agent_budget_put(int);
++DROP TABLE agent_budget_nested;
++DROP FUNCTION agent_budget_record();
++DROP TABLE agent_budget_history;
++
+ -- cost budget: an over-budget plan is refused before it runs
+ SET agent_max_cost = 1000;
+ SELECT count(*) FROM agent_budget_t;                     -- cheap: allowed

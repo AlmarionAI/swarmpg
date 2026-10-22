@@ -1,8 +1,11 @@
 # SwarmPG threat model
 
-Version 0.1, 2026-10-20. Every control below is backed by a probe in `loadtest/` that runs
-in CI (`make e2e`: 65 probes on stock Postgres; `make e2e KERNEL=1`: 83 on the SwarmPG
-kernel). The probe column cites probe names as printed by the load test.
+Development revision, 2026-10-22. The load harness contains 66 probes on stock Postgres
+and 95 with the signed SwarmPG kernel. The tables cite those probe names; audit delivery
+and shared-producer semantics also have gateway unit/integration tests run by the e2e
+script. Test presence is not a production-readiness claim. Negative query probes require
+the expected application code/SQLSTATE and HTTP status; unexpected HTTP 5xx, transport
+errors and failed load requests fail the run.
 
 ## System and trust boundaries
 
@@ -25,8 +28,9 @@ kernel). The probe column cites probe names as printed by the load test.
 - **Two modes.**
   - On **stock Postgres**, the gateway is the control for identity; the database enforces
     row-level security, privileges and revokes.
-  - On the **SwarmPG kernel**, identity, budgets and the fail-closed gate are enforced in
-    core, so they hold even for SQL that never passed through the gateway.
+  - On the **SwarmPG kernel**, the sealed principal, row/cost ceilings and fail-closed
+    gate are enforced in core. A principal secret is required to reject an unsigned or
+    forged identity on raw SQL access. Gateway-only limits do not become kernel limits.
 
 ## Attackers
 
@@ -70,7 +74,7 @@ An agent tries to act as another agent or org.
 | Attack | Control | Probes | Stock | Kernel |
 |---|---|---|:-:|:-:|
 | Query another agent's rows by id, or everything but one's own | Forced row-level security on every agent table | read peer memory by id; read all non-self memory; query cannot read a peer's rows (MCP) | ✔ | ✔ |
-| Read another agent's private memory key | Live reads fall back only to keys the owner marked `shared` within the same org | memory_get cannot read a peer's private key (MCP) | ✔ | ✔ |
+| Read another agent's private memory key | Live fallback, explicit `from` and shared listings expose only own keys or same-org shared keys; historical reads remain own-only | memory_get cannot read a peer's private key (MCP); `TestSharedMemoryProducersIntegration` | ✔ | ✔ |
 | Read another agent's memory history | History is visible only to its owner | a peer cannot read your key's history; a peer cannot read your history rows | ✔ | ✔ |
 | Read the agent registry or the audit log | No privileges on either | read agent registry (token hashes); read server audit log | ✔ | ✔ |
 
@@ -97,7 +101,8 @@ Hundreds of agents share each Postgres connection over time.
 | Exhaust the lock table or block others with advisory locks; fill storage with large objects | Advisory-lock family and large-object functions revoked | session advisory lock; large object spam | ✔ | ✔ |
 | Flood requests or hold many connections | Per-agent rate limit and concurrency cap; statement, lock and idle-in-transaction timeouts | (load phase; `rate_limited` and errors are counted) | ✔ | ✔ |
 | Runaway query (e.g. a cross join) | Refused before it runs when its estimated cost exceeds the agent's budget | runaway query refused before it runs; MCP query tool is held to the same budget | ✘ (statement timeout only) | ✔ |
-| Huge results or bulk writes | Gateway row and byte caps; on the kernel a per-statement row cap that fails over-budget writes as a whole | write over the row budget refused; refused write left nothing behind | partial (reads only) | ✔ |
+| Huge results or bulk writes | Gateway row and byte caps; kernel cumulative attempted-write cap including trigger bookkeeping, with statement rollback on excess | write over the row budget refused; refused write left nothing behind | partial (reads only) | ✔ |
+| Hide many writes behind one aggregate, CTE result or function call | Nested execution shares the statement's attempted-write budget; live data and history roll back together | aggregate cannot hide repeated memory writes; data-modifying CTE cannot hide repeated function writes; function calling function shares the write budget; residual-row checks | — | ✔ |
 | Dodge the cost budget with `EXPLAIN ANALYZE` or SQL inside functions | The gate applies at every nesting level and under `EXPLAIN ANALYZE`; plain `EXPLAIN` stays allowed | EXPLAIN ANALYZE cannot dodge the cost budget; query_to_xml cannot dodge the cost budget; EXPLAIN still shows the estimate | — | ✔ |
 | Raw SQL: raise one's own budget, or the role's ceiling | Budgets are tighten-only (`GUC_RATCHET`); role defaults need privilege | raise the row budget refused; raise the cost budget refused; change the role's budget defaults refused | — | ✔ |
 
@@ -121,7 +126,7 @@ agent.
 | Delete or truncate the event journal | Append-only: no UPDATE/DELETE/TRUNCATE privilege and a trigger that refuses changes; each event is hash-chained to the previous one | tamper with event log (DELETE); truncate event log | ✔ | ✔ |
 | Rewrite, erase or forge memory history | History is written only by triggers; agents have `SELECT` only | rewrite history (UPDATE); erase history (DELETE); forge history (INSERT) | ✔ | ✔ |
 | Forge a version number with raw `UPDATE` | A trigger assigns every version | raw UPDATE cannot set a version; ... the version still moves forward | ✔ | ✔ |
-| File audit records in another agent's name | Only the gateway's admin connection can call `record_audit`; every statement an agent sends through the gateway, including ones the guard refuses, is recorded | forge an audit record for another agent | ✔ | ✔ |
+| File audit records in another agent's name | Only the trusted admin connection can call `record_audit` or `record_audit_receipt`; delivery completeness depends on the audit mode | forge an audit record for another agent; forge a deduplicated audit receipt | ✔ | ✔ |
 
 ### T8. Lost updates and unrecoverable mistakes
 
@@ -129,9 +134,9 @@ Not attacks, but the failure modes that hurt agent fleets most.
 
 | Risk | Control | Probes | Stock | Kernel |
 |---|---|---|:-:|:-:|
-| Two agents overwrite each other after reading the same version | Compare-and-set on `expected_version` | create-only write (expected_version 0); second create-only write conflicts; write at the current version; stale write conflicts and writes nothing; 20 concurrent writers at one version: one wins; MCP memory_put with a stale version conflicts | ✔ | ✔ |
+| Concurrent requests overwrite the same agent-owned key after reading one version | Compare-and-set on `expected_version`; peers still cannot write the owner's key | create-only write (expected_version 0); second create-only write conflicts; write at the current version; stale write conflicts and writes nothing; 20 concurrent writers at one version: one wins; MCP memory_put with a stale version conflicts | ✔ | ✔ |
 | A bad write or delete cannot be taken back | Versioned history, reads of the past, undo | read an earlier version; history lists every version; as_of reads the value at that time; undo restores the previous value as a new version; a delete can be undone; MCP memory_history; MCP memory_get at a version; MCP memory_undo to a version | ✔ | ✔ |
-| A retry after a timeout duplicates a write | `Idempotency-Key` / `idempotency_key` replays the stored result | events_append retry with the same key is replayed | ✔ | ✔ |
+| An event-append retry after a timeout creates a second event | `Idempotency-Key` / `idempotency_key` replays the stored event result; arbitrary SQL is not deduplicated | events_append retry with the same key is replayed | ✔ | ✔ |
 
 ### T9. The MCP endpoint
 
@@ -145,10 +150,29 @@ Protocol conformance (both eras, eight tools) is covered by: legacy initialize n
 2025-06-18; 2026-07-28 server/discover; tools/list returns the 8 tools; schema tool
 describes the tables; memory_put then memory_get round-trips.
 
+### T10. Audit loss and ambiguous outcomes
+
+SQL-query audit covers the REST query endpoint and MCP query tool, including guard
+rejections. It does not cover typed memory/event API writes or direct database sessions.
+
+| Risk | Control and limit | Validation |
+|---|---|---|
+| Audit database outage drops a dequeued batch | Retain receipts and retry with bounded backoff; stable UUIDs deduplicate database replay | `TestAuditRetriesDatabaseOutageIntegration`; `TestAuditReceiptReplayIntegration` |
+| Full spool silently violates a strict admission policy | Strict mode requires disk spooling and rejects with `audit_unavailable` before execution when an intent cannot be reserved | `TestAuditSpoolCapacityAndAdmission`; `TestStrictAuditFullRefusesWriteIntegration` |
+| Gateway restart loses queued receipts | A configured persistent spool fsyncs receipts and restores them; default memory-only mode offers no crash durability | `TestAuditSpoolDurableRecovery` |
+| Rejected query text poisons a retry batch | Samples and error metadata normalize NUL/invalid UTF-8 before storage and delivery; the digest retains the original SQL bytes | `TestAuditNULRefusalCannotPoisonBatchIntegration`; `TestAuditLegacyInvalidTextRecoveryIntegration` |
+| SQL commits, then the gateway crashes before recording completion | Recover the durable intent as `audit_outcome_unknown`; do not infer rollback or safe replay | `TestAuditSpoolDurableRecovery`; explicit limitation, not atomic SQL/audit commit |
+
+Best-effort mode can drop new receipts on capacity or persistence failure and increments
+`audit_lost`. Strict mode bounds admission, not availability: an unavailable/full spool
+stops SQL-query admission. Disk failure after execution can leave an unknown outcome.
+See [configuration, health fields and recovery semantics](gateway.md#audit-delivery).
+
 ### Positive controls
 
 Probes that must *succeed*, so a control that breaks normal work is caught too: read own
-memory; write own document; EXPLAIN still shows the estimate; and every memory and MCP
+memory; write own document; one memory write fits the nested-write budget; EXPLAIN still
+shows the estimate; and every memory and MCP
 round-trip above.
 
 ## Residual risks
@@ -173,8 +197,10 @@ What is **not** covered today, in rough order of importance.
    no data). Query latency reveals load.
 6. **Cheap but slow work.** `pg_sleep` and similar cost almost nothing to the planner, so
    an agent can hold up to `max_concurrency` connections for its statement timeout each.
-7. **Budget gaps.** The kernel row cap does not apply to SQL `FETCH` from a cursor (the
-   gateway refuses cursors); the byte budget exists only in the gateway.
+7. **Budget gaps.** CPU, IO and storage size are not metered. The byte budget exists only
+   in the gateway. The gateway passes a `max_rows + 1` kernel ceiling to detect result
+   truncation; attempted internal writes consume that same ceiling. Raw non-atomic
+   `CALL` can commit between statements; the gateway refuses `CALL` and cursors.
 8. **Memory history is kept forever.** Deleting an agent's data for good (right to erasure)
    needs an operator purge; there is no API for it yet.
 9. **Capabilities are coarse.** All agents share one role, so per-agent privileges are not
@@ -183,12 +209,19 @@ What is **not** covered today, in rough order of importance.
 10. **Deployment defaults.** Trust authentication, the default admin key and the default
     principal secret in the quickstart and benchmark are for local use only. TLS is not
     provided by SwarmPG. Rate limits live in one gateway process.
+11. **Audit completeness.** Default best-effort mode may drop receipts; memory-only spools
+    do not survive process failure. Strict mode requires an operator-maintained persistent
+    volume and still cannot atomically couple SQL commit with audit completion. It does
+    not audit typed memory/event API calls or raw SQL sessions.
+12. **Shared information is not trusted information.** Producer identity makes provenance
+    explicit; it does not establish that an org peer's content is correct. Shared keys
+    remain owner-written, with no jointly editable workspace or coordination protocol.
 
 ## Reproduce
 
 ```bash
-make e2e              # stock Postgres: 65 probes
-make kernel && make e2e KERNEL=1   # SwarmPG kernel: 83 probes
+make e2e              # stock Postgres: 66 probes
+make kernel && make e2e KERNEL=1   # SwarmPG kernel: 95 probes
 ```
 
 `bench/run.sh` also runs three of these attacks against a PgBouncer + row-level security
