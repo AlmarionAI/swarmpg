@@ -40,11 +40,25 @@ jobs:
       - run: which psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
       - run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f sql/schema.sql
       - run: AGENTS=1000 REQUESTS=8 scripts/e2e.sh
+      - name: coordination failure workload on stock PostgreSQL
+        run: |
+          for workers in 100 1000; do
+            COORD_DB_MODE=docker COORD_PG_IMAGE=postgres:17 COORD_WORKERS="$workers" \
+              COORD_REPORT_DIR="$GITHUB_WORKSPACE/.coord-test/stock-$workers" \
+              scripts/coordination-e2e.sh
+          done
       - name: docs run as written
         run: |
           .bin/gateway &
           for i in $(seq 1 50); do curl -sf -o /dev/null localhost:8080/healthz && break; sleep 0.2; done
-          scripts/check-docs.sh README.md docs/getting-started.md docs/gateway.md
+          scripts/check-docs.sh README.md docs/getting-started.md docs/gateway.md docs/tasks.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coordination-stock
+          path: |
+            .coord-test/stock-*/report.json
+            .coord-test/stock-*/*.log
 
   kernel:
     runs-on: ubuntu-latest
@@ -65,3 +79,17 @@ jobs:
         run: cat swarmpg-core/src/test/regress/regression.diffs || true
       - name: e2e on the kernel, including kernel probes
         run: make e2e KERNEL=1 AGENTS=1000 REQUESTS=8
+      - name: coordination failure workload on the signed kernel
+        run: |
+          for workers in 100 1000; do
+            KERNEL=1 PG_BIN_DIR="$PREFIX/bin" COORD_WORKERS="$workers" \
+              COORD_REPORT_DIR="$GITHUB_WORKSPACE/.coord-test/kernel-$workers" \
+              scripts/coordination-e2e.sh
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coordination-kernel
+          path: |
+            .coord-test/kernel-*/report.json
+            .coord-test/kernel-*/*.log

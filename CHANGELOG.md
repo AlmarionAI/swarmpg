@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add org-shared task queues with immutable dependencies and producer-selected input
+  snapshots, lease-based claims, monotonic fencing, renew/release/cancel, administrative
+  recovery, durable claim replay and atomic result/state/history completion. Eight new
+  MCP tools and REST/SQL APIs share the same database contract.
+- Return retryable `503 auth_unavailable` when the authentication database is
+  unavailable, preserving `401` for genuinely invalid tokens.
+- Add a reproducible 100–1,000-worker failure workload with restarts, abandoned leases,
+  duplicate requests, stale workers, changed inputs and a noisy tenant; retain correctness,
+  latency, retry and recovery reports for stock/kernel comparison.
 - Share one attempted-write budget across nested execution, including function calls,
   data-modifying CTEs and trigger bookkeeping; retain atomic rollback for a refused statement.
 - Add bounded audit spooling, retained retry batches, stable receipt IDs and optional disk
@@ -14,9 +23,8 @@
 - Tighten negative probes to require their intended application code/SQLSTATE and HTTP
   status. Unexpected HTTP 5xx, transport failures and failed load requests fail the run.
   Add aggregate, CTE and nested-function write-budget probes and rollback checks.
-- Focus the next milestone on task claims, leases, fencing and atomic completion, then a
-  collaborative failure workload. Workspaces follow that proof; storage, catalog and
-  process-model rewrites are deferred. None of those planned primitives is claimed built.
+- Keep workspaces, storage/catalog/process-model rewrites and broader operational
+  acceptance separate from the implemented task-coordination milestone.
 
 ## 0.1.0 development baseline (2026-10-20)
 

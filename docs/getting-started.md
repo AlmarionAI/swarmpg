@@ -162,8 +162,8 @@ Most MCP clients take a URL and headers:
 }
 ```
 
-The agent gets eight tools: `schema`, `query`, `memory_get`, `memory_put`, `memory_delete`,
-`memory_history`, `memory_undo` and `events_append`, each under the same identity and
+The agent gets sixteen tools: `schema`, `query`, `memory_get`, `memory_put`, `memory_delete`,
+`memory_history`, `memory_undo`, `events_append` and the eight [task tools](tasks.md#rest-and-mcp), each under the same identity and
 limits as the REST API. To see the protocol itself, here are the same calls with `curl`, as
 a 2026-07-28 client makes them:
 

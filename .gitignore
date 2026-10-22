@@ -10,3 +10,5 @@
 /.bin/
 /gateway/gateway
 /loadtest/loadtest
+/.coord-test/
+/coordination/coordination

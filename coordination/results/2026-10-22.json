@@ -1,0 +1,625 @@
+{
+  "date": "2026-10-22",
+  "provenance": "Local pre-commit acceptance runs; source commit and full source-tree SHA-256 are recorded per run. CI repeats the matrix on each PR revision and retains full reports/logs as artifacts.",
+  "timing_note": "Stock used PostgreSQL 17 in a Linux ARM64 Docker container; the signed kernel used native macOS ARM64 with debug/assertions. Timings are observations, not a controlled performance comparison.",
+  "runs": [
+    {
+      "passed": true,
+      "seed": 20261022,
+      "source_commit": "b05944fbfb9b1cfacd980e86d58dd87c8bb9046d",
+      "source_tree_sha256": "1ac79bb67fda7731617dfc7b8e1a4b44719ee923ae7261cfa6c3df07fe77220a",
+      "environment": {
+        "arch": "arm64",
+        "audit_mode": "best-effort",
+        "database_mode": "docker",
+        "go": "go1.27.1",
+        "kernel": "",
+        "os": "darwin",
+        "postgres": "PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit"
+      },
+      "settings": {
+        "duration": "30s",
+        "external_effects": false,
+        "in_flight": 128,
+        "lease_ms": 3000,
+        "noisy_query_concurrency_limit": 2,
+        "noisy_query_rps_limit": 5,
+        "quiet_worker_share": 0.8,
+        "runtime_pool": 32,
+        "workers": 100
+      },
+      "started_at": "2026-10-22T10:45:12.876128Z",
+      "finished_at": "2026-10-22T10:45:46.100351Z",
+      "production_seconds": 30.184809,
+      "elapsed_seconds": 33.224223,
+      "waves": 109,
+      "requests": 29912,
+      "request_retries": 546,
+      "retry_amplification": 1.0185929306000137,
+      "claim_attempts": 8381,
+      "completion_attempts": 2070,
+      "completion_replays": 258,
+      "discarded_acknowledgments": 102,
+      "paused_workers": 60,
+      "reclaimed_tasks": 60,
+      "stale_denials": 61,
+      "changed_input_denials": 1,
+      "noisy_rejections": 10065,
+      "lost_completions": 0,
+      "duplicate_completions": 0,
+      "stale_overwrites": 0,
+      "attribution_failures": 0,
+      "dependency_failures": 0,
+      "history_rows": 5292,
+      "http_outcomes": {
+        "0": 332,
+        "200": 18949,
+        "201": 105,
+        "400:57P01": 9,
+        "400:57P03": 159,
+        "404:not_found": 1,
+        "409:inputs_changed": 1,
+        "409:lease_expired": 1,
+        "409:stale_claim": 64,
+        "409:task_conflict": 1,
+        "429:concurrency_limited": 6,
+        "429:rate_limited": 10059,
+        "500:internal": 130,
+        "503:auth_unavailable": 95
+      },
+      "tenants": [
+        {
+          "name": "quiet",
+          "org_id": "51f1cc68-cc71-43bc-9bcd-b01e756e0758",
+          "workers": 80,
+          "participants": 80,
+          "completing_workers": 80,
+          "created": 872,
+          "completed": 872,
+          "verified": 872,
+          "completions_per_second": 26.24591100294505,
+          "completion_latency_ms": {
+            "p50": 106.741,
+            "p95": 3122.778,
+            "p99": 3246.773
+          },
+          "queue_delay_ms": {
+            "p50": 49.172,
+            "p95": 3064.358,
+            "p99": 3172.603
+          },
+          "http_outcomes": {
+            "0": 175,
+            "200": 11565,
+            "400:57P01": 5,
+            "400:57P03": 129,
+            "409:inputs_changed": 1,
+            "409:lease_expired": 1,
+            "409:stale_claim": 33,
+            "409:task_conflict": 1,
+            "500:internal": 102,
+            "503:auth_unavailable": 23
+          }
+        },
+        {
+          "name": "noisy",
+          "org_id": "18795273-50df-46b1-8579-d96b90be47e0",
+          "workers": 20,
+          "participants": 20,
+          "completing_workers": 20,
+          "created": 872,
+          "completed": 872,
+          "verified": 872,
+          "completions_per_second": 26.24591100294505,
+          "completion_latency_ms": {
+            "p50": 156.487,
+            "p95": 3158.587,
+            "p99": 3318.895
+          },
+          "queue_delay_ms": {
+            "p50": 93.117,
+            "p95": 3103.488,
+            "p99": 3251.968
+          },
+          "http_outcomes": {
+            "0": 157,
+            "200": 7384,
+            "400:57P01": 4,
+            "400:57P03": 30,
+            "404:not_found": 1,
+            "409:stale_claim": 31,
+            "429:concurrency_limited": 6,
+            "429:rate_limited": 10059,
+            "500:internal": 28,
+            "503:auth_unavailable": 72
+          }
+        }
+      ],
+      "faults": [
+        {
+          "kind": "gateway",
+          "started_at": "2026-10-22T10:45:22.882475Z",
+          "service_ready_at": "2026-10-22T10:45:23.373049Z",
+          "first_completion_at": "2026-10-22T10:45:23.382656Z",
+          "recovery_ms": 500.181,
+          "interrupted_requests": 331
+        },
+        {
+          "kind": "database",
+          "started_at": "2026-10-22T10:45:32.876296Z",
+          "service_ready_at": "2026-10-22T10:45:33.549949Z",
+          "first_completion_at": "2026-10-22T10:45:33.591654Z",
+          "recovery_ms": 715.358,
+          "interrupted_requests": 393
+        }
+      ],
+      "errors": [],
+      "run": "stock-100",
+      "event_count": 229,
+      "raw_report_sha256": "8864688f9988c985f7a7ae3564e936cf5b9caa7bd3d6745d677f2e2bf360c0d4",
+      "raw_report_path": ".coord-test/stock-100/report.json"
+    },
+    {
+      "passed": true,
+      "seed": 20261022,
+      "source_commit": "b05944fbfb9b1cfacd980e86d58dd87c8bb9046d",
+      "source_tree_sha256": "1ac79bb67fda7731617dfc7b8e1a4b44719ee923ae7261cfa6c3df07fe77220a",
+      "environment": {
+        "arch": "arm64",
+        "audit_mode": "best-effort",
+        "database_mode": "docker",
+        "go": "go1.27.1",
+        "kernel": "",
+        "os": "darwin",
+        "postgres": "PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit"
+      },
+      "settings": {
+        "duration": "30s",
+        "external_effects": false,
+        "in_flight": 128,
+        "lease_ms": 3000,
+        "noisy_query_concurrency_limit": 2,
+        "noisy_query_rps_limit": 5,
+        "quiet_worker_share": 0.8,
+        "runtime_pool": 32,
+        "workers": 1000
+      },
+      "started_at": "2026-10-22T10:45:52.358417Z",
+      "finished_at": "2026-10-22T10:46:25.677955Z",
+      "production_seconds": 30.215931,
+      "elapsed_seconds": 33.319538,
+      "waves": 61,
+      "requests": 108185,
+      "request_retries": 5650,
+      "retry_amplification": 1.0551031355147023,
+      "claim_attempts": 64786,
+      "completion_attempts": 5783,
+      "completion_replays": 723,
+      "discarded_acknowledgments": 287,
+      "paused_workers": 168,
+      "reclaimed_tasks": 168,
+      "stale_denials": 168,
+      "changed_input_denials": 1,
+      "noisy_rejections": 7188,
+      "lost_completions": 0,
+      "duplicate_completions": 0,
+      "stale_overwrites": 0,
+      "attribution_failures": 0,
+      "dependency_failures": 0,
+      "history_rows": 14808,
+      "http_outcomes": {
+        "0": 2821,
+        "200": 94033,
+        "201": 1005,
+        "400:57P01": 23,
+        "400:57P03": 514,
+        "404:not_found": 1,
+        "409:inputs_changed": 1,
+        "409:lease_expired": 1,
+        "409:stale_claim": 177,
+        "409:task_conflict": 1,
+        "429:concurrency_limited": 6,
+        "429:rate_limited": 7182,
+        "500:internal": 1156,
+        "503:auth_unavailable": 1264
+      },
+      "tenants": [
+        {
+          "name": "quiet",
+          "org_id": "6e90df2e-164e-4246-9f57-23f1f9a20c7c",
+          "workers": 800,
+          "participants": 800,
+          "completing_workers": 749,
+          "created": 2440,
+          "completed": 2440,
+          "verified": 2440,
+          "completions_per_second": 73.23030709489429,
+          "completion_latency_ms": {
+            "p50": 211.017,
+            "p95": 3183.032,
+            "p99": 4034.51
+          },
+          "queue_delay_ms": {
+            "p50": 48.203,
+            "p95": 3065.253,
+            "p99": 3515.856
+          },
+          "http_outcomes": {
+            "0": 2143,
+            "200": 65807,
+            "400:57P01": 18,
+            "400:57P03": 415,
+            "409:inputs_changed": 1,
+            "409:lease_expired": 1,
+            "409:stale_claim": 92,
+            "409:task_conflict": 1,
+            "500:internal": 903,
+            "503:auth_unavailable": 988
+          }
+        },
+        {
+          "name": "noisy",
+          "org_id": "56a167d4-46ac-405f-b3ea-5ef827ab0ea9",
+          "workers": 200,
+          "participants": 200,
+          "completing_workers": 200,
+          "created": 2440,
+          "completed": 2440,
+          "verified": 2440,
+          "completions_per_second": 73.23030709489429,
+          "completion_latency_ms": {
+            "p50": 234.953,
+            "p95": 3205.322,
+            "p99": 3977.854
+          },
+          "queue_delay_ms": {
+            "p50": 73.852,
+            "p95": 3085.828,
+            "p99": 3562.457
+          },
+          "http_outcomes": {
+            "0": 678,
+            "200": 28226,
+            "400:57P01": 5,
+            "400:57P03": 99,
+            "404:not_found": 1,
+            "409:stale_claim": 85,
+            "429:concurrency_limited": 6,
+            "429:rate_limited": 7182,
+            "500:internal": 253,
+            "503:auth_unavailable": 276
+          }
+        }
+      ],
+      "faults": [
+        {
+          "kind": "gateway",
+          "started_at": "2026-10-22T10:46:02.361348Z",
+          "service_ready_at": "2026-10-22T10:46:03.681093Z",
+          "first_completion_at": "2026-10-22T10:46:03.684948Z",
+          "recovery_ms": 1323.6,
+          "interrupted_requests": 2816
+        },
+        {
+          "kind": "database",
+          "started_at": "2026-10-22T10:46:12.358551Z",
+          "service_ready_at": "2026-10-22T10:46:14.140604Z",
+          "first_completion_at": "2026-10-22T10:46:14.150924Z",
+          "recovery_ms": 1792.373,
+          "interrupted_requests": 2957
+        }
+      ],
+      "errors": [],
+      "run": "stock-1000",
+      "event_count": 629,
+      "raw_report_sha256": "17d993c7221598574c8e55a2458a8dfe9c4d6767793098cf18a2b6b8f4dd4cf3",
+      "raw_report_path": ".coord-test/stock-1000/report.json"
+    },
+    {
+      "passed": true,
+      "seed": 20261022,
+      "source_commit": "b05944fbfb9b1cfacd980e86d58dd87c8bb9046d",
+      "source_tree_sha256": "1ac79bb67fda7731617dfc7b8e1a4b44719ee923ae7261cfa6c3df07fe77220a",
+      "environment": {
+        "arch": "arm64",
+        "audit_mode": "best-effort",
+        "database_mode": "local",
+        "go": "go1.27.1",
+        "kernel": "1",
+        "os": "darwin",
+        "postgres": "PostgreSQL 19rc1 on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit"
+      },
+      "settings": {
+        "duration": "30s",
+        "external_effects": false,
+        "in_flight": 128,
+        "lease_ms": 3000,
+        "noisy_query_concurrency_limit": 2,
+        "noisy_query_rps_limit": 5,
+        "quiet_worker_share": 0.8,
+        "runtime_pool": 32,
+        "workers": 100
+      },
+      "started_at": "2026-10-22T10:46:38.916942Z",
+      "finished_at": "2026-10-22T10:47:11.871953Z",
+      "production_seconds": 30.246721,
+      "elapsed_seconds": 32.955011,
+      "waves": 108,
+      "requests": 29874,
+      "request_retries": 631,
+      "retry_amplification": 1.0215778134938276,
+      "claim_attempts": 8334,
+      "completion_attempts": 2051,
+      "completion_replays": 256,
+      "discarded_acknowledgments": 101,
+      "paused_workers": 59,
+      "reclaimed_tasks": 59,
+      "stale_denials": 60,
+      "changed_input_denials": 1,
+      "noisy_rejections": 10056,
+      "lost_completions": 0,
+      "duplicate_completions": 0,
+      "stale_overwrites": 0,
+      "attribution_failures": 0,
+      "dependency_failures": 0,
+      "history_rows": 5243,
+      "http_outcomes": {
+        "0": 359,
+        "200": 18803,
+        "201": 105,
+        "400:57P03": 319,
+        "404:not_found": 1,
+        "409:inputs_changed": 1,
+        "409:lease_expired": 1,
+        "409:stale_claim": 63,
+        "409:task_conflict": 1,
+        "429:concurrency_limited": 6,
+        "429:rate_limited": 10050,
+        "500:internal": 53,
+        "503:auth_unavailable": 112
+      },
+      "tenants": [
+        {
+          "name": "quiet",
+          "org_id": "130d39a5-64a9-426f-b5b7-78334c574ad6",
+          "workers": 80,
+          "participants": 80,
+          "completing_workers": 80,
+          "created": 864,
+          "completed": 864,
+          "verified": 864,
+          "completions_per_second": 26.217560661715453,
+          "completion_latency_ms": {
+            "p50": 98.52,
+            "p95": 3109.893,
+            "p99": 3240.355
+          },
+          "queue_delay_ms": {
+            "p50": 49.921,
+            "p95": 3066.542,
+            "p99": 3169.151
+          },
+          "http_outcomes": {
+            "0": 176,
+            "200": 11487,
+            "400:57P03": 249,
+            "409:inputs_changed": 1,
+            "409:lease_expired": 1,
+            "409:stale_claim": 33,
+            "409:task_conflict": 1,
+            "500:internal": 34,
+            "503:auth_unavailable": 30
+          }
+        },
+        {
+          "name": "noisy",
+          "org_id": "acc79ce7-6ada-4bf4-93aa-8b836081f84f",
+          "workers": 20,
+          "participants": 20,
+          "completing_workers": 20,
+          "created": 864,
+          "completed": 864,
+          "verified": 864,
+          "completions_per_second": 26.217560661715453,
+          "completion_latency_ms": {
+            "p50": 139.755,
+            "p95": 3156.102,
+            "p99": 3297.277
+          },
+          "queue_delay_ms": {
+            "p50": 85.934,
+            "p95": 3103.99,
+            "p99": 3220.943
+          },
+          "http_outcomes": {
+            "0": 183,
+            "200": 7316,
+            "400:57P03": 70,
+            "404:not_found": 1,
+            "409:stale_claim": 30,
+            "429:concurrency_limited": 6,
+            "429:rate_limited": 10050,
+            "500:internal": 19,
+            "503:auth_unavailable": 82
+          }
+        }
+      ],
+      "faults": [
+        {
+          "kind": "gateway",
+          "started_at": "2026-10-22T10:46:48.917513Z",
+          "service_ready_at": "2026-10-22T10:46:49.491123Z",
+          "first_completion_at": "2026-10-22T10:46:49.508626Z",
+          "recovery_ms": 591.113,
+          "interrupted_requests": 358
+        },
+        {
+          "kind": "database",
+          "started_at": "2026-10-22T10:46:58.917061Z",
+          "service_ready_at": "2026-10-22T10:46:59.757894Z",
+          "first_completion_at": "2026-10-22T10:46:59.774099Z",
+          "recovery_ms": 857.038,
+          "interrupted_requests": 484
+        }
+      ],
+      "errors": [],
+      "run": "kernel-100",
+      "event_count": 226,
+      "raw_report_sha256": "710da210d34ad65a3493ee713124a86d8264e455d446c0e26308dec704c88927",
+      "raw_report_path": ".coord-test/kernel-100/report.json"
+    },
+    {
+      "passed": true,
+      "seed": 20261022,
+      "source_commit": "b05944fbfb9b1cfacd980e86d58dd87c8bb9046d",
+      "source_tree_sha256": "1ac79bb67fda7731617dfc7b8e1a4b44719ee923ae7261cfa6c3df07fe77220a",
+      "environment": {
+        "arch": "arm64",
+        "audit_mode": "best-effort",
+        "database_mode": "local",
+        "go": "go1.27.1",
+        "kernel": "1",
+        "os": "darwin",
+        "postgres": "PostgreSQL 19rc1 on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit"
+      },
+      "settings": {
+        "duration": "30s",
+        "external_effects": false,
+        "in_flight": 128,
+        "lease_ms": 3000,
+        "noisy_query_concurrency_limit": 2,
+        "noisy_query_rps_limit": 5,
+        "quiet_worker_share": 0.8,
+        "runtime_pool": 32,
+        "workers": 1000
+      },
+      "started_at": "2026-10-22T10:47:19.083857Z",
+      "finished_at": "2026-10-22T10:47:52.312379Z",
+      "production_seconds": 30.225696,
+      "elapsed_seconds": 33.228522,
+      "waves": 73,
+      "requests": 121397,
+      "request_retries": 4809,
+      "retry_amplification": 1.041247812810924,
+      "claim_attempts": 71175,
+      "completion_attempts": 6919,
+      "completion_replays": 863,
+      "discarded_acknowledgments": 343,
+      "paused_workers": 201,
+      "reclaimed_tasks": 201,
+      "stale_denials": 201,
+      "changed_input_denials": 1,
+      "noisy_rejections": 9094,
+      "lost_completions": 0,
+      "duplicate_completions": 0,
+      "stale_overwrites": 0,
+      "attribution_failures": 0,
+      "dependency_failures": 0,
+      "history_rows": 17721,
+      "http_outcomes": {
+        "0": 2396,
+        "200": 106136,
+        "201": 1005,
+        "400:57P03": 1576,
+        "404:not_found": 1,
+        "409:inputs_changed": 1,
+        "409:lease_expired": 1,
+        "409:stale_claim": 212,
+        "409:task_conflict": 1,
+        "429:concurrency_limited": 9,
+        "429:rate_limited": 9085,
+        "500:internal": 672,
+        "503:auth_unavailable": 302
+      },
+      "tenants": [
+        {
+          "name": "quiet",
+          "org_id": "f85b2889-e29b-4323-bf72-792df83f2d32",
+          "workers": 800,
+          "participants": 800,
+          "completing_workers": 768,
+          "created": 2920,
+          "completed": 2920,
+          "verified": 2920,
+          "completions_per_second": 87.8763130060374,
+          "completion_latency_ms": {
+            "p50": 119.493,
+            "p95": 3108.366,
+            "p99": 3477.211
+          },
+          "queue_delay_ms": {
+            "p50": 34.139,
+            "p95": 3044.398,
+            "p99": 3240.019
+          },
+          "http_outcomes": {
+            "0": 1773,
+            "200": 73317,
+            "400:57P03": 1265,
+            "409:inputs_changed": 1,
+            "409:lease_expired": 1,
+            "409:stale_claim": 106,
+            "409:task_conflict": 1,
+            "500:internal": 516,
+            "503:auth_unavailable": 232
+          }
+        },
+        {
+          "name": "noisy",
+          "org_id": "cbfc1a33-8c87-4fd3-b2d8-b74f6e512dad",
+          "workers": 200,
+          "participants": 200,
+          "completing_workers": 200,
+          "created": 2920,
+          "completed": 2920,
+          "verified": 2920,
+          "completions_per_second": 87.8763130060374,
+          "completion_latency_ms": {
+            "p50": 138.369,
+            "p95": 3140.105,
+            "p99": 3620.567
+          },
+          "queue_delay_ms": {
+            "p50": 54.297,
+            "p95": 3068.663,
+            "p99": 3286.018
+          },
+          "http_outcomes": {
+            "0": 623,
+            "200": 32819,
+            "400:57P03": 311,
+            "404:not_found": 1,
+            "409:stale_claim": 106,
+            "429:concurrency_limited": 9,
+            "429:rate_limited": 9085,
+            "500:internal": 156,
+            "503:auth_unavailable": 70
+          }
+        }
+      ],
+      "faults": [
+        {
+          "kind": "gateway",
+          "started_at": "2026-10-22T10:47:29.089072Z",
+          "service_ready_at": "2026-10-22T10:47:29.881301Z",
+          "first_completion_at": "2026-10-22T10:47:29.93191Z",
+          "recovery_ms": 842.838,
+          "interrupted_requests": 2390
+        },
+        {
+          "kind": "database",
+          "started_at": "2026-10-22T10:47:39.08396Z",
+          "service_ready_at": "2026-10-22T10:47:40.734795Z",
+          "first_completion_at": "2026-10-22T10:47:40.873016Z",
+          "recovery_ms": 1789.056,
+          "interrupted_requests": 2550
+        }
+      ],
+      "errors": [],
+      "run": "kernel-1000",
+      "event_count": 751,
+      "raw_report_sha256": "5c747afb2aeb99637e9c76e9609f2a8a60190101edae08037e65bc1e699c931c",
+      "raw_report_path": ".coord-test/kernel-1000/report.json"
+    }
+  ]
+}

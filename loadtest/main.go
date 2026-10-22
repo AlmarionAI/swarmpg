@@ -369,7 +369,7 @@ func main() {
 	code, list := mcpRPC(A.Token, true, "tools/list", nil, nil)
 	listRes, _ := list["result"].(map[string]any)
 	tools, _ := listRes["tools"].([]any)
-	check("tools/list returns the 8 tools", code == 200 && len(tools) == 8, fmt.Sprintf("%d tools", len(tools)))
+	check("tools/list returns the 16 tools", code == 200 && len(tools) == 16, fmt.Sprintf("%d tools", len(tools)))
 	code, _ = mcpRPC("", true, "tools/list", nil, nil)
 	check("no token refused", code == 401, fmt.Sprint(code))
 	code, _ = mcpRPC("spg_not_a_real_token", true, "tools/list", nil, nil)
@@ -515,6 +515,61 @@ func main() {
 	isErr, sc, _ = tool(A.Token, "memory_undo", map[string]any{"key": k, "to_version": 2, "expected_version": 6})
 	_, now = get(A.Token, "")
 	check("MCP memory_undo to a version", !isErr && sc["version"] == float64(7) && n(now) == float64(2), fmt.Sprintf("v%v n=%v", sc["version"], n(now)))
+
+	// ---- task isolation: a concrete task in A's org must remain invisible to
+	// another org, and only its current owner/fence may publish its result.
+	fmt.Println("\n== task isolation probes ==")
+	taskForeign := createAgentWith(createOrg("loadtest-task-other"), "task-other-org", nil)
+	type taskState struct {
+		ID, Fence, State string
+		Owner            string `json:"owner_agent_id"`
+		Result           int
+	}
+	taskReceipt := func(status int, body []byte) taskState {
+		mustOK(status, body)
+		var receipt struct{ Task *taskState }
+		if err := json.Unmarshal(body, &receipt); err != nil || receipt.Task == nil || receipt.Task.ID == "" || receipt.Task.Fence == "" {
+			fmt.Println("task probe setup returned no valid task:", string(body))
+			os.Exit(1)
+		}
+		return *receipt.Task
+	}
+	task := taskReceipt(call("POST", "/v1/tasks", A.Token, map[string]any{
+		"queue": "isolation-probe", "key": "owned-task", "payload": 42,
+	}, false))
+	taskPath := "/v1/tasks/" + task.ID
+	probe("foreign org cannot read task rows", "zero", taskForeign.Token,
+		"SELECT * FROM swarmpg.tasks WHERE id = $1::uuid", task.ID)
+	foreignClaimCode, foreignClaimBody := call("POST", "/v1/tasks/claim", taskForeign.Token,
+		map[string]any{"queue": "isolation-probe", "request_id": taskForeign.ID}, false)
+	foreignTask, hasTask := decode(foreignClaimBody)["task"]
+	foreignCompleteCode, foreignCompleteBody := call("POST", taskPath+"/complete", taskForeign.Token,
+		map[string]any{"fence": "1", "result": -1}, false)
+	check("foreign org cannot claim or complete a task",
+		foreignClaimCode == 200 && hasTask && foreignTask == nil && foreignCompleteCode == 404 && errOf(decode(foreignCompleteBody))["code"] == "not_found",
+		fmt.Sprintf("claim HTTP%d task=%v; complete HTTP%d code=%v", foreignClaimCode, foreignTask, foreignCompleteCode, errOf(decode(foreignCompleteBody))["code"]))
+	claim := taskReceipt(call("POST", "/v1/tasks/claim", A.Token,
+		map[string]any{"queue": "isolation-probe", "request_id": A.ID, "lease_ms": 300000}, false))
+	if claim.ID != task.ID || claim.Owner != A.ID || claim.Fence != "1" || claim.State != "claimed" {
+		fmt.Printf("task probe setup returned an invalid claim: %+v\n", claim)
+		os.Exit(1)
+	}
+	wrongOwnerCode, wrongOwnerBody := call("POST", taskPath+"/complete", B.Token,
+		map[string]any{"fence": claim.Fence, "result": -1}, false)
+	probe("raw task UPDATE cannot transfer ownership", "reject:42501", B.Token,
+		"UPDATE swarmpg.tasks SET owner_agent_id = swarmpg.current_agent() WHERE id = $1::uuid", task.ID)
+	mustOK(call("POST", taskPath+"/release", A.Token, map[string]any{"fence": claim.Fence}, false))
+	fresh := taskReceipt(call("POST", "/v1/tasks/claim", A.Token,
+		map[string]any{"queue": "isolation-probe", "request_id": B.ID, "lease_ms": 300000}, false))
+	staleCode, staleBody := call("POST", taskPath+"/complete", A.Token,
+		map[string]any{"fence": claim.Fence, "result": -1}, false)
+	finished := taskReceipt(call("POST", taskPath+"/complete", A.Token,
+		map[string]any{"fence": fresh.Fence, "result": 42}, false))
+	check("wrong task owner and released fence cannot complete",
+		wrongOwnerCode == 409 && errOf(decode(wrongOwnerBody))["code"] == "stale_claim" &&
+			staleCode == 409 && errOf(decode(staleBody))["code"] == "stale_claim" &&
+			fresh.ID == task.ID && fresh.Fence == "2" && finished.ID == task.ID && finished.Owner == A.ID && finished.State == "completed" && finished.Result == 42,
+		fmt.Sprintf("wrong owner HTTP%d code=%v; old fence HTTP%d code=%v; current fence=%s result=%d", wrongOwnerCode, errOf(decode(wrongOwnerBody))["code"], staleCode, errOf(decode(staleBody))["code"], fresh.Fence, finished.Result))
 
 	// ---- kernel probes: raw SQL as agent_runtime with the gateway bypassed
 	// entirely, then budget probes through the gateway. Only the SwarmPG
