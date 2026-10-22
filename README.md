@@ -22,6 +22,10 @@ is enforcing this pooled principal even when an agent bypasses the gateway.
 - **Budgets.** The gateway limits rate, concurrency, result rows/bytes and statement time.
   The kernel adds a planner-cost gate and cumulative attempted-write limits, including
   nested functions, CTEs and trigger bookkeeping. It does not meter CPU or IO.
+- **Organization admission.** PostgreSQL shares organization rate, burst and concurrency
+  ceilings across gateways. Bounded local queues rotate waiting organizations, with
+  reserved capacity for task renew/release/complete. Per-agent limits remain local. See
+  the [admission contract](docs/admission.md) for fairness and failure boundaries.
 - **Versioned memory.** Compare-and-set, history and undo support read-think-write without
   an open transaction. Shared reads identify their producer; callers can choose a
   producer or list the visible shared values. Sharing is owner-written and org-readable,
@@ -81,8 +85,8 @@ budget changes; rerun `bench/run.sh` before making new performance claims.
 
 | Layer | Enforces |
 |---|---|
-| **Gateway** (`gateway/`, Go) | Agent tokens, rate and concurrency limits, result caps, a statement guard, a clean connection for every request, REST and MCP |
-| **Schema** (`sql/schema.sql`) | Row-level security, revoked fleet-wide levers, versioned memory, the journal, the audit log. Targets stock Postgres 14+ |
+| **Gateway** (`gateway/`, Go) | Agent tokens, local fair queues, shared organization admission, per-agent limits, result caps, a statement guard, connection cleanup, REST and MCP |
+| **Schema** (`sql/schema.sql`) | Row-level security, revoked fleet-wide levers, versioned memory, journal/audit, tasks/outbox and shared admission permits. Targets stock Postgres 14+ |
 | **Kernel** (`kernel/`, PostgreSQL 19 + a small patch series) | The sealed, signed agent principal and a fail-closed gate; tighten-only row and cost budgets in the executor |
 
 The gateway and schema target Postgres 14+; the CI stock-database job uses Postgres 17.
@@ -104,6 +108,10 @@ exercises 100–1,000 worker identities against stock and kernel deployments, wi
 abandoned claims, duplicate requests, changed inputs and a noisy tenant. Its reports count
 correct completed work and record the conditions tested; they are not a production scale guarantee.
 
+The [multi-gateway admission workload](docs/admission.md#reproducible-validation) adds
+sustained thousands-of-agent tests with shared quotas, quiet-tenant progress and gateway
+failure. Its evidence must be assessed separately from the historical throughput benchmark.
+
 Workspaces come after that proof. Storage branching, catalog virtualization, process-model
 rewrites and scale-to-zero are deferred research, outside the next milestone.
 [Design and acceptance criteria](docs/DESIGN.md) and [known limits](docs/THREAT-MODEL.md#residual-risks)
@@ -113,6 +121,7 @@ separate implemented behavior from planned work.
 
 - [Getting started](docs/getting-started.md): REST, MCP and SQL, step by step
 - [Gateway reference](docs/gateway.md): the API, configuration and what each layer enforces
+- [Organization admission](docs/admission.md): shared quotas, local fairness, deadlines and overload behavior
 - [Tasks](docs/tasks.md): claims, leases, fencing, atomic completion and retry contracts
 - [Threat model](docs/THREAT-MODEL.md): attackers, controls, the probe for each, residual risks
 - [Benchmark](bench/README.md): method, results, how to reproduce

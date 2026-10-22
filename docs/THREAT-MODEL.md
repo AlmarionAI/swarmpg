@@ -99,7 +99,7 @@ Hundreds of agents share each Postgres connection over time.
 |---|---|---|:-:|:-:|
 | Terminate or cancel other agents' backends | `pg_terminate_backend`/`pg_cancel_backend` revoked | terminate peer backends; cancel peer backends | ✔ | ✔ |
 | Exhaust the lock table or block others with advisory locks; fill storage with large objects | Advisory-lock family and large-object functions revoked | session advisory lock; large object spam | ✔ | ✔ |
-| Flood requests or hold many connections | Per-agent rate limit and concurrency cap; statement, lock and idle-in-transaction timeouts | (load phase; `rate_limited` and errors are counted) | ✔ | ✔ |
+| Flood requests or hold many connections | Shared organization rate/concurrency ceilings, bounded local fair queues, separate control capacity, local per-agent caps and fixed execution deadlines | Admission unit/SQL tests and owned multi-gateway workload; see [admission contract](admission.md) | ✔ | ✔ |
 | Runaway query (e.g. a cross join) | Refused before it runs when its estimated cost exceeds the agent's budget | runaway query refused before it runs; MCP query tool is held to the same budget | ✘ (statement timeout only) | ✔ |
 | Huge results or bulk writes | Gateway row and byte caps; kernel cumulative attempted-write cap including trigger bookkeeping, with statement rollback on excess | write over the row budget refused; refused write left nothing behind | partial (reads only) | ✔ |
 | Hide many writes behind one aggregate, CTE result or function call | Nested execution shares the statement's attempted-write budget; live data and history roll back together | aggregate cannot hide repeated memory writes; data-modifying CTE cannot hide repeated function writes; function calling function shares the write budget; residual-row checks | — | ✔ |
@@ -206,6 +206,28 @@ transaction spanning PostgreSQL and an arbitrary external service. A failed or e
 message may already have caused an external effect if its acknowledgement was lost;
 operator retry preserves its key, and must not replace it with a new one.
 
+### T13. Multi-gateway admission
+
+Organization policies, token buckets and permit rows are admin-only. SQL acquisition
+serializes per organization/class and checks the agent registry; the gateway does not
+execute without a grant. Local queues bound waiting work and rotate organizations.
+
+| Failure or attack | Control | Verification surface |
+|---|---|---|
+| Spread requests across many agents and gateways | One database token bucket and permit set per organization/class | Parallel SQL acquisition tests; shared-ceiling workload probes |
+| General work starves task heartbeats/completion | Independent control quotas, local slots and bounded class queues; actual REST route/MCP envelope selects class | Scheduler/classification tests; sustained leased-task workload |
+| Spoof a control tool header for a query | MCP validates the envelope and uses the actual tool name | MCP classification tests and workload probe |
+| Lose a grant reply or quota access | Fail closed, no replacement acquisition; independent cleanup of the same UUID | Controller ambiguous-grant test; quota-failure probe |
+| Crash a gateway or lose confirmation of rollback/reset while it owns capacity | Fixed permit expiry longer than bounded SQL execution; uncertain sessions retain their shared reservation | Runtime-cleanup tests; gateway crash/expiry workload probe |
+| Lower policy limits during work or repeatedly update for free tokens | Serialize policy updates with both buckets, clamp existing tokens, retain active permits | Live-policy and no-free-burst SQL tests |
+
+These are verification surfaces, not a statement that a particular run passed. Inspect
+the reports for the exact source revision. Local round-robin is not global weighted
+fairness. Raw SQL bypasses HTTP admission even on the kernel; admin/dispatcher traffic
+is outside agent admission. Compromised gateway or database-owner credentials can
+circumvent the policy. Database wall-clock jumps and failover need separate operational
+acceptance; CPU, IO and storage remain unmetered.
+
 ### Positive controls
 
 Probes that must *succeed*, so a control that breaks normal work is caught too: read own
@@ -234,7 +256,8 @@ What is **not** covered today, in rough order of importance.
    ids reveal fleet activity. `pg_locks` shows other backends' locks (relations and pids,
    no data). Query latency reveals load.
 6. **Cheap but slow work.** `pg_sleep` and similar cost almost nothing to the planner, so
-   an agent can hold up to `max_concurrency` connections for its statement timeout each.
+   admitted requests may occupy their available runtime slots until the bounded execution
+   deadline. Organization ceilings constrain this across gateways, but do not meter CPU/IO.
 7. **Budget gaps.** CPU, IO and storage size are not metered. Generic query byte budgets
    exist in the gateway; task functions also bound their receipts in SQL. The gateway
    passes a `max_rows + 1` kernel ceiling to detect result
@@ -247,7 +270,8 @@ What is **not** covered today, in rough order of importance.
    setting, not by the kernel. Task mutations additionally check the agent registry.
 10. **Deployment defaults.** Trust authentication, the default admin key and the default
     principal secret in the quickstart and benchmark are for local use only. TLS is not
-    provided by SwarmPG. Rate limits live in one gateway process.
+    provided by SwarmPG. Organization admission is shared in PostgreSQL; per-agent limits
+    remain process-local. Direct SQL bypasses gateway admission.
 11. **Audit completeness.** Default best-effort mode may drop receipts; memory-only spools
     do not survive process failure. Strict mode requires an operator-maintained persistent
     volume and still cannot atomically couple SQL commit with audit completion. It does

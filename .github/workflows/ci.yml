@@ -51,12 +51,17 @@ jobs:
         run: |
           .bin/gateway &
           for i in $(seq 1 50); do curl -sf -o /dev/null localhost:8080/healthz && break; sleep 0.2; done
-          scripts/check-docs.sh README.md docs/getting-started.md docs/gateway.md docs/tasks.md docs/outbox.md
+          scripts/check-docs.sh README.md docs/getting-started.md docs/gateway.md docs/tasks.md docs/outbox.md docs/admission.md
       - name: outbox crash recovery on stock PostgreSQL
         run: |
           COORD_DB_MODE=docker COORD_PG_IMAGE=postgres:17 \
             COORD_REPORT_DIR="$GITHUB_WORKSPACE/.coord-test/outbox-stock" \
             scripts/outbox-e2e.sh
+      - name: sustained organization fairness across three stock gateways
+        run: |
+          ADMISSION_DB_MODE=docker ADMISSION_WORKERS=2000 ADMISSION_DURATION=120s \
+            ADMISSION_REPORT_DIR="$GITHUB_WORKSPACE/.coord-test/admission-stock" \
+            scripts/admission-e2e.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -67,6 +72,8 @@ jobs:
             .coord-test/stock-*/*.log
             .coord-test/outbox-stock/report.json
             .coord-test/outbox-stock/*.log
+            .coord-test/admission-stock/report.json
+            .coord-test/admission-stock/*.log
 
   kernel:
     runs-on: ubuntu-latest
@@ -99,6 +106,11 @@ jobs:
           KERNEL=1 PG_BIN_DIR="$PREFIX/bin" \
             COORD_REPORT_DIR="$GITHUB_WORKSPACE/.coord-test/outbox-kernel" \
             scripts/outbox-e2e.sh
+      - name: sustained organization fairness across three kernel gateways
+        run: |
+          KERNEL=1 PG_BIN_DIR="$PREFIX/bin" ADMISSION_WORKERS=2000 ADMISSION_DURATION=120s \
+            ADMISSION_REPORT_DIR="$GITHUB_WORKSPACE/.coord-test/admission-kernel" \
+            scripts/admission-e2e.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -109,3 +121,5 @@ jobs:
             .coord-test/kernel-*/*.log
             .coord-test/outbox-kernel/report.json
             .coord-test/outbox-kernel/*.log
+            .coord-test/admission-kernel/report.json
+            .coord-test/admission-kernel/*.log

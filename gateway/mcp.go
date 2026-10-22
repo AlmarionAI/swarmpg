@@ -429,26 +429,88 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		writeRPCError(w, nil, &rpcError{Code: rpcInvalidRequest, Message: "POST only: this endpoint keeps no sessions and opens no streams", status: http.StatusMethodNotAllowed})
 		return
 	}
-	a, release, aerr := g.admit(r)
-	if aerr != nil {
-		switch aerr.Status {
-		case http.StatusUnauthorized:
-			w.Header().Set("WWW-Authenticate", `Bearer realm="swarmpg"`)
-		case http.StatusTooManyRequests:
-			w.Header().Set("Retry-After", "1")
+	a, authErr := g.authenticate(r.Context(), r)
+	if authErr != nil {
+		g.mcpAdmissionError(w, authErr.(*apiError))
+		return
+	}
+	// Classification needs the actual payload. Bound body reads separately so
+	// slow or malformed MCP messages cannot allocate unbounded memory before
+	// the execution queues apply, and reject revoked cached identities early.
+	if a.Disabled || a.Expired {
+		g.mcpAdmissionError(w, errForbidden("agent disabled or token expired"))
+		return
+	}
+	releaseIngress, ingressErr := g.acquireMCPIngress(a)
+	if ingressErr != nil {
+		g.mcpAdmissionError(w, ingressErr)
+		return
+	}
+	c, rerr := func() (*mcpCall, *rpcError) {
+		defer releaseIngress()
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+		if err != nil {
+			return &mcpCall{}, &rpcError{Code: rpcParseError, Message: "request body unreadable or larger than 1 MiB", status: 400}
 		}
-		writeRPCError(w, nil, &rpcError{Code: rpcServerError, Message: aerr.Message, Data: map[string]any{"code": aerr.Code}, status: aerr.Status})
+		return parseMCP(r.Header, body)
+	}()
+	if rerr != nil {
+		writeRPCError(w, c.id, rerr)
+		return
+	}
+	class := admissionGeneral
+	if c.method == "tools/call" && (c.toolName == "task_renew" || c.toolName == "task_release" || c.toolName == "task_complete") {
+		class = admissionControl
+	}
+	a, release, aerr := g.admitAgent(r, a, class)
+	setAdmissionTiming(w, r)
+	if aerr != nil {
+		g.mcpAdmissionError(w, aerr)
 		return
 	}
 	defer release()
-	g.serveMCP(w, r, a)
+	g.serveMCPCall(w, r, a, c)
 }
 
-// serveMCP serves one admitted JSON-RPC message.
+func (g *Gateway) acquireMCPIngress(a *Agent) (func(), *apiError) {
+	g.mcpIngressOnce.Do(func() { g.mcpIngress = make(chan struct{}, 64) })
+	// One identity cannot occupy all body-read slots even when its execution
+	// concurrency is configured as unlimited. This is a separate local bound.
+	ingressAgent := *a
+	ingressAgent.MaxConcurrency = 4
+	if a.MaxConcurrency > 0 {
+		ingressAgent.MaxConcurrency = min(a.MaxConcurrency, 4)
+	}
+	releaseAgent, ok := g.acquireSlot(&ingressAgent, admissionClass("mcp_ingress"))
+	if !ok {
+		return nil, admissionRejected("mcp_ingress_busy", 100)
+	}
+	select {
+	case g.mcpIngress <- struct{}{}:
+		return func() { <-g.mcpIngress; releaseAgent() }, nil
+	default:
+		releaseAgent()
+		return nil, admissionRejected("mcp_ingress_busy", 100)
+	}
+}
+
+func (g *Gateway) mcpAdmissionError(w http.ResponseWriter, err *apiError) {
+	if err.Status == 401 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="swarmpg"`)
+	}
+	admissionHTTPHeaders(w, err)
+	data := map[string]any{"code": err.Code, "retryable": err.Retryable}
+	for k, v := range err.Extra {
+		data[k] = v
+	}
+	writeRPCError(w, nil, &rpcError{Code: rpcServerError, Message: err.Message, Data: data, status: err.Status})
+}
+
+// serveMCP permits protocol unit tests to exercise an already admitted call.
 func (g *Gateway) serveMCP(w http.ResponseWriter, r *http.Request, a *Agent) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 	if err != nil {
-		writeRPCError(w, nil, &rpcError{Code: rpcParseError, Message: "request body unreadable or larger than 1 MiB", status: http.StatusBadRequest})
+		writeRPCError(w, nil, &rpcError{Code: rpcParseError, Message: "request body unreadable or larger than 1 MiB", status: 400})
 		return
 	}
 	c, rerr := parseMCP(r.Header, body)
@@ -456,6 +518,9 @@ func (g *Gateway) serveMCP(w http.ResponseWriter, r *http.Request, a *Agent) {
 		writeRPCError(w, c.id, rerr)
 		return
 	}
+	g.serveMCPCall(w, r, a, c)
+}
+func (g *Gateway) serveMCPCall(w http.ResponseWriter, r *http.Request, a *Agent, c *mcpCall) {
 	if len(c.id) == 0 { // a notification: accepted, nothing to answer
 		w.WriteHeader(http.StatusAccepted)
 		return

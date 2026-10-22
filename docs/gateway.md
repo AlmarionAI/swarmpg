@@ -23,7 +23,7 @@ deployment.
 
 | Variable | Default | |
 |---|---|---|
-| `DATABASE_URL` | `postgres://127.0.0.1:5499/swarmpg?sslmode=disable` | Admin connection (a superuser or the schema owner): the agent registry and the audit log |
+| `DATABASE_URL` | `postgres://127.0.0.1:5499/swarmpg?sslmode=disable` | Privileged connection URL (a superuser or the schema owner): admin/audit, authentication and admission pools |
 | `RUNTIME_DATABASE_URL` | `agent_runtime` on the same host and database | The connection all agent SQL runs on; must log in as `agent_runtime` |
 | `ADMIN_KEY` | `dev-admin-key` (logged as a warning) | Required in `X-Admin-Key` on admin calls |
 | `ADDR` | `:8080` | Listen address. Plain HTTP: terminate TLS in front |
@@ -33,14 +33,20 @@ deployment.
 | `AUDIT_SPOOL_CAPACITY` | `10000` | Maximum outstanding receipts for new admission, including active requests and retries; must be positive; a recovered backlog is never discarded to meet a smaller limit |
 | `AUDIT_SPOOL_DIR` | none | Optional persistent spool directory in best-effort mode; required on persistent storage in strict mode. One gateway process owns each directory |
 
-The runtime pool holds 32 connections and the admin pool 4. The gateway detects the
-kernel at startup and logs which mode it runs in.
+The runtime pool holds 32 connections; administrative/audit, authentication and admission
+pools each hold 4, for up to 44 database connections per gateway. Organization admission
+is always enabled in the production gateway. Its default local slots reserve 24 for
+general work and 8 for task renew/release/complete. See [organization admission](admission.md)
+for `ADMISSION_*` settings, shared policies, overload codes and capacity planning. The
+gateway detects the kernel at startup and logs which mode it runs in.
 
 ## API
 
 | Call | Auth | Purpose |
 |---|---|---|
 | `POST /v1/orgs {name}` | admin | create an org |
+| `GET /v1/orgs/{id}/admission` | admin | shared policy, active permits and cumulative grant counters |
+| `PUT /v1/orgs/{id}/admission` | admin | replace the six general/control rate, burst and concurrency limits; [contract](admission.md#organization-policy-api) |
 | `POST /v1/agents {org_id,name,rps_limit,max_rows,max_result_bytes,max_concurrency,max_cost,statement_timeout_ms,read_only,ttl_seconds}` | admin | mint an agent + token (TTL optional; `max_cost` defaults to 1e6 and applies on the kernel) |
 | `POST /v1/agents/{id}/disable` | admin | kill switch |
 | `POST /v1/query {sql,params}` | agent | one statement, parameterised, row- and byte-capped, timed out |
@@ -57,7 +63,8 @@ kernel at startup and logs which mode it runs in.
 | `GET /v1/tasks/{id}/outbox` | agent | organization-scoped committed delivery intents and their current status |
 | `/v1/admin/outbox/…` | admin | claim/renew/ack/nack, inspect and retry external deliveries; [outbox contract and dispatcher](outbox.md) |
 | `POST /mcp` | agent | the same operations as MCP tools (see below) |
-| `GET /healthz` | none | liveness, request/error counters, pool sizes, `audit_lost`, `audit_retries` and `audit:{mode,queued,capacity,durable_spool}` |
+| `GET /healthz` | none | liveness, request/error counters, pool sizes, audit status and local admission counters/capacities |
+| `GET /readyz` | none | controller presence, admission-pool connectivity and required admission catalog objects |
 
 `POST /v1/events` honours an `Idempotency-Key` header: a retry after a timeout replays the
 stored response instead of appending twice. Memory `expected_version` detects a stale or
@@ -177,9 +184,13 @@ Postgres, that identity depends on requests staying behind the gateway:
 - **An operator-only audit table.** Agents can neither read nor write audit records or
   call either audit insertion helper. Receipt delivery follows the audit contract above.
 
-On top of that the gateway applies each agent's rate, concurrency, row, byte and time
-limits; a statement guard that refuses `SET`, transaction control, DDL, `COPY`, cursors and
-multiple statements after stripping comments and normalising whitespace; and a reset of
+On top of that the gateway applies shared organization rate/concurrency admission and
+locally fair queues, then each agent's row, byte and time limits. Per-agent rate and
+concurrency limits remain process-local and are separate for general/control requests.
+The fixed admission execution deadline also caps the server timeout, even if the agent
+timeout is zero. The gateway applies a statement guard that refuses `SET`, transaction
+control, DDL, `COPY`, cursors and multiple statements after stripping comments and
+normalising whitespace; and a reset of
 every connection after every request (`CLOSE ALL; RESET ALL; DISCARD TEMP; DISCARD
 SEQUENCES`). Audit delivery and last-seen updates run in background batches. Audit
 admission follows the selected policy; strict disk persistence adds synchronous work.

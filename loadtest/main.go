@@ -348,6 +348,23 @@ func main() {
 	probe("read own memory", "allow", A.Token, "SELECT count(*) FROM swarmpg.memory")
 	probe("write own document", "allow", A.Token, "INSERT INTO swarmpg.documents(agent_id,org_id,collection,body) VALUES(swarmpg.current_agent(),swarmpg.current_org(),'c',jsonb_build_object('ok',true))")
 
+	// Admission state and administration remain inaccessible to ordinary agent
+	// SQL, including attempts to mint reserved-control permits directly.
+	fmt.Println("\n== organization admission isolation probes ==")
+	for _, table := range []string{"admission_policies", "admission_buckets", "admission_permits"} {
+		probe("agent cannot read "+table, "reject:42501", A.Token, "SELECT * FROM swarmpg."+table)
+	}
+	probe("agent cannot inspect fleet admission status", "reject:42501", A.Token,
+		"SELECT swarmpg.admission_status(swarmpg.current_org())")
+	probe("agent cannot change organization quotas", "reject:42501", A.Token,
+		"SELECT swarmpg.admission_policy_set(swarmpg.current_org(),'{}'::jsonb)")
+	probe("agent cannot forge a control permit", "reject:42501", A.Token,
+		"SELECT swarmpg.admission_acquire(swarmpg.current_org(),swarmpg.current_agent(),$1::uuid,$2::uuid,'control',1000)", A.ID, B.ID)
+	probe("agent cannot release another permit", "reject:42501", A.Token,
+		"SELECT swarmpg.admission_release(swarmpg.current_org(),$1::uuid,$2::uuid)", A.ID, B.ID)
+	probe("agent cannot sweep shared permits", "reject:42501", A.Token,
+		"SELECT swarmpg.admission_sweep(1000)")
+
 	// ---- MCP: the same agents through the /mcp endpoint
 	fmt.Println("\n== MCP probes (/mcp, agent tokens) ==")
 	check := func(name string, ok bool, res string) {
@@ -359,6 +376,12 @@ func main() {
 			probeFail++
 		}
 		fmt.Printf("  [%s] %-50s -> %s\n", mark, name, res)
+	}
+	for _, method := range []string{"GET", "PUT"} {
+		status, body := call(method, "/v1/orgs/"+org.ID+"/admission", A.Token, map[string]any{}, false)
+		errorBody, _ := decode(body)["error"].(map[string]any)
+		check("agent bearer cannot "+method+" organization quotas", status == 401 && errorBody["code"] == "unauthorized",
+			fmt.Sprintf("HTTP%d %s", status, firstLine(string(body))))
 	}
 	code, initMsg := mcpRPC(A.Token, false, "initialize", map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "loadtest", "version": "1"}}, nil)
 	initRes, _ := initMsg["result"].(map[string]any)

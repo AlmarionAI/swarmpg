@@ -46,6 +46,17 @@ files also remain for diagnosis. Docker containers are removed.
   workers are active. Each fault must interrupt requests and be followed by a
   successful completion. Transient failures are retried within bounded fault windows;
   authentication and other unexpected failures fail the run.
+- Each retrying operation has a 30-second deadline starting at its first HTTP
+  dispatch, or the caller's earlier deadline. Initial client admission queueing
+  remains bounded by the caller's deadline; subsequent queue waits, HTTP attempts
+  and backoff consume the same retry deadline, which is never reset. This exceeds the
+  default 20-second organization admission permit lease so reservations left by
+  a killed gateway can expire safely. Every 429 is recorded and retried after
+  one second with the identical body and request ID; stale or expired task leases
+  still follow the normal reclaim/fencing path. Transport and server errors
+  remain retryable only within the recorded fault window. A deadline failure
+  reports first dispatch time, attempts, initial queue time, retry elapsed time
+  and the last HTTP status/code; it still fails the run.
 - A noisy agent floods queries under a small admission budget while the quiet
   organization continues processing tasks. Both organizations must finish every
   generated task. Per-organization latency and rejection outcomes are reported.

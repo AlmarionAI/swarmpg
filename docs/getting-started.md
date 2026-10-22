@@ -43,8 +43,8 @@ created:
 
 | Field | Default | Limits |
 |---|---|---|
-| `rps_limit` | 20 | requests per second (0: none) |
-| `max_concurrency` | 4 | requests in flight at once |
+| `rps_limit` | 20 | requests per second per gateway and request class (0: no per-agent rate cap) |
+| `max_concurrency` | 4 | requests in flight per gateway and request class |
 | `max_rows` | 1000 | rows returned per query; kernel attempted-write ceiling is `max_rows + 1`, including nested writes and trigger bookkeeping |
 | `max_result_bytes` | 4 MiB | bytes returned per query |
 | `max_cost` | 1e6 | planner cost a query may have before it runs (kernel) |
@@ -257,7 +257,10 @@ covered yet.
 | 409 | `version_conflict` | the key changed since you read it; `current_version` says to what | read again, then retry |
 | 413 | `result_limit_exceeded` | complete shared listing exceeds the result budget | select a producer with `from`, or raise the budget |
 | 503 | `audit_unavailable` | strict audit could not reserve an intent; SQL was not executed | restore spool capacity/availability, then retry |
-| 429 | `rate_limited`, `concurrency_limited` | over the rate or concurrency limit | wait `Retry-After` seconds |
+| 429 | `rate_limited`, `concurrency_limited` | over the process-local per-agent class limit | back off with jitter and honor `Retry-After` |
+| 429 | `org_rate_limited`, `org_concurrency_limited` | over the shared organization class limit | back off with jitter and honor `Retry-After` |
+| 429 | `local_queue_full`, `local_queue_timeout`, `auth_busy`, `admission_busy`, `mcp_ingress_busy` | bounded gateway capacity exhausted | reduce in-flight requests and retry with backoff |
+| 503 | `admission_unavailable` | shared organization admission failed; request work was not executed | restore admission availability, then retry |
 | 400 | `53400` | over the cost or row budget (kernel) | narrow the query or the write |
 | 400/504 | `57014`, `statement_timeout` | took longer than `statement_timeout_ms` | retry or narrow; `retryable` is true |
 
@@ -265,6 +268,12 @@ covered yet.
 arbitrary write is safe to repeat. Use event idempotency keys or memory compare-and-set,
 and inspect outcomes after a lost connection. An `audit_outcome_unknown` record means the
 SQL result was not durably recorded; it does not mean the SQL rolled back.
+
+Organization ceilings are shared across all gateways using the database. Typed task
+renew/release/complete have reserved control capacity; all other work uses the general
+lane. The admission execution deadline also caps requests whose per-agent timeout is
+zero. Operators configure policies with `GET/PUT /v1/orgs/{id}/admission`; see the
+[admission reference](admission.md) for defaults, fairness boundaries and connection sizing.
 
 ## 10. Run on the SwarmPG kernel
 

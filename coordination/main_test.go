@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -348,6 +350,213 @@ func TestDatabaseDisconnectCodesAreNarrow(t *testing.T) {
 	for _, code := range []string{"", "unauthorized", "bad_request", "42501", "40001", "57P04"} {
 		if databaseDisconnect(code) {
 			t.Fatalf("unrelated failure %s was masked", code)
+		}
+	}
+}
+
+func TestAdmissionRetriesSurviveMoreThanFifteenRejections(t *testing.T) {
+	if requestRetryWindow < 30*time.Second {
+		t.Fatal("retry deadline cannot cover the default 20s admission lease")
+	}
+	for _, final := range []struct {
+		name, body string
+		status     int
+	}{
+		{"success", `{"task":null}`, http.StatusOK},
+		{"expired lease remains visible", `{"error":{"code":"lease_expired"}}`, http.StatusConflict},
+	} {
+		t.Run(final.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var requests []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				body, _ := io.ReadAll(req.Body)
+				mu.Lock()
+				requests = append(requests, string(body))
+				n := len(requests)
+				mu.Unlock()
+				if n <= 20 {
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":{"code":"org_concurrency_limited"}}`))
+					return
+				}
+				w.WriteHeader(final.status)
+				_, _ = w.Write([]byte(final.body))
+			}))
+			defer server.Close()
+			r := workerTestRun(server, 3000)
+			body := map[string]any{"request_id": "fixed-claim-receipt", "fence": "9007199254740993", "result": result{42}}
+			out, err := r.callWithRetryPolicy(context.Background(), agent{ID: "worker"}, "POST", "/v1/tasks/task/complete", body, false, true,
+				requestRetryPolicy{time.Second, time.Millisecond, time.Millisecond})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil || out.Status != final.status || len(requests) != 21 || r.report.RequestRetries != 20 || r.report.HTTPOutcomes["429:org_concurrency_limited"] != 20 {
+				t.Fatalf("admission retry lost outcomes: response=%+v error=%v requests=%d report=%+v", out, err, len(requests), r.report)
+			}
+			for _, got := range requests {
+				if got != requests[0] {
+					t.Fatal("retry changed immutable request body")
+				}
+			}
+		})
+	}
+}
+
+func TestAdmissionRetryDeadlineAndCallerCancellation(t *testing.T) {
+	for _, name := range []string{"retry budget", "earlier caller deadline", "retry disabled"} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"code":"org_concurrency_limited"}}`))
+			}))
+			defer server.Close()
+			r := workerTestRun(server, 3000)
+			ctx := context.Background()
+			window := 25 * time.Millisecond
+			if name == "earlier caller deadline" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, window)
+				defer cancel()
+				window = time.Second
+			}
+			start := time.Now()
+			out, err := r.callWithRetryPolicy(ctx, agent{ID: "worker"}, "POST", "/v1/tasks/claim", map[string]any{"request_id": "stable"}, false, name != "retry disabled",
+				requestRetryPolicy{window, time.Millisecond, time.Millisecond})
+			if name == "retry disabled" {
+				if err != nil || out.Status != 429 || r.report.Requests != 1 || r.report.RequestRetries != 0 {
+					t.Fatalf("unexpected disabled retry: response=%+v err=%v requests=%d", out, err, r.report.Requests)
+				}
+			} else {
+				if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 500*time.Millisecond || r.report.HTTPOutcomes["429:org_concurrency_limited"] == 0 {
+					t.Fatalf("retry escaped deadline or lost rejection: response=%+v err=%v elapsed=%s", out, err, time.Since(start))
+				}
+			}
+			if len(r.sem) != 0 || len(r.claimSem) != 0 {
+				t.Fatal("retry cancellation leaked HTTP capacity")
+			}
+		})
+	}
+}
+
+func TestInitialClaimQueueDoesNotConsumeRetryWindow(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		n := len(bodies)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":"org_concurrency_limited"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"task":{"id":"claimed-task","fence":"9007199254740993"}}`))
+	}))
+	defer server.Close()
+	r := workerTestRun(server, 3000)
+	r.claimSem = make(chan struct{}, 1)
+	r.claimSem <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	type answer struct {
+		out apiResponse
+		err error
+	}
+	result := make(chan answer, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		out, err := r.callWithRetryPolicy(ctx, agent{ID: "worker"}, "POST", "/v1/tasks/claim", map[string]any{"request_id": "fixed-claim"}, false, true,
+			requestRetryPolicy{50 * time.Millisecond, time.Millisecond, time.Millisecond})
+		result <- answer{out, err}
+	}()
+	<-started
+	// Hold initial client admission longer than the entire retry window.
+	select {
+	case got := <-result:
+		t.Fatalf("unsent operation spent retry budget: %+v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	<-r.claimSem
+	got := <-result
+	if got.err != nil || got.out.Status != http.StatusOK || r.report.RequestRetries != 1 {
+		t.Fatalf("queued operation could not use its retry window: %+v", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 || bodies[0] != bodies[1] || r.report.ClaimAttempts != 1 || len(r.participants) != 1 {
+		t.Fatalf("claim retry changed receipt or participation: bodies=%v report=%+v", bodies, r.report)
+	}
+}
+
+func TestCallerDeadlineStillBoundsInitialQueue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		t.Error("cancelled initial waiter dispatched an HTTP request")
+	}))
+	defer server.Close()
+	r := workerTestRun(server, 3000)
+	r.claimSem = make(chan struct{}, 1)
+	r.claimSem <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := r.callWithRetryPolicy(ctx, agent{ID: "worker"}, "POST", "/v1/tasks/claim", map[string]any{"request_id": "fixed"}, false, true,
+		requestRetryPolicy{time.Second, time.Millisecond, time.Millisecond})
+	if !errors.Is(err, context.DeadlineExceeded) || r.report.Requests != 0 || len(r.participants) != 0 || len(r.sem) != 0 {
+		t.Fatalf("initial caller deadline was not preserved: err=%v report=%+v", err, r.report)
+	}
+	for _, detail := range []string{"first_dispatch=none", "attempts=0", "initial_queue_ms=", "retry_elapsed_ms=0.000", "last_http_status=0"} {
+		if !strings.Contains(err.Error(), detail) {
+			t.Fatalf("deadline diagnostic missing %q: %v", detail, err)
+		}
+	}
+	<-r.claimSem
+}
+
+func TestRetryQueueCannotRestartDeadline(t *testing.T) {
+	serverEntered := make(chan struct{})
+	allowResponse := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		close(serverEntered)
+		<-allowResponse
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"org_concurrency_limited"}}`))
+	}))
+	defer server.Close()
+	r := workerTestRun(server, 3000)
+	r.claimSem = make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.callWithRetryPolicy(context.Background(), agent{ID: "worker"}, "POST", "/v1/tasks/claim", map[string]any{"request_id": "fixed"}, false, true,
+			requestRetryPolicy{80 * time.Millisecond, 20 * time.Millisecond, time.Millisecond})
+		done <- err
+	}()
+	<-serverEntered
+	// Queue a competing local claimant while the first HTTP attempt holds the
+	// slot. Its admission must not reset the original operation's retry clock.
+	occupied := make(chan struct{})
+	unblock := make(chan struct{})
+	go func() {
+		r.claimSem <- struct{}{}
+		close(occupied)
+		<-unblock
+		<-r.claimSem
+	}()
+	close(allowResponse)
+	<-occupied
+	defer close(unblock)
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retry queue extended the operation deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || r.report.Requests != 1 || r.report.RequestRetries != 1 {
+		t.Fatalf("retry wait escaped fixed deadline: err=%v report=%+v", err, r.report)
+	}
+	for _, detail := range []string{"attempts=1", "last_http_status=429", "last_http_code=org_concurrency_limited", "first_dispatch=", "initial_queue_ms=", "retry_elapsed_ms="} {
+		if !strings.Contains(err.Error(), detail) {
+			t.Fatalf("deadline diagnostic missing %q: %v", detail, err)
 		}
 	}
 }
