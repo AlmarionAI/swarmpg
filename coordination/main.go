@@ -266,14 +266,27 @@ func (r *run) call(ctx context.Context, a agent, method, path string, body any, 
 		requestRetryPolicy{requestRetryWindow, time.Second, 50 * time.Millisecond})
 }
 
-func (r *run) callWithRetryPolicy(ctx context.Context, a agent, method, path string, body any, admin, retry bool, policy requestRetryPolicy) (apiResponse, error) {
-	if retry {
-		// WithTimeout preserves an earlier caller deadline. The bound includes
-		// semaphore waits, network attempts and backoff, not just sleep time.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, policy.window)
-		defer cancel()
-	}
+func (r *run) callWithRetryPolicy(ctx context.Context, a agent, method, path string, body any, admin, retry bool, policy requestRetryPolicy) (outcome apiResponse, callErr error) {
+	started := time.Now()
+	var firstDispatch time.Time
+	var initialQueue time.Duration
+	attempts, lastStatus, lastCode := 0, 0, ""
+	defer func() {
+		if !errors.Is(callErr, context.DeadlineExceeded) {
+			return
+		}
+		retryElapsed := time.Duration(0)
+		first := "none"
+		if firstDispatch.IsZero() {
+			initialQueue = time.Since(started)
+		} else {
+			first = firstDispatch.UTC().Format(time.RFC3339Nano)
+			retryElapsed = time.Since(firstDispatch)
+		}
+		callErr = fmt.Errorf("request deadline on %s %s: started=%s first_dispatch=%s attempts=%d initial_queue_ms=%.3f retry_elapsed_ms=%.3f last_http_status=%d last_http_code=%s: %w",
+			method, path, started.UTC().Format(time.RFC3339Nano), first, attempts,
+			float64(initialQueue.Microseconds())/1000, float64(retryElapsed.Microseconds())/1000, lastStatus, lastCode, callErr)
+	}()
 	var encoded []byte
 	var err error
 	if body != nil {
@@ -294,6 +307,18 @@ func (r *run) callWithRetryPolicy(ctx context.Context, a agent, method, path str
 			release()
 			return apiResponse{}, err
 		}
+		if attempt == 0 {
+			firstDispatch = time.Now()
+			initialQueue = firstDispatch.Sub(started)
+			if retry {
+				// Initial client queueing has not sent any operation and remains
+				// bounded by the caller. Start one retry deadline on first dispatch;
+				// subsequent queue waits, HTTP attempts and backoff all consume it.
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, policy.window)
+				defer cancel()
+			}
+		}
 		req, err := http.NewRequestWithContext(ctx, method, r.cfg.Gateway+path, bytes.NewReader(encoded))
 		if err != nil {
 			release()
@@ -311,6 +336,7 @@ func (r *run) callWithRetryPolicy(ctx context.Context, a agent, method, path str
 			r.participants[a.ID] = true
 			r.mu.Unlock()
 		}
+		attempts++
 		resp, transportErr := r.client.Do(req)
 		out := apiResponse{}
 		if transportErr == nil {
@@ -325,6 +351,7 @@ func (r *run) callWithRetryPolicy(ctx context.Context, a agent, method, path str
 			}
 			_ = json.Unmarshal(out.Body, &envelope)
 			out.Code = envelope.Error.Code
+			lastStatus, lastCode = out.Status, out.Code
 		}
 		release()
 		key := strconv.Itoa(out.Status)
@@ -1226,7 +1253,7 @@ func main() {
 		client: &http.Client{Transport: &http.Transport{MaxIdleConns: cfg.InFlight * 2, MaxIdleConnsPerHost: cfg.InFlight, MaxConnsPerHost: cfg.InFlight}, Timeout: 10 * time.Second},
 		report: report{Seed: cfg.Seed, SourceCommit: os.Getenv("COORD_SOURCE_COMMIT"), SourceTreeSHA256: os.Getenv("COORD_SOURCE_TREE_SHA256"),
 			Environment:  map[string]string{"go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH, "cpu_count": strconv.Itoa(runtime.NumCPU()), "gomaxprocs": strconv.Itoa(runtime.GOMAXPROCS(0)), "postgres": os.Getenv("COORD_DB_VERSION"), "kernel": os.Getenv("KERNEL"), "audit_mode": "best-effort", "database_mode": os.Getenv("COORD_DB_MODE")},
-			Settings:     map[string]any{"workers": cfg.Workers, "in_flight": cfg.InFlight, "claim_in_flight": claimLimit, "lease_ms": cfg.LeaseMS, "duration": cfg.Duration.String(), "runtime_pool": 32, "empty_poll_backoff_cap_ms": 2000, "request_retry_window_ms": requestRetryWindow.Milliseconds(), "lease_renew_interval_ms": cfg.LeaseMS / 3, "quiet_worker_share": 0.8, "noisy_query_rps_limit": 5, "noisy_query_concurrency_limit": 2, "external_effects": false},
+			Settings:     map[string]any{"workers": cfg.Workers, "in_flight": cfg.InFlight, "claim_in_flight": claimLimit, "lease_ms": cfg.LeaseMS, "duration": cfg.Duration.String(), "runtime_pool": 32, "empty_poll_backoff_cap_ms": 2000, "request_retry_window_ms": requestRetryWindow.Milliseconds(), "request_retry_window_starts": "first_dispatch", "lease_renew_interval_ms": cfg.LeaseMS / 3, "quiet_worker_share": 0.8, "noisy_query_rps_limit": 5, "noisy_query_concurrency_limit": 2, "external_effects": false},
 			HTTPOutcomes: map[string]int64{}, Events: []event{}, Errors: []string{}},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Duration+time.Duration(cfg.LeaseMS)*time.Millisecond+3*time.Minute)
