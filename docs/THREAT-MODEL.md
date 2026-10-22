@@ -1,7 +1,7 @@
 # SwarmPG threat model
 
-Development revision, 2026-10-22. The load harness contains 70 probes on stock Postgres
-and 99 with the signed SwarmPG kernel. The tables cite those probe names; audit delivery
+Development revision, 2026-10-22. The load harness contains 76 probes on stock Postgres
+and 105 with the signed SwarmPG kernel. The tables cite those probe names; audit delivery
 and shared-producer semantics also have gateway unit/integration tests run by the e2e
 script. Test presence is not a production-readiness claim. Negative query probes require
 the expected application code/SQLSTATE and HTTP status; unexpected HTTP 5xx, transport
@@ -146,15 +146,16 @@ Not attacks, but the failure modes that hurt agent fleets most.
 | A web page drives a local gateway (DNS rebinding, A3) | Requests with an `Origin` outside `MCP_ALLOWED_ORIGINS` get 403 | foreign Origin refused (DNS rebinding) | ✔ | ✔ |
 | Bypass REST controls through MCP | Tools call the same code paths, under the same identity, budgets and limits | query cannot read a peer's rows; query cannot change identity; MCP query tool is held to the same budget | ✔ | ✔ |
 
-Protocol conformance (both eras, sixteen tools) is covered by: legacy initialize negotiates
-2025-06-18; 2026-07-28 server/discover; tools/list returns the 16 tools; schema tool
+Protocol conformance (both eras, seventeen tools) is covered by: legacy initialize negotiates
+2025-06-18; 2026-07-28 server/discover; tools/list returns the 17 tools; schema tool
 describes the tables; memory_put then memory_get round-trips.
 
 ### T10. Audit loss and ambiguous outcomes
 
 SQL-query audit covers the REST query endpoint and MCP query tool, including guard
 rejections. It does not cover typed task/memory/event API writes or direct database sessions.
-Task transition history is a separate synchronous record committed with each task mutation.
+Task and outbox transition histories are separate synchronous records committed with
+their state changes.
 
 | Risk | Control and limit | Validation |
 |---|---|---|
@@ -186,6 +187,24 @@ The [task contract](tasks.md) covers declared inputs and database state only. It
 make arbitrary external effects exactly once or validate undeclared reads. Task queues
 are org-shared, with no narrower workspace/queue membership policy. Completed dependencies
 are immutable; cancelled dependencies block dependents until explicit replanning.
+
+### T12. External delivery intent and ambiguous outcomes
+
+| Attack or failure | Control and boundary | Validation |
+|---|---|---|
+| Completion fails after preparing effects | Result, task history and outbox rows share a transaction; final receipt budget failure rolls back all writes | `TestOutboxSQLValidationAndBudgetRollbackIntegration`; `TestOutboxCompletionResponseBudgetRollsBackIntegration` |
+| Another org reads delivery payloads | Forced org RLS and explicit task ownership scope | `foreign org cannot read outbox rows`; `foreign org cannot inspect outbox through REST/MCP` |
+| Agent falsely acknowledges external delivery | No runtime DML or dispatcher function grants; administrative HTTP credential required | `raw outbox UPDATE cannot acknowledge delivery`; `agent SQL cannot invoke outbox dispatcher`; `agent bearer cannot call admin outbox API` |
+| Dispatcher crashes after the receiver commits an effect | Stable message key and exact body on replay; receiver must atomically deduplicate the effect | `scripts/outbox-recovery.py` kills dispatcher and receiver after durable effect commit, then compares receiver payloads and delivery history |
+| Expired dispatcher acknowledges a reclaimed message | Post-lock database-time lease and fence checks; successful identical ack is replayable | `TestOutboxSQLLeaseAfterLockWaitIntegration`; `TestOutboxSQLClaimAndAckRacesIntegration` |
+| Agent directs a credentialed request to another service | Routing names map to operator-configured destinations; no agent URLs/headers; redirects refused | Dispatcher configuration/redirect tests; concurrent org/destination recovery case |
+
+The dispatcher holds gateway administrative authority. Its operator controls destination
+URLs and credentials; the receiver enforces business authorization and idempotency.
+HTTP 2xx means delivery acceptance under that receiver's contract. There is no atomic
+transaction spanning PostgreSQL and an arbitrary external service. A failed or exhausted
+message may already have caused an external effect if its acknowledgement was lost;
+operator retry preserves its key, and must not replace it with a new one.
 
 ### Positive controls
 
@@ -242,8 +261,8 @@ What is **not** covered today, in rough order of importance.
 ## Reproduce
 
 ```bash
-make e2e              # stock Postgres: 70 probes
-make kernel && make e2e KERNEL=1   # SwarmPG kernel: 99 probes
+make e2e              # stock Postgres: 76 probes
+make kernel && make e2e KERNEL=1   # SwarmPG kernel: 105 probes
 ```
 
 `bench/run.sh` also runs three of these attacks against a PgBouncer + row-level security

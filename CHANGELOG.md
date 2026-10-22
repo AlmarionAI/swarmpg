@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add a transactional task outbox, administrative delivery claims/leases/fences,
+  stable idempotency keys, bounded retry cycles, explicit failed-message requeue and
+  attributed delivery history. A separate HTTP dispatcher routes operator-configured
+  destinations; external receivers must atomically deduplicate effects. Stock/kernel
+  recovery tests kill dispatchers and receivers after durable effects, crash services,
+  and verify persisted delivery and receiver ledgers.
 - Add org-shared task queues with immutable dependencies and producer-selected input
   snapshots, lease-based claims, monotonic fencing, renew/release/cancel, administrative
   recovery, durable claim replay and atomic result/state/history completion. Eight new

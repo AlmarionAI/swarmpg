@@ -55,7 +55,7 @@ release ends ownership immediately, and the next claim receives a larger fence.
 |---|---|
 | Enqueue | `(org, queue, key)` identifies the request. Same creator, payload, dependency set and input set returns the task's current snapshot; different content conflicts. |
 | Claim | Required `request_id` UUID is scoped to the agent/org. Identical retries return the original snapshot, including an empty claim. Changed queue/duration conflicts. Use a new ID to poll again. |
-| Complete | Same successful owner, fence and JSON result returns the completed receipt, even after its old lease expires or inputs later change. Different result conflicts. |
+| Complete | Same successful owner, fence, JSON result and normalized effect set returns the completed receipt, even after its old lease expires or inputs later change. Different result or effects conflict. |
 | Renew/release | Resolve an uncertain response with `task_get`. Renewal can extend again; release retry may report a stale claim. |
 
 A replayed claim snapshot can already be expired or superseded. It is a receipt, not
@@ -81,9 +81,11 @@ declare every memory value their result relies on. Completed dependency results 
 already immutable. Other reads, model outputs and external effects are outside this
 validation boundary.
 
-This provides one committed database result per task, not exactly-once execution of a
-worker or an external side effect. External systems need their own idempotency/fencing
-support. There is no external outbox in this milestone.
+Completion may include an optional `effects` array. Its immutable delivery intents commit
+with the result and history; receipt-budget or other failures roll everything back.
+The [transactional outbox](outbox.md) dispatches those intents with stable idempotency keys.
+Receivers must atomically deduplicate each key with its external effect. Completing a
+task commits its intents; it does not wait for delivery.
 
 ## REST and MCP
 
@@ -97,14 +99,15 @@ except the administrator recovery route, which requires `X-Admin-Key`.
 | `POST /v1/tasks/claim` | `queue`, `request_id`, optional `lease_ms` | `task_claim` |
 | `POST /v1/tasks/{id}/renew` | `fence`, optional `lease_ms` | `task_renew` |
 | `POST /v1/tasks/{id}/release` | `fence` | `task_release` |
-| `POST /v1/tasks/{id}/complete` | `fence`, `result` | `task_complete` |
+| `POST /v1/tasks/{id}/complete` | `fence`, `result`, optional `effects` | `task_complete` |
+| `GET /v1/tasks/{id}/outbox` | — | `task_outbox` |
 | `POST /v1/tasks/{id}/cancel` | `{}` | `task_cancel` |
 | `GET /v1/tasks/{id}/history?limit=50` | Limit 1–1,000, newest first | `task_history` |
 | `POST /v1/admin/tasks/{id}/recover` | `reason` | Administrator only; no MCP tool |
 
 MCP operations taking a task ID use the `id` argument. Enqueue, claim and complete return
 `{task, replayed}`; an empty claim has `task: null`. Other operations return the task,
-except history, which returns `{events}`. Every task includes producer input references,
+except history, which returns `{events}`, and outbox, which returns `{messages}`. Every task includes producer input references,
 owner, lease, fence, attempt count and per-task revision. History attributes transitions
 to the agent; administrative recovery records a null agent and the supplied reason.
 
@@ -181,6 +184,6 @@ transport outcomes after gateway/database reconnects.
 
 Per-agent HTTP rate/concurrency limits do not promise organization-wide fairness or
 multi-gateway admission fairness. Monitor queue delay and quiet-tenant latency under the
-failure workload. Retention, queue quotas, outbox delivery, backup/PITR acceptance and
+failure workload. Retention, queue quotas, backup/PITR acceptance and
 broader deployment compatibility still require operational work. A short 1,000-worker
 test is evidence for its measured conditions, not a production scale guarantee.

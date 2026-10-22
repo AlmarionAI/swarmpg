@@ -29,7 +29,10 @@ is enforcing this pooled principal even when an agent bypasses the gateway.
 - **Task coordination.** Org-shared queues, dependency-aware claims, expiring leases,
   monotonic fencing tokens and atomic completion against declared memory versions.
   Durable request receipts resolve retries; attributed history commits with transitions.
-- **REST and MCP.** Sixteen MCP tools expose queries, schema, memory, tasks and the event journal,
+- **Transactional outbox.** Task completion can atomically queue external tool effects.
+  A separate dispatcher uses renewable leases and stable idempotency keys through
+  crashes and retries. Receivers must deduplicate effects; see the [outbox contract](docs/outbox.md).
+- **REST and MCP.** Seventeen MCP tools expose queries, schema, memory, tasks, outbox status and the event journal,
   with structured errors for clients to handle.
 - **Journal and query audit.** The event journal is append-only and hash-chained per
   agent. SQL-query audit has a bounded retry spool and optional disk persistence; strict mode

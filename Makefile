@@ -45,10 +45,15 @@ test:
 	cd gateway && go vet ./... && go test ./...
 	cd loadtest && go vet ./... && go test ./...
 	cd coordination && go vet ./... && go test ./...
+	cd outbox && go vet ./... && go test ./...
+	python3 -m unittest discover -s scripts -p 'test_outbox_recovery.py'
 	cd bench && go vet ./...
 
 # Creates and crashes only its own disposable database and gateway.
 coordination-test:
 	scripts/coordination-e2e.sh
 
-.PHONY: pg-start pg-stop gateway loadtest e2e kernel kernel-check test coordination-test
+outbox-test:
+	scripts/outbox-e2e.sh
+
+.PHONY: pg-start pg-stop gateway loadtest e2e kernel kernel-check test coordination-test outbox-test

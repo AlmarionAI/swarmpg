@@ -12,3 +12,5 @@
 /loadtest/loadtest
 /.coord-test/
 /coordination/coordination
+/outbox/outbox
+/scripts/__pycache__/

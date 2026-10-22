@@ -76,8 +76,9 @@ inside PostgreSQL; it adds no kernel patch or alternative storage layer.
 4. **Atomic completion.** Result, completed state and history commit together. The
    current owner/fence and unexpired lease are checked before and after locking all
    declared producer-selected memory inputs and checking their versions. Identical
-   successful completion retries replay the result. No external outbox or exactly-once
-   external effect is promised.
+   successful completion retries replay the result and normalized effect set. Optional
+   external intents commit in the same transaction. The [outbox dispatcher](outbox.md)
+   retries them using stable keys; receivers must atomically deduplicate external effects.
 
 SQL, REST and MCP expose matching conflict, stale-claim, expired-lease and changed-input
 errors. The task creator can cancel; an administrator can requeue a nonterminal task

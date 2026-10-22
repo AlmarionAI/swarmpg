@@ -4,6 +4,8 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+workload=${COORD_WORKLOAD:-coordination}
+case "$workload" in coordination|outbox) ;; *) echo "unknown workload: $workload" >&2; exit 2 ;; esac
 export COORD_DB_MODE=${COORD_DB_MODE:-local}
 export COORD_RUN_DIR=${COORD_REPORT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/swarmpg-coordination.XXXXXX")}
 mkdir -p "$COORD_RUN_DIR"
@@ -116,7 +118,11 @@ print(h.hexdigest())
 PY
 )
 (cd "$root/gateway" && go build -o "$COORD_GATEWAY_BIN" .)
-(cd "$root/coordination" && go build -o "$COORD_RUN_DIR/coordination" .)
+if [ "$workload" = outbox ]; then
+  (cd "$root/outbox" && go build -o "$COORD_RUN_DIR/outbox-dispatcher" .)
+else
+  (cd "$root/coordination" && go build -o "$COORD_RUN_DIR/coordination" .)
+fi
 
 # This private controller only knows the services created above. The workload
 # passes a fixed operation name; it cannot choose a PID, container or cluster.
@@ -158,10 +164,14 @@ chmod +x "$COORD_RUN_DIR/control.sh"
 coord_gateway_owned=true
 "$COORD_RUN_DIR/control.sh" initial
 
-"$COORD_RUN_DIR/coordination" \
+if [ "$workload" = outbox ]; then
+  python3 "$root/scripts/outbox-recovery.py" | tee "$COORD_RUN_DIR/workload.log"
+else
+  "$COORD_RUN_DIR/coordination" \
   -gateway "http://127.0.0.1:$COORD_GATEWAY_PORT" -admin-key "$ADMIN_KEY" \
   -workers "${COORD_WORKERS:-100}" -duration "${COORD_DURATION:-30s}" \
   -in-flight "${COORD_IN_FLIGHT:-128}" -lease-ms "${COORD_LEASE_MS:-3000}" \
   -seed "${COORD_SEED:-20261022}" -fault-control "$COORD_RUN_DIR/control.sh" \
   -output "$COORD_RUN_DIR/report.json" | tee "$COORD_RUN_DIR/workload.log"
-echo "coordination evidence retained in $COORD_RUN_DIR"
+fi
+echo "$workload evidence retained in $COORD_RUN_DIR"

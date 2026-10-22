@@ -54,6 +54,8 @@ kernel at startup and logs which mode it runs in.
 | `POST /v1/events {kind,payload}` | agent | hash-chained append-only journal; honours `Idempotency-Key` |
 | `/v1/tasks` and `/v1/tasks/{id}/…` | agent | enqueue/get/history, claim, renew, release, complete and cancel; [task contract and route reference](tasks.md) |
 | `POST /v1/admin/tasks/{id}/recover {reason}` | admin | invalidate a nonterminal claim and requeue, with attributed recovery history |
+| `GET /v1/tasks/{id}/outbox` | agent | organization-scoped committed delivery intents and their current status |
+| `/v1/admin/outbox/…` | admin | claim/renew/ack/nack, inspect and retry external deliveries; [outbox contract and dispatcher](outbox.md) |
 | `POST /mcp` | agent | the same operations as MCP tools (see below) |
 | `GET /healthz` | none | liveness, request/error counters, pool sizes, `audit_lost`, `audit_retries` and `audit:{mode,queued,capacity,durable_spool}` |
 
@@ -133,7 +135,7 @@ server-sent events. `GET` and `DELETE` return 405.
 | `memory_history` `{key, limit}` | the key's versions, newest first | `GET /v1/memory/{key}/history` |
 | `memory_undo` `{key, to_version, expected_version}` | undo the latest change, or restore a version | `POST /v1/memory/{key}/undo` |
 | `events_append` `{kind, payload, idempotency_key}` | append to the journal; a repeated key replays | `POST /v1/events` |
-| `task_enqueue`, `task_get`, `task_claim`, `task_renew`, `task_release`, `task_complete`, `task_cancel`, `task_history` | database-enforced task coordination | [task API reference](tasks.md#rest-and-mcp) |
+| `task_enqueue`, `task_get`, `task_claim`, `task_renew`, `task_release`, `task_complete`, `task_cancel`, `task_history`, `task_outbox` | database-enforced task coordination and outbox status | [task API reference](tasks.md#rest-and-mcp) |
 
 - **Versions.** 2026-07-28 requests carry `io.modelcontextprotocol/protocolVersion` and
   `clientCapabilities` in `params._meta`, mirrored in the `MCP-Protocol-Version`,

@@ -369,7 +369,7 @@ func main() {
 	code, list := mcpRPC(A.Token, true, "tools/list", nil, nil)
 	listRes, _ := list["result"].(map[string]any)
 	tools, _ := listRes["tools"].([]any)
-	check("tools/list returns the 16 tools", code == 200 && len(tools) == 16, fmt.Sprintf("%d tools", len(tools)))
+	check("tools/list returns the 17 tools", code == 200 && len(tools) == 17, fmt.Sprintf("%d tools", len(tools)))
 	code, _ = mcpRPC("", true, "tools/list", nil, nil)
 	check("no token refused", code == 401, fmt.Sprint(code))
 	code, _ = mcpRPC("spg_not_a_real_token", true, "tools/list", nil, nil)
@@ -564,12 +564,39 @@ func main() {
 	staleCode, staleBody := call("POST", taskPath+"/complete", A.Token,
 		map[string]any{"fence": claim.Fence, "result": -1}, false)
 	finished := taskReceipt(call("POST", taskPath+"/complete", A.Token,
-		map[string]any{"fence": fresh.Fence, "result": 42}, false))
+		map[string]any{"fence": fresh.Fence, "result": 42, "effects": []any{map[string]any{
+			"key": "probe-effect", "destination": "isolation-probe", "payload": map[string]any{"value": 42},
+		}}}, false))
 	check("wrong task owner and released fence cannot complete",
 		wrongOwnerCode == 409 && errOf(decode(wrongOwnerBody))["code"] == "stale_claim" &&
 			staleCode == 409 && errOf(decode(staleBody))["code"] == "stale_claim" &&
 			fresh.ID == task.ID && fresh.Fence == "2" && finished.ID == task.ID && finished.Owner == A.ID && finished.State == "completed" && finished.Result == 42,
 		fmt.Sprintf("wrong owner HTTP%d code=%v; old fence HTTP%d code=%v; current fence=%s result=%d", wrongOwnerCode, errOf(decode(wrongOwnerBody))["code"], staleCode, errOf(decode(staleBody))["code"], fresh.Fence, finished.Result))
+
+	// Outbox delivery is an administrative capability. Ordinary agents may read
+	// their organization's committed intents, but cannot acknowledge external work.
+	fmt.Println("\n== outbox isolation probes ==")
+	probe("foreign org cannot read outbox rows", "zero", taskForeign.Token,
+		"SELECT * FROM swarmpg.outbox_messages WHERE task_id=$1::uuid", task.ID)
+	foreignOutboxCode, foreignOutboxBody := call("GET", taskPath+"/outbox", taskForeign.Token, nil, false)
+	foreignOutboxMCPError, foreignOutboxMCP, _ := tool(taskForeign.Token, "task_outbox", map[string]any{"id": task.ID})
+	check("foreign org cannot inspect outbox through REST/MCP",
+		foreignOutboxCode == 404 && errOf(decode(foreignOutboxBody))["code"] == "not_found" &&
+			foreignOutboxMCPError && errOf(foreignOutboxMCP)["code"] == "not_found",
+		fmt.Sprintf("REST HTTP%d MCP error=%v", foreignOutboxCode, foreignOutboxMCPError))
+	probe("raw outbox UPDATE cannot acknowledge delivery", "reject:42501", A.Token,
+		"UPDATE swarmpg.outbox_messages SET state='delivered' WHERE task_id=$1::uuid", task.ID)
+	probe("agent SQL cannot invoke outbox dispatcher", "reject:42501", A.Token,
+		"SELECT swarmpg.outbox_claim(swarmpg.current_org(),'isolation-probe',$1::uuid,$2::uuid,30000)", A.ID, B.ID)
+	adminOutboxCode, adminOutboxBody := call("POST", "/v1/admin/outbox/claim", A.Token,
+		map[string]any{"org_id": org, "destination": "isolation-probe", "worker_id": A.ID, "request_id": B.ID}, false)
+	check("agent bearer cannot call admin outbox API", adminOutboxCode == 401,
+		fmt.Sprintf("HTTP%d %s", adminOutboxCode, firstLine(string(adminOutboxBody))))
+	visibleOutboxCode, visibleOutboxBody := call("GET", taskPath+"/outbox", A.Token, nil, false)
+	visibleMessages, _ := decode(visibleOutboxBody)["messages"].([]any)
+	check("completion commits one immutable pending outbox intent", visibleOutboxCode == 200 && len(visibleMessages) == 1 &&
+		visibleMessages[0].(map[string]any)["state"] == "pending" && visibleMessages[0].(map[string]any)["key"] == "probe-effect",
+		fmt.Sprintf("HTTP%d messages=%d", visibleOutboxCode, len(visibleMessages)))
 
 	// ---- kernel probes: raw SQL as agent_runtime with the gateway bypassed
 	// entirely, then budget probes through the gateway. Only the SwarmPG

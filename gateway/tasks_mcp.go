@@ -54,10 +54,15 @@ var taskMCPTools = []mcpTool{
 	}, toolTaskRelease},
 	{mcpToolDef{
 		Name: "task_complete", Title: "Complete a task atomically",
-		Description: "Store a result and complete the task atomically only while you own its unexpired current fence and every declared memory input remains readable at the declared version. An identical result retry under the successful owner/fence returns the completed receipt, even after its lease expires; changed results conflict. This fences PostgreSQL state, not external effects. Returns {task,replayed}.",
+		Description: "Store a result, complete the task and optionally enqueue outbox effects atomically only while you own its unexpired current fence and every declared memory input remains readable at the declared version. Identical result/effects retries under the successful owner/fence return the completed receipt, even after its lease expires; changed content conflicts. Outbox delivery uses stable idempotency keys; the receiver must deduplicate external effects. Returns {task,replayed}.",
 		InputSchema: object(map[string]any{
 			"id": taskIDSchema("Task ID."), "fence": taskFenceSchema(),
 			"result": map[string]any{"description": "Complete task result, any JSON value, at most 64 KiB."},
+			"effects": map[string]any{"type": "array", "maxItems": 32, "description": "Optional outbox intents, at most 256 KiB in total; omitted means no effects. Keys must be unique within this task.", "items": object(map[string]any{
+				"key":         outboxNameSchema("Stable effect key within this task."),
+				"destination": outboxNameSchema("Operator-configured destination name; never a URL."),
+				"payload":     map[string]any{"description": "Intent payload, any JSON value including null, at most 64 KiB."},
+			}, "key", "destination", "payload")},
 		}, "id", "fence", "result"),
 		Annotations: annotations("Complete a task atomically", false, false, true),
 	}, toolTaskComplete},
@@ -76,6 +81,16 @@ var taskMCPTools = []mcpTool{
 		}, "id"),
 		Annotations: annotations("Read task history", true, false, true),
 	}, toolTaskHistory},
+	{mcpToolDef{
+		Name: "task_outbox", Title: "Read task outbox",
+		Description: "Read a task's durable outbox intents and current delivery states. Returns {messages}; only tasks in your organization are visible. Delivery transitions require an admin dispatcher.",
+		InputSchema: object(map[string]any{"id": taskIDSchema("Task ID.")}, "id"),
+		Annotations: annotations("Read task outbox", true, false, true),
+	}, toolTaskOutbox},
+}
+
+func outboxNameSchema(description string) map[string]any {
+	return map[string]any{"type": "string", "pattern": outboxNamePattern, "minLength": 1, "maxLength": 128, "description": description}
 }
 
 func taskStringSchema(description string, max int) map[string]any {
@@ -179,4 +194,14 @@ func toolTaskHistory(g *Gateway, ctx context.Context, a *Agent, args json.RawMes
 		return toolError(err)
 	}
 	return taskToolResult(g.taskHistory(ctx, a, in.ID, in.Limit))
+}
+
+func toolTaskOutbox(g *Gateway, ctx context.Context, a *Agent, args json.RawMessage) map[string]any {
+	var in struct {
+		ID string `json:"id"`
+	}
+	if err := decodeTaskArgs(args, &in); err != nil {
+		return toolError(err)
+	}
+	return taskToolResult(g.taskOutbox(ctx, a, in.ID))
 }
