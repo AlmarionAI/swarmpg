@@ -28,6 +28,7 @@ client from choosing an identity. This is the advantage to preserve and measure.
 | Memory | Per-key versions, compare-and-set, history, time reads and undo; producer identity, explicit producer selection and shared listing |
 | Records | Hash-chained per-agent journal; SQL-query audit with bounded retry spooling and a strict durable-intent mode |
 | Tasks | Org-shared queues, immutable dependencies/input snapshots, atomic claims, leases, fencing, completion replay and attributed history |
+| Recovery | Opt-in primary identity/timeline pins, synchronous barriers and generation-based PITR quarantine; external fencing and effect reconciliation remain required |
 | Validation | Go tests, stock/kernel e2e probes, upstream kernel regressions and a reproducible collaborative failure workload |
 
 Memory history is logical history for this schema, not PostgreSQL storage-level time
@@ -135,6 +136,27 @@ Count successful completed work, correctness failures, retry amplification and r
 time alongside requests/sec. Do not claim a million-agent system from a count of
 registered identities or idle connections.
 
+## Failover and point-in-time recovery
+
+**Implemented as an opt-in schema/gateway contract.** The [recovery guide](recovery.md)
+defines pinned PostgreSQL identity/timeline, synchronous acknowledgement barriers and an
+externally allocated recovery generation. Existing deployments without recovery activation
+retain legacy behavior. Primary selection and fencing belong to the operator or existing
+HA manager; SwarmPG does not introduce an election protocol.
+
+Eligible synchronous failover must preserve acknowledged results and effect intents.
+PITR is a separate contract: it intentionally rewinds history, invalidates unfinished
+ownership into a new generation and quarantines runtime/dispatch until retained messages
+have explicit dispositions and the operator attests reconciliation of effects missing
+from restored history. Stable receiver keys cannot deduplicate a recreated intent whose
+original key disappeared in the rewind.
+
+The owned-cluster recovery workload covers primary failure, replication partitions,
+promotion and archive-based PITR while driving task/lease/effect traffic. Retain the
+recorded workload duration, recovery time, replication settings and independent receiver
+ledger when interpreting results. This adds bounded fault evidence, not a production HA
+service or a statement about hundreds of thousands of active agents.
+
 ## Work after the coordination proof
 
 **Planned; not implemented.** Design shared workspaces around explicit membership and
@@ -143,9 +165,10 @@ conflict handling, retention and deletion before adding more shared-write APIs. 
 private agent memory and shared workspace state distinct.
 
 Operational readiness is also required: schema migration and rollback procedures,
-backup/restore and PITR tests, deployment authentication/TLS, token rotation, audit-volume
+production backup/restore drills, deployment authentication/TLS, token rotation, audit-volume
 operations, retention/purge, capacity tuning for shared admission, longer fairness soaks and
-distributed failover acceptance. The development Compose setup is not a production deployment recipe.
+deployment-specific HA/fencing acceptance. The recovery guide supplies a reference
+procedure and owned-cluster fault tests; the development Compose setup is not a production deployment recipe.
 Extension compatibility and supported PostgreSQL versions need explicit test matrices.
 
 ## Deferred research

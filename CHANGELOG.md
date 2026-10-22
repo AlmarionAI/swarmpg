@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add opt-in synchronous recovery with externally pinned cluster identity, timeline
+  and recovery generation. Guard coordination, admission and outbox transactions;
+  treat interrupted replication commits as unknown and fence stale history. PITR
+  revokes agent credentials and quarantines work until explicit outbox and external
+  effect reconciliation. Add owned primary/standby, partition, failover and physical
+  PITR acceptance workloads on stock PostgreSQL and the signed kernel.
+
 - Add PostgreSQL-authoritative organization rate, burst and concurrency policies shared
   across gateways, bounded local organization round-robin queues, and reserved capacity
   for typed task renew/release/complete. Admission fails closed on quota errors; expiring

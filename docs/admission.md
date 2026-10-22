@@ -144,7 +144,8 @@ remains reserved until expiry; restarting does not reclaim it early. Expired per
 longer count against concurrency. A bounded background sweep runs every five seconds,
 and acquisitions also perform bounded cleanup; both retain expired rows for another
 120 seconds. These lifetime bounds assume a healthy database clock and functioning
-statement timeouts; clock jumps and database failover need separate acceptance.
+statement timeouts. The separate [recovery contract](recovery.md) covers opt-in
+synchronous failover and PITR quarantine; clock jumps still need separate acceptance.
 
 The internal SQL acquire function can replay an identical live request without extending
 its lease or consuming another token. Changed parameters or an expired retained UUID are
@@ -184,6 +185,9 @@ a single gateway's health counts are not fleet totals.
 then verifies the required admission tables and function signatures in the catalog. It
 rejects an older schema with missing objects. It does not execute a grant or verify every
 function body, permission, column definition or runtime dependency.
+When recovery pins are configured, readiness also commits the
+[recovery durability barrier](recovery.md#gateway-configuration); a live database socket
+alone cannot make a quarantined or unreplicated gateway ready.
 Monitor 503s, retained uncertain permits and release failures alongside queue delay and
 completed-task latency. A
 quota outage fails closed even if cached authentication and ordinary queries could work.
@@ -193,8 +197,10 @@ Agents cannot change policies, mint permits or release another gateway's reserva
 The trusted gateway and schema owner remain inside the security boundary. Direct SQL
 sessions bypass HTTP admission even on the kernel; a signed principal does not constitute
 an organization permit. Keep raw access restricted or supply a separately enforced
-connection/resource policy. This feature adds no guarantee for PostgreSQL failover,
-clock jumps, CPU/IO fairness, backup/PITR, storage quotas or arbitrary external effects.
+connection/resource policy. Admission alone adds no guarantee for PostgreSQL failover
+or backup/PITR; use the opt-in [recovery contract](recovery.md), including its external
+primary fencing and reconciliation requirements. Clock jumps, CPU/IO fairness, storage
+quotas and arbitrary external effects remain outside admission's guarantees.
 
 ## Reproducible validation
 

@@ -166,3 +166,5 @@ runner does not test global weighted scheduling, distributed PostgreSQL failover
 jumps, unbounded offered concurrency, production datasets or long-term storage growth.
 It does not replace the full stock/kernel suites, upstream PostgreSQL regressions, the
 [task failure workload](../coordination/README.md) or [outbox recovery tests](../outbox/README.md).
+The separate [recovery workload](../docs/recovery.md#reproducible-validation) covers
+synchronous replication partitions, eligible primary failover and PITR quarantine.

@@ -386,7 +386,7 @@ func (g *Gateway) taskRoutes(mux *http.ServeMux) {
 			return
 		}
 		var out json.RawMessage
-		if err := g.admin.QueryRow(r.Context(), `SELECT swarmpg.task_recover($1::uuid, $2)`, r.PathValue("id"), in.Reason).Scan(&out); err != nil {
+		if err := g.adminRow(r.Context(), `SELECT swarmpg.task_recover($1::uuid, $2)`, []any{r.PathValue("id"), in.Reason}, &out); err != nil {
 			writeErr(w, classifyPg(err))
 			return
 		}

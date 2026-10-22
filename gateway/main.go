@@ -62,6 +62,7 @@ type Gateway struct {
 	quota     *pgxpool.Pool
 	authGate  chan struct{}
 	admission *admissionController
+	recovery  *recoveryConfig
 
 	mcpOrigins     map[string]bool // Origins allowed to call /mcp; requests without one are allowed
 	mcpIngressOnce sync.Once
@@ -379,6 +380,10 @@ func classifyPg(err error) *apiError {
 			status, code = 409, "inputs_changed"
 		case "PT413":
 			status, code = 413, "result_limit_exceeded"
+		case "SR503":
+			status, code, retryable = 503, "recovery_unavailable", true
+		case "SR409":
+			status, code = 409, "recovery_conflict"
 		}
 		return &apiError{Status: status, Code: code, Message: pg.Message,
 			Detail: pg.Detail, Hint: pg.Hint, Position: int(pg.Position), Retryable: retryable, Extra: extra}
@@ -484,6 +489,9 @@ func (g *Gateway) withConn(ctx context.Context, a *Agent, fn func(ctx context.Co
 			stmtTimeout = int(remaining)
 		}
 	}
+	if g.recovery != nil {
+		seal += "SET LOCAL synchronous_commit = remote_apply; "
+	}
 	setup := seal + fmt.Sprintf(
 		"SET LOCAL app.agent_id = '%s'; SET LOCAL app.org_id = '%s'; "+
 			"SET LOCAL statement_timeout = %d; SET LOCAL idle_in_transaction_session_timeout = 2000; "+
@@ -494,11 +502,15 @@ func (g *Gateway) withConn(ctx context.Context, a *Agent, fn func(ctx context.Co
 		poisoned = true
 		return err
 	}
+	if err := g.recovery.check(ctx, tx); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
 	if err := fn(ctx, tx); err != nil {
 		_ = tx.Rollback(ctx)
 		return err
 	}
-	return tx.Commit(ctx)
+	return g.recovery.commit(ctx, tx)
 }
 
 // kernelSetup seals the agent's principal (agent and org in one value, signed
@@ -1259,7 +1271,7 @@ func (g *Gateway) routes() http.Handler {
 	g.admissionRoutes(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
-			"ok": true, "admission": g.admissionStatus(), "requests": g.stats.requests.Load(), "rejected": g.stats.rejected.Load(),
+			"ok": true, "recovery": g.recovery, "admission": g.admissionStatus(), "requests": g.stats.requests.Load(), "rejected": g.stats.rejected.Load(),
 			"errors": g.stats.errors.Load(), "rate_limited": g.stats.limited.Load(), "audit_lost": g.stats.auditLost.Load(),
 			"audit_retries": g.stats.auditRetries.Load(), "audit": g.auditStatus(),
 			"runtime_pool": g.runtime.Stat().TotalConns(), "admin_pool": g.admin.Stat().TotalConns(),
@@ -1273,7 +1285,7 @@ func (g *Gateway) routes() http.Handler {
 			return
 		}
 		var id string
-		if err := g.admin.QueryRow(r.Context(), `INSERT INTO swarmpg.orgs(name) VALUES($1) RETURNING id::text`, in.Name).Scan(&id); err != nil {
+		if err := g.adminRow(r.Context(), `INSERT INTO swarmpg.orgs(name) VALUES($1) RETURNING id::text`, []any{in.Name}, &id); err != nil {
 			writeErr(w, classifyPg(err))
 			return
 		}
@@ -1311,10 +1323,10 @@ func (g *Gateway) routes() http.Handler {
 		}
 		tok := newToken()
 		var id string
-		err := g.admin.QueryRow(r.Context(), `
+		err := g.adminRow(r.Context(), `
 			INSERT INTO swarmpg.agents(org_id, name, token_hash, rps_limit, max_rows, max_result_bytes, max_concurrency, max_cost, statement_timeout_ms, read_only, token_expires_at)
 			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id::text`,
-			in.OrgID, in.Name, hashToken(tok), in.RPS, in.MaxRows, in.MaxResultBytes, in.MaxConcurrency, in.MaxCost, in.StatementTimeoutMS, in.ReadOnly, expires).Scan(&id)
+			[]any{in.OrgID, in.Name, hashToken(tok), in.RPS, in.MaxRows, in.MaxResultBytes, in.MaxConcurrency, in.MaxCost, in.StatementTimeoutMS, in.ReadOnly, expires}, &id)
 		if err != nil {
 			writeErr(w, classifyPg(err))
 			return
@@ -1323,7 +1335,7 @@ func (g *Gateway) routes() http.Handler {
 	}))
 
 	mux.HandleFunc("POST /v1/agents/{id}/disable", g.withAdmin(func(w http.ResponseWriter, r *http.Request) {
-		_, err := g.admin.Exec(r.Context(), `UPDATE swarmpg.agents SET disabled = true WHERE id = $1`, r.PathValue("id"))
+		err := g.adminExec(r.Context(), `UPDATE swarmpg.agents SET disabled = true WHERE id = $1`, r.PathValue("id"))
 		if err != nil {
 			writeErr(w, classifyPg(err))
 			return
@@ -1528,11 +1540,12 @@ func (g *Gateway) readCeilings(ctx context.Context) error {
 	return err
 }
 
-func mustPool(ctx context.Context, url string, max int32, reset bool) *pgxpool.Pool {
+func mustPool(ctx context.Context, url string, max int32, reset bool, recovery *recoveryConfig) *pgxpool.Pool {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		log.Fatal(err)
 	}
+	recovery.configurePool(cfg)
 	cfg.MaxConns = max
 	cfg.MinConns = max / 4
 	cfg.MaxConnIdleTime = 5 * time.Minute
@@ -1568,29 +1581,37 @@ func main() {
 	adminURL := env("DATABASE_URL", "postgres://127.0.0.1:5499/swarmpg?sslmode=disable")
 	runtimeURL := env("RUNTIME_DATABASE_URL", "")
 	if runtimeURL == "" {
-		c, err := pgx.ParseConfig(adminURL)
+		var err error
+		runtimeURL, err = runtimeDatabaseURL(adminURL)
 		if err != nil {
 			log.Fatal(err)
 		}
-		runtimeURL = fmt.Sprintf("postgres://agent_runtime@%s:%d/%s?sslmode=%s", c.Host, c.Port, c.Database, sslmode(adminURL))
+	}
+	recovery, err := recoveryConfigFromEnv()
+	if err != nil {
+		log.Fatal(err)
 	}
 	adminKey := env("ADMIN_KEY", "dev-admin-key")
 	if adminKey == "dev-admin-key" {
 		log.Printf("WARNING: using the default admin key; set ADMIN_KEY in any non-local deployment")
 	}
 	g := &Gateway{
-		admin:    mustPool(ctx, adminURL, 4, false),
-		runtime:  mustPool(ctx, runtimeURL, 32, true),
+		admin:    mustPool(ctx, adminURL, 4, false, recovery),
+		runtime:  mustPool(ctx, runtimeURL, 32, true, recovery),
 		adminKey: adminKey,
+		recovery: recovery,
+	}
+	if err := g.validateRecoveryStartup(ctx); err != nil {
+		log.Fatalf("configure recovery: %v", err)
 	}
 	cfg, err := admissionConfigFromEnv()
 	if err != nil {
 		log.Fatal(err)
 	}
-	g.auth = mustPool(ctx, adminURL, 4, false)
-	g.quota = mustPool(ctx, adminURL, 4, false)
+	g.auth = mustPool(ctx, adminURL, 4, false, recovery)
+	g.quota = mustPool(ctx, adminURL, 4, false, recovery)
 	g.authGate = make(chan struct{}, 1024)
-	g.admission, err = newAdmissionController(&postgresAdmissionStore{pool: g.quota, gate: make(chan struct{}, 64)}, cfg)
+	g.admission, err = newAdmissionController(&postgresAdmissionStore{pool: g.quota, gate: make(chan struct{}, 64), recovery: recovery}, cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
