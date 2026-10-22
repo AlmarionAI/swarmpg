@@ -35,6 +35,10 @@ files also remain for diagnosis. Docker containers are removed.
 - Workers pause beyond their lease, abandon claims and retry uncertain completion
   acknowledgements. Separate deterministic probes exercise renewal, reclaim,
   stale fencing, changed inputs, identical completion replay and conflicting results.
+- Healthy workers renew every third of a lease while reading inputs and calculating;
+  deliberate pause faults never renew. Idle workers use seeded jitter with an
+  exponential backoff capped at two seconds, so empty durable claim receipts do not
+  crowd out completion requests. Reports include empty claims and renewal outcomes.
 - The gateway receives SIGKILL and restarts; the database is crash-restarted while
   workers are active. Each fault must interrupt requests and be followed by a
   successful completion. Transient failures are retried within bounded fault windows;
@@ -81,10 +85,10 @@ All four 30-second production runs passed, including gateway/database crash reco
 
 | Engine | Workers participating | Workers completing tasks | Verified tasks | Reclaimed tasks |
 |---|---:|---:|---:|---:|
-| Stock PostgreSQL 17 | 100 | 100 | 1,744 | 60 |
-| Stock PostgreSQL 17 | 1,000 | 949 | 4,880 | 168 |
-| Signed SwarmPG kernel | 100 | 100 | 1,728 | 59 |
-| Signed SwarmPG kernel | 1,000 | 968 | 5,840 | 201 |
+| Stock PostgreSQL 17 | 100 | 98 | 1,760 | 60 |
+| Stock PostgreSQL 17 | 1,000 | 967 | 6,880 | 237 |
+| Signed SwarmPG kernel | 100 | 98 | 1,728 | 59 |
+| Signed SwarmPG kernel | 1,000 | 953 | 6,480 | 223 |
 
 Every run recorded zero lost results, duplicate completions, stale overwrites,
 attribution failures and dependency failures. See the [measurement summaries](results/2026-10-22.json)

@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -132,6 +133,10 @@ type report struct {
 	RequestRetries           int64             `json:"request_retries"`
 	RetryAmplification       float64           `json:"retry_amplification"`
 	ClaimAttempts            int64             `json:"claim_attempts"`
+	EmptyClaims              int64             `json:"empty_claims"`
+	LeaseRenewalAttempts     int64             `json:"lease_renewal_attempts"`
+	LeaseRenewals            int64             `json:"lease_renewals"`
+	LeaseRenewalDenials      int64             `json:"lease_renewal_denials"`
 	CompletionAttempts       int64             `json:"completion_attempts"`
 	CompletionReplays        int64             `json:"completion_replays"`
 	DiscardedAcknowledgments int64             `json:"discarded_acknowledgments"`
@@ -599,6 +604,8 @@ func (r *run) observedCompletion(a agent, claimed *task, completed *task) {
 }
 
 func (r *run) worker(ctx context.Context, a agent, index int) {
+	random := rand.New(rand.NewSource(r.cfg.Seed ^ int64(index)<<32))
+	emptyPolls := 0
 	for ctx.Err() == nil {
 		c, err := r.claim(ctx, a, "work", r.cfg.LeaseMS)
 		if err != nil {
@@ -611,81 +618,148 @@ func (r *run) worker(ctx context.Context, a agent, index int) {
 			continue
 		}
 		if c.Task == nil {
-			if !sleep(ctx, time.Duration(400+index%100)*time.Millisecond) {
-				return
-			}
-			continue
-		}
-		t := c.Task
-		v, err := r.calculate(ctx, a, t)
-		if err != nil {
-			if ctx.Err() == nil {
-				r.fail(err)
-			}
-			continue
-		}
-		// These worker goroutines stop all work/heartbeats past the lease and
-		// resume with the old fence. Other workers must reclaim their tasks.
-		paused := t.Payload.Ordinal%29 == 0 && t.Attempts == 1
-		if paused {
+			emptyPolls++
 			r.mu.Lock()
-			r.report.PausedWorkers++
+			r.report.EmptyClaims++
 			r.mu.Unlock()
-			r.note("worker_paused", t, a, "No requests or heartbeat from this worker during pause")
-			if !sleep(ctx, time.Duration(r.cfg.LeaseMS+250)*time.Millisecond) {
+			if !sleep(ctx, emptyPollDelay(emptyPolls, random)) {
 				return
 			}
-		} else if !sleep(ctx, time.Duration(20+t.Payload.Ordinal%60)*time.Millisecond) {
+			continue
+		}
+		emptyPolls = 0
+		r.processTask(ctx, a, c.Task)
+	}
+}
+
+// Empty claims are durable idempotency receipts, not free reads. Back off each
+// idle worker independently so poll traffic leaves capacity for useful work.
+func emptyPollDelay(streak int, random *rand.Rand) time.Duration {
+	ceiling := min(2000, 200<<min(max(streak-1, 0), 4))
+	return time.Duration(100+random.Intn(ceiling-99)) * time.Millisecond
+}
+
+// Healthy workers renew during dependency reads and computation. The returned
+// stop joins the heartbeat before completion, preventing renew/complete races.
+// Deliberately paused workers never start a heartbeat.
+func (r *run) maintainLease(parent context.Context, a agent, t *task) (context.Context, func() bool) {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	var lost atomic.Bool
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			r.mu.Lock()
+			r.report.LeaseRenewalAttempts++
+			r.mu.Unlock()
+			out, err := r.call(ctx, a, "POST", "/v1/tasks/"+t.ID+"/renew", map[string]any{"fence": t.Fence, "lease_ms": r.cfg.LeaseMS}, false, true)
+			if ctx.Err() != nil {
+				return
+			}
+			if err == nil && out.Status == 409 && (out.Code == "stale_claim" || out.Code == "lease_expired") {
+				r.mu.Lock()
+				r.report.LeaseRenewalDenials++
+				r.mu.Unlock()
+				r.note("lease_renewal_rejected", t, a, out.Code)
+			} else {
+				renewed, decodeErr := decodeOK[task](out, err)
+				if decodeErr == nil && renewed.Fence == t.Fence && renewed.Owner == a.ID && renewed.State == "claimed" {
+					r.mu.Lock()
+					r.report.LeaseRenewals++
+					r.mu.Unlock()
+					if !sleep(ctx, time.Duration(r.cfg.LeaseMS)*time.Millisecond/3) {
+						return
+					}
+					continue
+				}
+				r.fail(fmt.Errorf("lease renewal failed for %s: %v HTTP%d %.1000s", t.ID, decodeErr, out.Status, out.Body))
+			}
+			lost.Store(true)
+			cancel()
 			return
 		}
-		// Lose selected committed acknowledgments at the client boundary. Do
-		// not interpret the first result; retry the identical completion.
-		if t.Payload.Ordinal%17 == 0 && t.Attempts == 1 {
-			_, discardedErr := r.call(ctx, a, "POST", "/v1/tasks/"+t.ID+"/complete", map[string]any{"fence": t.Fence, "result": v}, false, true)
-			if discardedErr != nil && ctx.Err() == nil {
-				r.fail(discardedErr)
-			}
-			r.mu.Lock()
-			r.report.DiscardedAcknowledgments++
-			r.report.CompletionAttempts++
-			r.mu.Unlock()
-			r.note("completion_acknowledgment_discarded", t, a, "Client deliberately discarded the response before deciding the execution outcome")
-		}
-		completed, out, err := r.complete(ctx, a, t, v)
-		if err != nil {
-			if ctx.Err() == nil {
-				r.fail(err)
-			}
-			continue
-		}
-		if out.Status == 409 && (out.Code == "stale_claim" || out.Code == "lease_expired") {
-			r.mu.Lock()
-			r.report.StaleDenials++
-			r.mu.Unlock()
-			r.note("late_completion_rejected", t, a, out.Code)
-			continue
-		}
-		if paused && out.Status == 200 {
-			r.mu.Lock()
-			r.report.StaleOverwrites++
-			r.mu.Unlock()
-			r.fail(fmt.Errorf("paused worker completed task %s after its lease expired", t.ID))
-			continue
-		}
-		if out.Status != 200 || completed.Task == nil || completed.Task.State != "completed" {
-			r.fail(fmt.Errorf("worker completion HTTP %d: %.1000s", out.Status, out.Body))
-			continue
-		}
-		if t.Payload.Ordinal%11 == 0 {
-			replayed, out, err := r.complete(ctx, a, t, v)
-			if err != nil || out.Status != 200 || !replayed.Replayed {
-				r.fail(fmt.Errorf("duplicate completion did not replay: %v HTTP%d %.1000s", err, out.Status, out.Body))
-			}
-		}
-		// The drain may cancel workers immediately after the last observed
-		// completion. Finish its replay assertion before marking it observed.
-		r.observedCompletion(a, t, completed.Task)
+	}()
+	return ctx, func() bool { cancel(); <-done; return lost.Load() }
+}
+
+func (r *run) processTask(ctx context.Context, a agent, t *task) {
+	paused := t.Payload.Ordinal%29 == 0 && t.Attempts == 1
+	taskCtx := ctx
+	stopLease := func() bool { return false }
+	if !paused {
+		taskCtx, stopLease = r.maintainLease(ctx, a, t)
+		defer stopLease()
 	}
+	v, err := r.calculate(taskCtx, a, t)
+	if err != nil {
+		if taskCtx.Err() == nil {
+			r.fail(err)
+		}
+		return
+	}
+	// These worker goroutines stop all work/heartbeats past the lease and
+	// resume with the old fence. Other workers must reclaim their tasks.
+	if paused {
+		r.mu.Lock()
+		r.report.PausedWorkers++
+		r.mu.Unlock()
+		r.note("worker_paused", t, a, "No requests or heartbeat from this worker during pause")
+		if !sleep(ctx, time.Duration(r.cfg.LeaseMS+250)*time.Millisecond) {
+			return
+		}
+	} else if !sleep(taskCtx, time.Duration(20+t.Payload.Ordinal%60)*time.Millisecond) {
+		return
+	}
+	if stopLease() {
+		return
+	}
+	// Lose selected committed acknowledgments at the client boundary. Do
+	// not interpret the first result; retry the identical completion.
+	if t.Payload.Ordinal%17 == 0 && t.Attempts == 1 {
+		_, discardedErr := r.call(ctx, a, "POST", "/v1/tasks/"+t.ID+"/complete", map[string]any{"fence": t.Fence, "result": v}, false, true)
+		if discardedErr != nil && ctx.Err() == nil {
+			r.fail(discardedErr)
+		}
+		r.mu.Lock()
+		r.report.DiscardedAcknowledgments++
+		r.report.CompletionAttempts++
+		r.mu.Unlock()
+		r.note("completion_acknowledgment_discarded", t, a, "Client deliberately discarded the response before deciding the execution outcome")
+	}
+	completed, out, err := r.complete(ctx, a, t, v)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.fail(err)
+		}
+		return
+	}
+	if out.Status == 409 && (out.Code == "stale_claim" || out.Code == "lease_expired") {
+		r.mu.Lock()
+		r.report.StaleDenials++
+		r.mu.Unlock()
+		r.note("late_completion_rejected", t, a, out.Code)
+		return
+	}
+	if paused && out.Status == 200 {
+		r.mu.Lock()
+		r.report.StaleOverwrites++
+		r.mu.Unlock()
+		r.fail(fmt.Errorf("paused worker completed task %s after its lease expired", t.ID))
+		return
+	}
+	if out.Status != 200 || completed.Task == nil || completed.Task.State != "completed" {
+		r.fail(fmt.Errorf("worker completion HTTP %d: %.1000s", out.Status, out.Body))
+		return
+	}
+	if t.Payload.Ordinal%11 == 0 {
+		replayed, out, err := r.complete(ctx, a, t, v)
+		if err != nil || out.Status != 200 || !replayed.Replayed {
+			r.fail(fmt.Errorf("duplicate completion did not replay: %v HTTP%d %.1000s", err, out.Status, out.Body))
+		}
+	}
+	// The drain may cancel workers immediately after the last observed
+	// completion. Finish its replay assertion before marking it observed.
+	r.observedCompletion(a, t, completed.Task)
 }
 
 func (r *run) produceWave(ctx context.Context, wave int) error {
@@ -1066,8 +1140,8 @@ func main() {
 	r := &run{cfg: cfg, sem: make(chan struct{}, cfg.InFlight), workerIDs: map[string]int{}, completed: map[string]bool{}, participants: map[string]bool{}, completers: map[string]bool{},
 		client: &http.Client{Transport: &http.Transport{MaxIdleConns: cfg.InFlight * 2, MaxIdleConnsPerHost: cfg.InFlight, MaxConnsPerHost: cfg.InFlight}, Timeout: 10 * time.Second},
 		report: report{Seed: cfg.Seed, SourceCommit: os.Getenv("COORD_SOURCE_COMMIT"), SourceTreeSHA256: os.Getenv("COORD_SOURCE_TREE_SHA256"),
-			Environment:  map[string]string{"go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH, "postgres": os.Getenv("COORD_DB_VERSION"), "kernel": os.Getenv("KERNEL"), "audit_mode": "best-effort", "database_mode": os.Getenv("COORD_DB_MODE")},
-			Settings:     map[string]any{"workers": cfg.Workers, "in_flight": cfg.InFlight, "lease_ms": cfg.LeaseMS, "duration": cfg.Duration.String(), "runtime_pool": 32, "quiet_worker_share": 0.8, "noisy_query_rps_limit": 5, "noisy_query_concurrency_limit": 2, "external_effects": false},
+			Environment:  map[string]string{"go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH, "cpu_count": strconv.Itoa(runtime.NumCPU()), "gomaxprocs": strconv.Itoa(runtime.GOMAXPROCS(0)), "postgres": os.Getenv("COORD_DB_VERSION"), "kernel": os.Getenv("KERNEL"), "audit_mode": "best-effort", "database_mode": os.Getenv("COORD_DB_MODE")},
+			Settings:     map[string]any{"workers": cfg.Workers, "in_flight": cfg.InFlight, "lease_ms": cfg.LeaseMS, "duration": cfg.Duration.String(), "runtime_pool": 32, "empty_poll_backoff_cap_ms": 2000, "lease_renew_interval_ms": cfg.LeaseMS / 3, "quiet_worker_share": 0.8, "noisy_query_rps_limit": 5, "noisy_query_concurrency_limit": 2, "external_effects": false},
 			HTTPOutcomes: map[string]int64{}, Events: []event{}, Errors: []string{}},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Duration+time.Duration(cfg.LeaseMS)*time.Millisecond+3*time.Minute)

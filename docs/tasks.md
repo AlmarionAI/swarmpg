@@ -40,6 +40,9 @@ Lease duration is 100–300,000 milliseconds, default 30,000. Expiration uses da
 `clock_timestamp()`, including a check after completion acquires its input locks.
 Workers never hold transactions open during model/tool execution. Renew before expiry;
 renewal cannot revive an expired lease and never shortens the existing expiry.
+Use periodic renewal while healthy work or database reads are in flight. Back off with
+jitter when a queue is empty: every new claim request creates a durable receipt, so
+tight polling across many idle workers can consume capacity needed for useful work.
 
 Every new claim advances a per-task signed 64-bit fence. Cancellation and administrative
 recovery advance it too. REST/MCP encode fences as **decimal strings**: preserve them as
