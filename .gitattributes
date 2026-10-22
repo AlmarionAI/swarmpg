@@ -1,0 +1,3 @@
+# Unified patches contain context prefixes and exact regression output spacing.
+# Preserve those bytes; check formatting in the applied PostgreSQL source tree.
+kernel/patches/*.patch -whitespace

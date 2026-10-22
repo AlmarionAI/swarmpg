@@ -2,8 +2,9 @@
 
 The gateway sits between agents and Postgres. It authenticates each agent's token, applies
 its limits, runs its request as one transaction on a pooled connection under the agent's
-identity, cleans the connection, and records what ran. It serves a REST API and an MCP
-endpoint, and works on stock Postgres 14+ or the SwarmPG kernel. For a walkthrough, start
+identity, cleans the connection, and submits SQL-query audit receipts under the configured
+delivery mode. It serves REST and MCP, targeting stock Postgres 14+ or the SwarmPG kernel
+(stock CI uses Postgres 17). For a walkthrough, start
 with [getting-started.md](getting-started.md).
 
 ## Run it
@@ -28,6 +29,9 @@ deployment.
 | `ADDR` | `:8080` | Listen address. Plain HTTP: terminate TLS in front |
 | `PRINCIPAL_SECRET` | none | Kernel only: signs each sealed principal; must equal the server's `agent_principal_secret` |
 | `MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call `/mcp`; requests with any other `Origin` get 403 |
+| `AUDIT_MODE` | `best-effort` | `best-effort` drops new receipts when the bounded spool is full; `strict` refuses SQL-query admission unless an intent can be durably reserved |
+| `AUDIT_SPOOL_CAPACITY` | `10000` | Maximum outstanding receipts for new admission, including active requests and retries; must be positive; a recovered backlog is never discarded to meet a smaller limit |
+| `AUDIT_SPOOL_DIR` | none | Optional persistent spool directory in best-effort mode; required on persistent storage in strict mode. One gateway process owns each directory |
 
 The runtime pool holds 32 connections and the admin pool 4. The gateway detects the
 kernel at startup and logs which mode it runs in.
@@ -42,18 +46,74 @@ kernel at startup and logs which mode it runs in.
 | `POST /v1/query {sql,params}` | agent | one statement, parameterised, row- and byte-capped, timed out |
 | `GET /v1/schema` | agent | compact schema text written for an LLM |
 | `PUT /v1/memory/{key} {value,shared,expected_version}` | agent | write an own key; returns its new `version`. `expected_version` makes it compare-and-set (`0` = must not exist); a stale one is `409 version_conflict` with `current_version` |
-| `GET /v1/memory/{key}[?version=N\|?as_of=RFC3339]` | agent | read a key with its `version` (live reads fall back to an org-shared key, `own: false`); `version`/`as_of` read the agent's own key as it was |
+| `GET /v1/memory/{key}[?from=UUID\|?version=N\|?as_of=RFC3339]` | agent | read a live key or own historical version; response includes `agent_id`, `changed_at`, `version`, `shared` and `own`. `from` selects a visible live producer |
+| `GET /v1/memory/{key}/shared` | agent | return `{key,memories:[]}` containing every visible org-shared live producer, ordered by version descending then agent ID ascending; no partial list |
 | `DELETE /v1/memory/{key}[?expected_version=N]` | agent | delete an own key; it stays in history |
 | `GET /v1/memory/{key}/history[?limit=N]` | agent | the key's versions, newest first, including deletes |
 | `POST /v1/memory/{key}/undo {to_version,expected_version}` | agent | restore the state before the latest change, or `to_version`, as a new version |
 | `POST /v1/events {kind,payload}` | agent | hash-chained append-only journal; honours `Idempotency-Key` |
 | `POST /mcp` | agent | the same operations as MCP tools (see below) |
-| `GET /healthz` | none | liveness, request and error counters, pool sizes |
+| `GET /healthz` | none | liveness, request/error counters, pool sizes, `audit_lost`, `audit_retries` and `audit:{mode,queued,capacity,durable_spool}` |
 
 `POST /v1/events` honours an `Idempotency-Key` header: a retry after a timeout replays the
-stored response instead of appending twice. Memory writes get the same safety from
-`expected_version`. Query errors carry the SQLSTATE `code`, `detail`, `hint`,
+stored response instead of appending twice. Memory `expected_version` detects a stale or
+repeated write with a conflict; it does not replay the original response. Query errors carry the SQLSTATE `code`, `detail`, `hint`,
 `position` and a `retryable` flag so an agent's control loop can decide retry vs repair.
+
+## Shared memory reads
+
+With no selector, a live read prefers your own key. If it is absent, the fallback is an
+org-shared producer ordered by `version DESC, agent_id ASC`. Versions belong to individual
+producers: that ordering is deterministic, not a claim about which producer is most
+correct or most recent across the organization. Use `from=<agent UUID>` when provenance
+matters, or list `/shared` and choose explicitly.
+
+`from` can select your own live key, or a peer's shared key in your org. An invisible or
+missing producer/key returns `404 not_found`. A shared listing includes your own key only
+if it is shared; no matches returns `memories: []`. If the complete listing cannot fit the
+row or byte result budget, it returns `413 result_limit_exceeded` instead of silently
+omitting producers. Select a producer or raise the result budget.
+
+Historical reads (`version` or `as_of`) remain owner-only. Do not combine them with each
+other, `from`, or shared listing. REST shared listing rejects all selectors; MCP
+`list_shared: true` rejects `from`, `version` and `as_of`. Invalid combinations return
+`400 bad_request`. A peer's shared live value never exposes its private history.
+
+## Audit delivery
+
+Audit covers authenticated SQL-query calls through `POST /v1/query` and the MCP `query`
+tool, including statements rejected by the guard. It does **not** cover typed memory or
+event API/tool writes, raw SQL sent directly to PostgreSQL, or requests rejected before
+query admission. Using strict audit does not extend this scope.
+
+- **Best effort (default).** Admission does not wait for audit-database availability or
+  free spool space. When the spool is full or cannot accept a receipt, the query proceeds
+  and `audit_lost` increments. Without `AUDIT_SPOOL_DIR`, queued receipts live only in
+  memory and are lost on process failure. A directory enables disk persistence but does
+  not change the drop-on-admission-failure policy; disk sync adds request latency.
+- **Strict.** Startup requires `AUDIT_SPOOL_DIR`. Place it on persistent storage and keep
+  it available across process restarts. Before SQL execution, the gateway reserves a
+  receipt and fsyncs its intent. If it cannot do that, REST returns `503 audit_unavailable`
+  and the statement has not executed; MCP reports the same code as a tool error. It does
+  not wait indefinitely for a queue slot. Completion is persisted and fsynced afterwards.
+- **Retries and bounds.** The spool capacity includes active queries and outstanding
+  retry receipts. Failed database batches stay queued. Delivery uses exponential backoff
+  starting from a 50 ms interval, capped at 5 s; `audit_retries` counts failed delivery or
+  cleanup attempts. Stable receipt UUIDs deduplicate retries if a batch committed but its
+  acknowledgement was lost. Receipts are removed after database acknowledgement.
+- **Crash semantics.** SQL commit and audit completion are separate writes. A crash after
+  SQL commit but before completion persistence can leave `audit_outcome_unknown`. An
+  unknown outcome does not mean rollback, and must not trigger a blind replay of a write.
+  If completion persistence fails, the durable intent remains and the completed receipt
+  is retained in memory for retry. Strict mode is not transactional exactly-once auditing
+  or exactly-once SQL execution; loss of the spool volume can still lose pending records.
+
+Receipts contain identity, a statement hash and the first 200 characters, parameter count,
+rows/bytes/affected rows, duration and error status (error text capped at 1,000 characters).
+They do not contain parameter values or full query results. Statement samples can still
+contain literals; secure the spool and audit table accordingly. Monitor `queued` relative
+to `capacity`, `audit_lost`, `audit_retries`, and durable-volume health. `durable_spool`
+reports that a disk directory is configured; it is not a replication or backup guarantee.
 
 ## MCP endpoint
 
@@ -65,7 +125,7 @@ server-sent events. `GET` and `DELETE` return 405.
 |---|---|---|
 | `schema` | describes the agent's tables and the SQL rules | `GET /v1/schema` |
 | `query` `{sql, params}` | one parameterised statement, budget-capped | `POST /v1/query` |
-| `memory_get` `{key, version, as_of}` | own key, else an org-shared key of that name; or an own key as it was | `GET /v1/memory/{key}` |
+| `memory_get` `{key, from, list_shared, version, as_of}` | read a visible live producer, list all shared producers, or read own history; selectors are mutually exclusive | `GET /v1/memory/{key}` or `/shared` |
 | `memory_put` `{key, value, shared, expected_version}` | write an own key, optionally compare-and-set | `PUT /v1/memory/{key}` |
 | `memory_delete` `{key, expected_version}` | delete an own key | `DELETE /v1/memory/{key}` |
 | `memory_history` `{key, limit}` | the key's versions, newest first | `GET /v1/memory/{key}/history` |
@@ -92,7 +152,8 @@ server-sent events. `GET` and `DELETE` return 405.
 ## What the database enforces
 
 Every agent query runs as one shared low-privilege role, `agent_runtime`. `sql/schema.sql`
-makes these hold whatever SQL an agent sends:
+enforces the following after a trustworthy principal has been established. On stock
+Postgres, that identity depends on requests staying behind the gateway:
 
 - **Isolation.** Agent data lives in shared tables (`memory`, `memory_history`,
   `documents`, `events`) with forced row-level security keyed on the agent's identity.
@@ -107,16 +168,15 @@ makes these hold whatever SQL an agent sends:
   the compare-and-set, history and undo functions run with the agent's own rights.
 - **A tamper-evident journal.** `events` is append-only and hash-chained per agent; each
   hash binds the agent, sequence and canonical payload, so an auditor can recompute it.
-- **A server-side audit log.** `audit` records every SQL statement the gateway ran or
-  refused for an agent: a hash and the first 200 characters of the statement, rows, bytes,
-  duration and SQLSTATE. Agents can neither read nor write it.
+- **An operator-only audit table.** Agents can neither read nor write audit records or
+  call either audit insertion helper. Receipt delivery follows the audit contract above.
 
 On top of that the gateway applies each agent's rate, concurrency, row, byte and time
 limits; a statement guard that refuses `SET`, transaction control, DDL, `COPY`, cursors and
 multiple statements after stripping comments and normalising whitespace; and a reset of
 every connection after every request (`CLOSE ALL; RESET ALL; DISCARD TEMP; DISCARD
-SEQUENCES`). Audit records and last-seen times are written in batches in the background,
-so they never queue in front of agent requests.
+SEQUENCES`). Audit delivery and last-seen updates run in background batches. Audit
+admission follows the selected policy; strict disk persistence adds synchronous work.
 
 The probes that check all of this, and what is not covered, are in
 [THREAT-MODEL.md](THREAT-MODEL.md).
@@ -133,7 +193,16 @@ detects the kernel at startup, and in every transaction:
   `PRINCIPAL_SECRET` is set (it must equal the server's `agent_principal_secret`);
 - lowers `agent_max_rows` to the agent's `max_rows + 1` and `agent_max_cost` to its `max_cost`.
 
-An agent that reached Postgres directly still could not change or forge its identity, read
-another agent's or org's rows, run an unsealed query, or raise a budget; the kernel probes in
-`make e2e KERNEL=1` check exactly that. On the kernel, `max_rows` also bounds the rows one
-statement may modify: a larger write fails with SQLSTATE 53400 and nothing is applied.
+With a principal secret configured, an agent reaching Postgres directly cannot forge a
+principal without the secret, change a sealed identity, or raise the role's row/cost
+ceilings. Private rows remain protected by RLS. An unsealed query is refused. Raw SQL still
+has the session-setting and capability gaps listed in the threat model.
+
+The kernel's `agent_max_rows` counts cumulative attempted ModifyTable rows across nested
+functions, data-modifying CTEs and triggers for one statement. Internal bookkeeping counts:
+a memory put/delete/undo normally writes memory plus history; an event append also updates
+the event head. A refused statement raises `53400` (HTTP 400) and rolls back its writes.
+Returned-row limiting is separate. The gateway retains its `max_rows + 1` kernel ceiling to
+detect result truncation, so the kernel write ceiling also has that one-row headroom;
+`max_rows` is not an exact count of user-visible changed records. Non-atomic raw `CALL`
+transactions are a separate boundary; the gateway refuses `CALL`.

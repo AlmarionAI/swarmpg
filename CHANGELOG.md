@@ -1,12 +1,30 @@
 # Changelog
 
-## 0.1.0 (2026-10-20)
+## Unreleased
 
-The first public release: Postgres for agent fleets, as a gateway and agent schema that run
+- Share one attempted-write budget across nested execution, including function calls,
+  data-modifying CTEs and trigger bookkeeping; retain atomic rollback for a refused statement.
+- Add bounded audit spooling, retained retry batches, stable receipt IDs and optional disk
+  persistence. Default `best-effort` mode drops new receipts when full and reports
+  `audit_lost`. `strict` mode requires a durable spool and rejects SQL queries before
+  execution when an intent cannot be reserved. A crash can leave an explicitly unknown
+  outcome; audit and SQL commit are not one transaction.
+- Add producer identity and timestamps to memory reads, explicit `from` selection, and a
+  complete shared-producer listing over REST and MCP. History remains owner-only.
+- Tighten negative probes to require their intended application code/SQLSTATE and HTTP
+  status. Unexpected HTTP 5xx, transport failures and failed load requests fail the run.
+  Add aggregate, CTE and nested-function write-budget probes and rollback checks.
+- Focus the next milestone on task claims, leases, fencing and atomic completion, then a
+  collaborative failure workload. Workspaces follow that proof; storage, catalog and
+  process-model rewrites are deferred. None of those planned primitives is claimed built.
+
+## 0.1.0 development baseline (2026-10-20)
+
+The initial implementation: Postgres for agent fleets, as a gateway and agent schema that run
 on stock Postgres 14+, and a PostgreSQL 19 kernel patch series that enforces agent identity
 and budgets in core.
 
-### Added
+### Added at this baseline
 
 - **Gateway** (`gateway/`): agent tokens, per-agent rate, concurrency, row, byte, cost and
   time limits, a statement guard, a clean connection for every request, and errors that
@@ -18,8 +36,8 @@ and budgets in core.
   - Forced row-level security on every agent table, and no DDL.
   - Fleet-wide levers revoked: backend signalling, advisory locks, large objects,
     `set_config`, `pg_notify`, `pg_stat_activity` and the statistics functions.
-  - A hash-chained, append-only event journal, and a server-side audit log of every SQL
-    statement an agent sends, refused ones included.
+  - A hash-chained, append-only event journal and asynchronous SQL-query audit.
+    The initial audit writer was best effort and could lose records.
 - **Versioned memory:**
   - Every write is versioned by trigger into a read-only history.
   - Compare-and-set writes with `expected_version`.
@@ -29,18 +47,18 @@ and budgets in core.
   - `[principal]`: agent and org sealed together as one value, optionally HMAC-signed,
     with a fail-closed gate that refuses queries until an identity is sealed.
   - `[budget]`: tighten-only budgets, a pre-execution cost gate, and per-statement row caps.
-- **Verification:**
+- **Verification reported for this baseline (not current-revision acceptance):**
   - 65 attack probes on stock Postgres and 83 on the kernel, in CI.
   - The upstream regression suite plus two new tests (241/241).
   - Interop tested with the official TypeScript and Python MCP SDKs.
-  - Every command in the README and guides runs in CI.
+  - Runnable documentation blocks are exercised in CI; server-start commands are skipped.
 - **Benchmark** (`bench/`): a reproducible Docker comparison with PgBouncer + row-level
   security at 10,000 agents.
 - **Docs:** getting started, the gateway reference, the threat model, and the design with
-  what v0.1 ships against the long-term plan.
+  implemented behavior against the longer-term plan.
 
 ### Known limits
 
 See the residual risks in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md#residual-risks).
-The storage rebuild in [docs/DESIGN.md](docs/DESIGN.md) is not built yet; this includes
-branching, storage-level time travel and per-agent spaces.
+Storage branching, storage-level time travel and per-agent spaces remain unbuilt and
+deferred. [docs/DESIGN.md](docs/DESIGN.md) defines the smaller coordination milestone.

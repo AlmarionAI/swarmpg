@@ -36,6 +36,11 @@ var (
 // load phase leaves it off, so rate limiting there is counted, not hidden.
 var retry429 atomic.Bool
 
+// A transport failure or server error must fail the run even when a caller is
+// checking a negative response, or ignores a setup response. Both REST and MCP
+// pass through doWithRetry, so neither can accidentally hide one.
+var httpFailures atomic.Int64
+
 var client = &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 1000, MaxConnsPerHost: 0}, Timeout: 30 * time.Second}
 
 func call(method, path, token string, body any, admin bool) (int, []byte) {
@@ -73,11 +78,54 @@ func doWithRetry(req *http.Request) (*http.Response, error) {
 			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode >= http.StatusInternalServerError {
+			httpFailures.Add(1)
+		}
 		if err != nil || resp.StatusCode != http.StatusTooManyRequests || !retry429.Load() || attempt == 3 {
 			return resp, err
 		}
 		resp.Body.Close()
 		time.Sleep(time.Second)
+	}
+}
+
+func runFailed(loadFailures int64, probeFailures int) bool {
+	return loadFailures > 0 || probeFailures > 0 || httpFailures.Load() > 0
+}
+
+// assessQueryProbe requires the intended denial, rather than accepting an
+// unrelated error as evidence that an isolation or budget control worked.
+func assessQueryProbe(want string, status int, body []byte) (bool, string) {
+	var r struct {
+		RowCount *int           `json:"row_count"`
+		Error    map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return false, fmt.Sprintf("HTTP %d: invalid response: %s", status, body)
+	}
+	if expectedCode, reject := strings.CutPrefix(want, "reject:"); reject {
+		expectedStatus := http.StatusBadRequest
+		switch expectedCode {
+		case "42501", "forbidden":
+			expectedStatus = http.StatusForbidden
+		case "not_found":
+			expectedStatus = http.StatusNotFound
+		case "version_conflict":
+			expectedStatus = http.StatusConflict
+		}
+		return expectedCode != "" && status == expectedStatus && r.Error["code"] == expectedCode,
+			fmt.Sprintf("HTTP %d code=%v (want HTTP %d code=%s)", status, r.Error["code"], expectedStatus, expectedCode)
+	}
+	if status != http.StatusOK || r.Error != nil || r.RowCount == nil {
+		return false, fmt.Sprintf("HTTP %d: expected a successful query result: %s", status, body)
+	}
+	switch want {
+	case "zero":
+		return *r.RowCount == 0, fmt.Sprintf("rows=%d", *r.RowCount)
+	case "allow":
+		return true, fmt.Sprintf("ok rows=%d", *r.RowCount)
+	default:
+		return false, fmt.Sprintf("invalid probe expectation %q", want)
 	}
 }
 
@@ -240,42 +288,11 @@ func main() {
 	mustOK(call("PUT", "/v1/memory/secret", B.Token, map[string]any{"value": map[string]any{"pw": "B-private"}}, false))
 
 	var probePass, probeFail int
-	// want: "reject" means the probe MUST be refused (error or 0 rows);
-	//       "allow"  means it MUST succeed. isExfil marks reads that must return 0 rows.
+	// Rejections name an exact application code or SQLSTATE; positive probes
+	// require a valid HTTP 200 query response and, for "zero", no visible rows.
 	probe := func(name, want string, token, sql string, params ...any) {
 		code, body := call("POST", "/v1/query", token, map[string]any{"sql": sql, "params": params}, false)
-		var r struct {
-			RowCount int            `json:"row_count"`
-			Rows     [][]any        `json:"rows"`
-			Error    map[string]any `json:"error"`
-		}
-		_ = json.Unmarshal(body, &r)
-		rejected := r.Error != nil || code >= 400
-		var ok bool
-		var res string
-		wantCode := ""
-		if code, found := strings.CutPrefix(want, "reject:"); found {
-			want, wantCode = "reject", code
-		}
-		switch want {
-		case "reject":
-			ok = rejected && (wantCode == "" || r.Error["code"] == wantCode)
-			if rejected {
-				res = fmt.Sprintf("rejected (%v)", r.Error["code"])
-			} else {
-				res = fmt.Sprintf("LEAKED rows=%d", r.RowCount)
-			}
-		case "zero": // read that must return 0 rows (RLS isolation)
-			ok = !rejected && r.RowCount == 0
-			res = fmt.Sprintf("rows=%d", r.RowCount)
-		case "allow":
-			ok = !rejected
-			if rejected {
-				res = fmt.Sprintf("WRONGLY REJECTED (%v)", r.Error["code"])
-			} else {
-				res = fmt.Sprintf("ok rows=%d", r.RowCount)
-			}
-		}
+		ok, res := assessQueryProbe(want, code, body)
 		mark := "PASS"
 		if ok {
 			probePass++
@@ -286,45 +303,47 @@ func main() {
 		fmt.Printf("  [%s] %-50s -> %s\n", mark, name, res)
 	}
 	// Identity cannot be spoofed by any SQL route.
-	probe("spoof identity via SET", "reject", A.Token, fmt.Sprintf("SET app.agent_id = '%s'", B.ID))
-	probe("spoof identity via set_config()", "reject", A.Token, "SELECT set_config('app.agent_id', $1, true)", B.ID)
-	probe("escalate via SET ROLE", "reject", A.Token, "SET ROLE postgres")
-	probe("escalate via RESET ROLE", "reject", A.Token, "RESET ROLE")
-	probe("anonymous code via DO", "reject", A.Token, "DO $$ BEGIN PERFORM 1; END $$")
-	probe("multi-statement smuggling", "reject", A.Token, "SELECT 1; SET app.agent_id = 'x'")
-	probe("obfuscated SET (nested comment)", "reject", A.Token, "/* /* */ */ SET app.agent_id = 'x'")
-	probe("obfuscated SET (tab)", "reject", A.Token, "SET\tapp.agent_id = 'x'")
+	probe("spoof identity via SET", "reject:bad_request", A.Token, fmt.Sprintf("SET app.agent_id = '%s'", B.ID))
+	probe("spoof identity via set_config()", "reject:42501", A.Token, "SELECT set_config('app.agent_id', $1, true)", B.ID)
+	probe("escalate via SET ROLE", "reject:bad_request", A.Token, "SET ROLE postgres")
+	probe("escalate via RESET ROLE", "reject:bad_request", A.Token, "RESET ROLE")
+	probe("anonymous code via DO", "reject:bad_request", A.Token, "DO $$ BEGIN PERFORM 1; END $$")
+	probe("multi-statement smuggling", "reject:42601", A.Token, "SELECT 1; SET app.agent_id = 'x'")
+	probe("obfuscated SET (nested comment)", "reject:bad_request", A.Token, "/* /* */ */ SET app.agent_id = 'x'")
+	probe("obfuscated SET (tab)", "reject:bad_request", A.Token, "SET\tapp.agent_id = 'x'")
 	// Cross-agent data isolation (RLS).
 	probe("read peer memory by id", "zero", A.Token, "SELECT * FROM swarmpg.memory WHERE agent_id = $1", B.ID)
 	probe("read all non-self memory", "zero", A.Token, "SELECT * FROM swarmpg.memory WHERE agent_id <> swarmpg.current_agent()")
 	// No object creation / DDL, so nothing can be owned and leaked across the pool.
-	probe("create scratch table (DDL)", "reject", A.Token, "CREATE TABLE scratch.notes(id int)")
-	probe("CREATE TABLE AS to exfil own rows", "reject", A.Token, "CREATE TABLE public.leak AS SELECT * FROM swarmpg.memory")
-	probe("create function to hide SET", "reject", A.Token, "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'")
-	probe("create temp table (pool leak)", "reject", A.Token, "CREATE TEMP TABLE t(x int)")
-	probe("declare WITH HOLD cursor (pool leak)", "reject", A.Token, "DECLARE c CURSOR WITH HOLD FOR SELECT 1")
+	probe("create scratch table (DDL)", "reject:bad_request", A.Token, "CREATE TABLE scratch.notes(id int)")
+	probe("CREATE TABLE AS to exfil own rows", "reject:bad_request", A.Token, "CREATE TABLE public.leak AS SELECT * FROM swarmpg.memory")
+	probe("create function to hide SET", "reject:bad_request", A.Token, "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'")
+	probe("create temp table (pool leak)", "reject:bad_request", A.Token, "CREATE TEMP TABLE t(x int)")
+	probe("declare WITH HOLD cursor (pool leak)", "reject:bad_request", A.Token, "DECLARE c CURSOR WITH HOLD FOR SELECT 1")
 	// No fleet-wide denial of service through the shared role.
-	probe("terminate peer backends", "reject", A.Token, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = current_user")
-	probe("cancel peer backends", "reject", A.Token, "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE usename = current_user")
-	probe("read peer SQL text (pg_stat_activity)", "reject", A.Token, "SELECT query FROM pg_stat_activity WHERE usename = current_user")
-	probe("read peer SQL text (backend function)", "reject", A.Token, "SELECT pg_stat_get_backend_activity(s) FROM pg_stat_get_backend_idset() s")
-	probe("session advisory lock", "reject", A.Token, "SELECT pg_advisory_lock(1)")
-	probe("signal other agents (pg_notify)", "reject", A.Token, "SELECT pg_notify('fleet', 'hello')")
+	probe("terminate peer backends", "reject:42501", A.Token, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = current_user")
+	probe("cancel peer backends", "reject:42501", A.Token, "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE usename = current_user")
+	probe("read peer SQL text (pg_stat_activity)", "reject:42501", A.Token, "SELECT query FROM pg_stat_activity WHERE usename = current_user")
+	probe("read peer SQL text (backend function)", "reject:42501", A.Token, "SELECT pg_stat_get_backend_activity(s) FROM pg_stat_get_backend_idset() s")
+	probe("session advisory lock", "reject:42501", A.Token, "SELECT pg_advisory_lock(1)")
+	probe("signal other agents (pg_notify)", "reject:42501", A.Token, "SELECT pg_notify('fleet', 'hello')")
 	// No fleet-wide metadata: counts and statistics describe every agent's rows.
 	if *pgURL != "" { // statistics exist only once the tables are analysed
 		psqlOut(*pgURL, "ANALYZE swarmpg.memory, swarmpg.memory_history, swarmpg.events, swarmpg.documents")
 	}
 	probe("read planner statistics of agent tables (pg_stats)", "zero", A.Token, "SELECT * FROM pg_stats WHERE schemaname = 'swarmpg'")
-	probe("read fleet-wide row counters (pg_stat_user_tables)", "reject", A.Token, "SELECT relname, n_live_tup FROM pg_stat_user_tables")
-	probe("read the fleet-wide event sequence", "reject", A.Token, "SELECT last_value FROM swarmpg.events_id_seq")
-	probe("large object spam", "reject", A.Token, "SELECT lo_create(0)")
+	probe("read fleet-wide row counters (pg_stat_user_tables)", "reject:42501", A.Token, "SELECT relname, n_live_tup FROM pg_stat_user_tables")
+	probe("read the fleet-wide event sequence", "reject:42501", A.Token, "SELECT last_value FROM swarmpg.events_id_seq")
+	probe("large object spam", "reject:42501", A.Token, "SELECT lo_create(0)")
 	// Control-plane confidentiality and log integrity.
-	probe("read agent registry (token hashes)", "reject", A.Token, "SELECT token_hash FROM swarmpg.agents")
-	probe("read server audit log", "reject", A.Token, "SELECT * FROM swarmpg.audit")
-	probe("forge an audit record for another agent", "reject", A.Token,
+	probe("read agent registry (token hashes)", "reject:42501", A.Token, "SELECT token_hash FROM swarmpg.agents")
+	probe("read server audit log", "reject:42501", A.Token, "SELECT * FROM swarmpg.audit")
+	probe("forge an audit record for another agent", "reject:42501", A.Token,
 		"SELECT swarmpg.record_audit($1, NULL, 'forged', 0, 0, 0, 0, 0, NULL, NULL)", B.ID)
-	probe("tamper with event log (DELETE)", "reject", A.Token, "DELETE FROM swarmpg.events")
-	probe("truncate event log", "reject", A.Token, "TRUNCATE swarmpg.events")
+	probe("forge a deduplicated audit receipt", "reject:42501", A.Token,
+		"SELECT swarmpg.record_audit_receipt(gen_random_uuid(), $1, NULL, clock_timestamp(), repeat('0', 64), 'forged', 0, 0, 0, 0, 0, NULL, NULL)", B.ID)
+	probe("tamper with event log (DELETE)", "reject:42501", A.Token, "DELETE FROM swarmpg.events")
+	probe("truncate event log", "reject:bad_request", A.Token, "TRUNCATE swarmpg.events")
 	// Legitimate operations still work.
 	probe("read own memory", "allow", A.Token, "SELECT count(*) FROM swarmpg.memory")
 	probe("write own document", "allow", A.Token, "INSERT INTO swarmpg.documents(agent_id,org_id,collection,body) VALUES(swarmpg.current_agent(),swarmpg.current_org(),'c',jsonb_build_object('ok',true))")
@@ -384,7 +403,7 @@ func main() {
 	check("query cannot read a peer's rows", !isErr && sc["row_count"] == float64(0), fmt.Sprintf("rows=%v", sc["row_count"]))
 	isErr, sc, _ = tool(A.Token, "query", map[string]any{"sql": fmt.Sprintf("SET app.agent_id = '%s'", B.ID)})
 	errBody, _ = sc["error"].(map[string]any)
-	check("query cannot change identity", isErr, fmt.Sprintf("isError (%v)", errBody["code"]))
+	check("query cannot change identity", isErr && errBody["code"] == "bad_request", fmt.Sprintf("isError (%v)", errBody["code"]))
 	key := fmt.Sprintf("mcp-%d", time.Now().UnixNano())
 	_, first, _ := tool(A.Token, "events_append", map[string]any{"kind": "mcp_probe", "idempotency_key": key})
 	_, again, _ := tool(A.Token, "events_append", map[string]any{"kind": "mcp_probe", "idempotency_key": key})
@@ -476,9 +495,9 @@ func main() {
 	probe("raw UPDATE cannot set a version", "allow", A.Token, "UPDATE swarmpg.memory SET version = 1 WHERE key = $1", k)
 	_, now = get(A.Token, "")
 	check("... the version still moves forward", now["version"] == float64(6), fmt.Sprintf("v%v", now["version"]))
-	probe("rewrite history (UPDATE)", "reject", A.Token, "UPDATE swarmpg.memory_history SET value = '{}'::jsonb")
-	probe("erase history (DELETE)", "reject", A.Token, "DELETE FROM swarmpg.memory_history")
-	probe("forge history (INSERT)", "reject", A.Token, "INSERT INTO swarmpg.memory_history(agent_id, org_id, key, version) VALUES ($1, $2, 'x', 1)", A.ID, org.ID)
+	probe("rewrite history (UPDATE)", "reject:42501", A.Token, "UPDATE swarmpg.memory_history SET value = '{}'::jsonb")
+	probe("erase history (DELETE)", "reject:42501", A.Token, "DELETE FROM swarmpg.memory_history")
+	probe("forge history (INSERT)", "reject:42501", A.Token, "INSERT INTO swarmpg.memory_history(agent_id, org_id, key, version) VALUES ($1, $2, 'x', 1)", A.ID, org.ID)
 	code, _ = call("GET", mem+"/history", B.Token, nil, false)
 	check("a peer cannot read your key's history", code == 404, fmt.Sprint(code))
 	probe("a peer cannot read your history rows", "zero", B.Token, "SELECT * FROM swarmpg.memory_history WHERE agent_id = $1", A.ID)
@@ -517,8 +536,9 @@ func main() {
 			switch want {
 			case "zero":
 				ok = err == nil && out == "0"
-			default: // the error message the kernel must raise
-				ok = err != nil && strings.Contains(out, want)
+			default: // Both SQLSTATE and message must identify the intended gate.
+				state, message, specified := strings.Cut(want, ":")
+				ok = specified && err != nil && strings.Contains(out, "ERROR:  "+state+":") && strings.Contains(out, message)
 			}
 			mark := "PASS"
 			if ok {
@@ -529,13 +549,13 @@ func main() {
 			}
 			fmt.Printf("  [%s] %-50s -> %s\n", mark, name, firstLine(out))
 		}
-		kprobe("unsealed query refused", "no agent principal established",
+		kprobe("unsealed query refused", "42501:no agent principal established",
 			"SELECT count(*) FROM swarmpg.memory")
-		kprobe("half-set principal refused (org missing)", "invalid agent principal",
+		kprobe("half-set principal refused (org missing)", "22023:invalid agent principal",
 			"BEGIN", fmt.Sprintf("SET LOCAL agent_principal = 'agent=%s'", A.ID), "COMMIT")
-		kprobe("re-seal to another agent refused", "is sealed",
+		kprobe("re-seal to another agent refused", "42501:is sealed",
 			"BEGIN", seal(A.ID), seal(B.ID), "COMMIT")
-		kprobe("RESET of a sealed principal refused", "is sealed",
+		kprobe("RESET of a sealed principal refused", "42501:is sealed",
 			"BEGIN", seal(A.ID), "RESET agent_principal", "COMMIT")
 		kprobe("SET app.agent_id cannot read peer rows", "zero",
 			"BEGIN", seal(A.ID), fmt.Sprintf("SET LOCAL app.agent_id = '%s'", B.ID),
@@ -544,18 +564,18 @@ func main() {
 			"BEGIN", seal(A.ID), fmt.Sprintf("SET LOCAL app.org_id = '%s'", org2),
 			fmt.Sprintf("SELECT count(*) FROM swarmpg.memory WHERE org_id = '%s'", org2), "COMMIT")
 		if *principalSecret != "" {
-			kprobe("forge an unsigned principal", "not signed",
+			kprobe("forge an unsigned principal", "42501:not signed",
 				"BEGIN", fmt.Sprintf("SET LOCAL agent_principal = 'agent=%s,org=%s'", B.ID, org.ID), "COMMIT")
-			kprobe("forge a principal with a bad signature", "invalid agent principal signature",
+			kprobe("forge a principal with a bad signature", "42501:invalid agent principal signature",
 				"BEGIN", fmt.Sprintf("SET LOCAL agent_principal = 'agent=%s,org=%s,sig=%s'", B.ID, org.ID, strings.Repeat("0", 64)), "COMMIT")
 		} else {
 			fmt.Println("  [SKIP] forged principals: PRINCIPAL_SECRET is not set, so principals are unsigned")
 		}
-		kprobe("raise the row budget refused", "can only be lowered",
+		kprobe("raise the row budget refused", "42501:can only be lowered",
 			"BEGIN", seal(A.ID), "SET LOCAL agent_max_rows = 0", "COMMIT")
-		kprobe("raise the cost budget refused", "can only be lowered",
+		kprobe("raise the cost budget refused", "42501:can only be lowered",
 			"BEGIN", seal(A.ID), "SET LOCAL agent_max_cost = 0", "COMMIT")
-		kprobe("change the role's budget defaults refused", "permission denied",
+		kprobe("change the role's budget defaults refused", "42501:permission denied",
 			"ALTER ROLE agent_runtime SET agent_max_rows = 0")
 
 		fmt.Println("\n== kernel budget probes (through the gateway: max_rows=5, max_cost=1000) ==")
@@ -569,6 +589,64 @@ func main() {
 		probe("EXPLAIN ANALYZE cannot dodge the cost budget", "reject:53400", C.Token, "EXPLAIN ANALYZE "+runaway)
 		probe("query_to_xml cannot dodge the cost budget", "reject:53400", C.Token, "SELECT query_to_xml($1, false, false, '')", runaway)
 		probe("EXPLAIN still shows the estimate", "allow", C.Token, "EXPLAIN "+runaway)
+
+		// A single returned row can hide many writes through SPI. Use a generous
+		// cost budget here so only the cumulative write-row budget can refuse
+		// these statements. Internal memory-history writes consume that budget
+		// too; an ordinary put still fits comfortably below this cap.
+		N := createAgentWith(org.ID, "nested-budget", map[string]any{"max_rows": 20, "max_cost": 1e9})
+		probe("one memory write fits the nested-write budget", "allow", N.Token,
+			"SELECT swarmpg.memory_put('nested-control', '{\"ok\":true}'::jsonb)")
+		probe("aggregate cannot hide repeated memory writes", "reject:53400", N.Token,
+			"SELECT sum(swarmpg.memory_put('nested-aggregate-' || i::text, '{}'::jsonb)) FROM generate_series(1, 30) i")
+		probe("refused aggregate left no memory rows", "zero", N.Token,
+			"SELECT 1 FROM swarmpg.memory WHERE key LIKE 'nested-aggregate-%'")
+		probe("refused aggregate left no history rows", "zero", N.Token,
+			"SELECT 1 FROM swarmpg.memory_history WHERE key LIKE 'nested-aggregate-%'")
+		probe("data-modifying CTE cannot hide repeated function writes", "reject:53400", N.Token,
+			`WITH made AS (
+				INSERT INTO swarmpg.documents(agent_id, org_id, collection, body)
+				SELECT swarmpg.current_agent(), swarmpg.current_org(), 'nested-cte',
+				       jsonb_build_object('versions', sum(swarmpg.memory_put('nested-cte-' || i::text, '{}'::jsonb)))
+				FROM generate_series(1, 30) i RETURNING 1
+			) SELECT count(*) FROM made`)
+		probe("refused CTE left no documents", "zero", N.Token,
+			"SELECT 1 FROM swarmpg.documents WHERE collection = 'nested-cte'")
+		probe("refused CTE left no memory rows", "zero", N.Token,
+			"SELECT 1 FROM swarmpg.memory WHERE key LIKE 'nested-cte-%'")
+		probe("refused CTE left no history rows", "zero", N.Token,
+			"SELECT 1 FROM swarmpg.memory_history WHERE key LIKE 'nested-cte-%'")
+
+		// Install a temporary SECURITY INVOKER helper as the test operator. Agents
+		// still cannot create functions or acquire the operator's privileges. A
+		// unique name avoids replacing application objects; remove it afterwards.
+		helper := fmt.Sprintf("swarmpg.loadtest_nested_write_%d", time.Now().UnixNano())
+		out, setupErr := psqlAs(*pgURL, "BEGIN", fmt.Sprintf(`
+			CREATE FUNCTION %s(p_prefix text, p_count integer) RETURNS integer
+			LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, swarmpg AS $$
+			BEGIN
+				FOR i IN 1..p_count LOOP
+					PERFORM swarmpg.memory_put(p_prefix || i::text, '{}'::jsonb);
+				END LOOP;
+				RETURN p_count;
+			END $$`, helper),
+			fmt.Sprintf("REVOKE ALL ON FUNCTION %s(text, integer) FROM PUBLIC", helper),
+			fmt.Sprintf("GRANT EXECUTE ON FUNCTION %s(text, integer) TO agent_runtime", helper), "COMMIT")
+		if setupErr != nil {
+			fmt.Println("nested-write helper setup failed:", out, setupErr)
+			os.Exit(1)
+		}
+		probe("function calling function shares the write budget", "reject:53400", N.Token,
+			fmt.Sprintf("SELECT %s('nested-function-', 30)", helper))
+		probe("refused nested function left no memory rows", "zero", N.Token,
+			"SELECT 1 FROM swarmpg.memory WHERE key LIKE 'nested-function-%'")
+		probe("refused nested function left no history rows", "zero", N.Token,
+			"SELECT 1 FROM swarmpg.memory_history WHERE key LIKE 'nested-function-%'")
+		if out, err := psqlAs(*pgURL, fmt.Sprintf("DROP FUNCTION %s(text, integer)", helper)); err != nil {
+			fmt.Println("nested-write helper cleanup failed:", out, err)
+			os.Exit(1)
+		}
+
 		_, msg := mcpRPC(C.Token, true, "tools/call", map[string]any{"name": "query", "arguments": map[string]any{"sql": runaway}}, nil)
 		res, _ := msg["result"].(map[string]any)
 		sc, _ := res["structuredContent"].(map[string]any)
@@ -582,8 +660,8 @@ func main() {
 		fmt.Printf("  [%s] %-50s -> %v\n", map[bool]string{true: "PASS", false: "FAIL"}[ok], "MCP query tool is held to the same budget", errBody["code"])
 	}
 
-	fmt.Printf("\nisolation probes: %d passed, %d failed\n", probePass, probeFail)
-	if probeFail > 0 {
+	fmt.Printf("\nisolation probes: %d passed, %d failed; HTTP/transport failures: %d\n", probePass, probeFail, httpFailures.Load())
+	if runFailed(fail.Load(), probeFail) {
 		os.Exit(1)
 	}
 }
@@ -643,7 +721,7 @@ func runtimeURL(admin string) string {
 // psqlAs runs each statement as its own -c in one session and returns the
 // combined output; with -q only query results and errors are printed.
 func psqlAs(dsn string, stmts ...string) (string, error) {
-	args := []string{dsn, "-v", "ON_ERROR_STOP=1", "-tAq"}
+	args := []string{dsn, "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-tAq"}
 	for _, s := range stmts {
 		args = append(args, "-c", s)
 	}

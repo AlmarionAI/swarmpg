@@ -128,8 +128,43 @@ allowed so the agent can see the estimate.
   results. SQL `FETCH` from a cursor is not capped, because `FETCH` runs into the portal's own
   tuplestore before the rows reach the client; the gateway refuses cursors, and the cost gate still
   bounds the work.
-- *Rows one statement may modify*, counted in `ExecModifyTable` per input row on a per-query EState
-  counter, so every ModifyTable node of the statement counts, including data-modifying CTEs (which
-  do not touch `es_processed`). Exceeding it is an ERROR, so the statement rolls back as a whole
-  instead of half-applying. This applies at every nesting level. `COPY FROM` does not go through
-  ModifyTable; it is refused anyway on the agent tables, which use row-level security.
+- *Rows one statement may modify*, originally counted in `ExecModifyTable` per input row on a
+  per-query EState counter. That covers the statement's data-modifying CTEs but gives each nested
+  SPI executor a fresh allowance. Patch 0003 replaces that boundary with the shared statement
+  budget described below. `COPY FROM` does not go through ModifyTable; it is refused anyway on
+  the agent tables, which use row-level security.
+
+### 0003 [budget] share the write budget across nested statement execution
+
+Files: `src/backend/tcop/pquery.c`, `src/include/tcop/pquery.h`,
+`src/include/utils/portal.h`, `src/backend/commands/portalcmds.c`,
+`src/backend/executor/nodeModifyTable.c`, `src/include/nodes/execnodes.h`,
+`src/test/regress/sql/agent_budget.sql`, `expected/agent_budget.out`.
+
+**Statement boundary.** The outer executing portal owns the cumulative write count. A dynamically
+scoped pointer lets nested SPI executors, SQL functions, triggers, prepared statements and
+data-modifying CTEs charge that same count. New client statements have new portals; a suspended
+extended-protocol portal retains its count across Execute messages, even when another portal is
+executed in between. Portal start, run, fetch, cleanup and holdable-cursor materialization all
+establish the scope and restore the previous pointer on both success and error. Internal execution
+without a portal retains the original EState-local fallback.
+
+**Atomic failure.** Crossing the cap raises SQLSTATE 53400 and records the exceeded limit in the
+owning portal. The failure remains sticky across a PL/pgSQL exception handler and is checked again
+before returning from portal execution, so catching an inner error cannot commit earlier writes
+from that statement. Savepoint recovery and subsequent client statements receive fresh budgets.
+Normal transaction semantics still apply: work already committed by a non-atomic `CALL`/`DO`
+cannot be rolled back by a later error, and transaction-deferred work is outside the original
+statement's execution. The gateway rejects those procedural entry points.
+
+**Accounting compatibility.** The charge point remains each input tuple to `ModifyTable`, before
+`ON CONFLICT`, `BEFORE` triggers or concurrency handling can skip it. Internal writes deliberately
+count: a successful memory put/delete/undo normally charges two rows (live data and history),
+and an event append charges three (event, attempted head insertion, head update). Returned SELECT
+rows use the existing separate output counter. The GUC ratchet, cost gate and gateway's
+`max_rows + 1` setting are unchanged.
+
+The expanded `agent_budget` regression checks nested PL/pgSQL and SQL functions, triggers, CTEs,
+prepared statements, utility execution, caught errors, holdable cursor materialization, exact-limit
+writes and recovery. `kernel/tests/agent_budget_protocol.py` checks interleaved suspended protocol
+portals, SQLSTATE 53400, rollback of both data and bookkeeping, and a successful subsequent write.

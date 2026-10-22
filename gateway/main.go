@@ -29,6 +29,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -66,14 +67,15 @@ type Gateway struct {
 	ceilRows        int
 	ceilCost        float64
 
-	cache   sync.Map // tokenHash -> *cachedAgent
-	buckets sync.Map // agentID -> *bucket
-	sems    sync.Map // agentID -> chan struct{} (per-agent concurrency)
-	seen    sync.Map // agentID -> *lastSeen (throttled last_seen_at writes)
-	auditCh chan auditRecord
-	seenCh  chan string
-	stats   struct {
-		requests, rejected, errors, limited, auditLost atomic.Int64
+	cache       sync.Map // tokenHash -> *cachedAgent
+	buckets     sync.Map // agentID -> *bucket
+	sems        sync.Map // agentID -> chan struct{} (per-agent concurrency)
+	seen        sync.Map // agentID -> *lastSeen (throttled last_seen_at writes)
+	auditSpool  *auditSpool
+	auditStrict bool
+	seenCh      chan string
+	stats       struct {
+		requests, rejected, errors, limited, auditLost, auditRetries atomic.Int64
 	}
 }
 
@@ -483,12 +485,19 @@ func approxBytes(v any) int64 {
 	}
 }
 
-func (g *Gateway) query(ctx context.Context, a *Agent, q QueryRequest) (*QueryResponse, *apiError) {
+func (g *Gateway) query(ctx context.Context, a *Agent, q QueryRequest) (result *QueryResponse, failure *apiError) {
+	// Reserve before executing (or refusing) SQL. Strict mode must reject work
+	// before a write can commit if its audit intent cannot be retained.
+	receipt, aerr := g.beginAudit(a, q.SQL, len(q.Params))
+	if aerr != nil {
+		return nil, aerr
+	}
+	started := time.Now()
+	defer func() { g.finishAudit(receipt, result, failure, time.Since(started)) }()
 	if err := guard(q.SQL, a); err != nil {
 		// Refused statements are audited too: they are the attempts worth seeing.
 		g.stats.rejected.Add(1)
 		ae := err.(*apiError)
-		g.audit(a, q.SQL, len(q.Params), 0, 0, 0, 0, ae)
 		return nil, ae
 	}
 	params, perr := decodeParams(q.Params)
@@ -546,10 +555,8 @@ func (g *Gateway) query(ctx context.Context, a *Agent, q QueryRequest) (*QueryRe
 	resp.Duration = float64(time.Since(start).Microseconds()) / 1000
 	if err != nil {
 		ae := classifyPg(err)
-		g.audit(a, q.SQL, len(params), 0, 0, 0, resp.Duration, ae)
 		return nil, ae
 	}
-	g.audit(a, q.SQL, len(params), resp.RowCount, resp.Bytes, resp.Affected, resp.Duration, nil)
 	return resp, nil
 }
 
@@ -877,11 +884,47 @@ func (g *Gateway) idempotentWrite(ctx context.Context, a *Agent, key string, do 
 // version or a point in time.
 type memoryState struct {
 	Key       string          `json:"key"`
+	AgentID   string          `json:"agent_id"`
 	Value     json.RawMessage `json:"value"`
 	Shared    bool            `json:"shared"`
 	Version   int64           `json:"version"`
 	Own       bool            `json:"own"`
 	ChangedAt *time.Time      `json:"changed_at,omitempty"`
+}
+
+type sharedMemoryResponse struct {
+	Key      string        `json:"key"`
+	Memories []memoryState `json:"memories"`
+}
+
+// Validate selectors before acquiring a connection. Historical memory stays
+// private even when its live value has been shared with the organization.
+func validateMemoryRead(key string, version *int64, asOf *time.Time, from *string, listShared bool) *apiError {
+	if key == "" {
+		return errBadReq("key required")
+	}
+	if version != nil && *version <= 0 {
+		return errBadReq("version must be > 0")
+	}
+	if version != nil && asOf != nil {
+		return errBadReq("pass version or as_of, not both")
+	}
+	if listShared && (from != nil || version != nil || asOf != nil) {
+		return errBadReq("list_shared cannot be combined with from, version or as_of")
+	}
+	if from != nil {
+		if version != nil || asOf != nil {
+			return errBadReq("from selects live memory only; it cannot be combined with version or as_of")
+		}
+		if len(*from) != 32 && (len(*from) != 36 || (*from)[8] != '-' || (*from)[13] != '-' || (*from)[18] != '-' || (*from)[23] != '-') {
+			return errBadReq("from must be an agent UUID")
+		}
+		var id pgtype.UUID
+		if err := id.Scan(*from); err != nil || !id.Valid {
+			return errBadReq("from must be an agent UUID")
+		}
+	}
+	return nil
 }
 
 // memoryPut writes one of the agent's own keys and returns its new version.
@@ -908,16 +951,14 @@ func (g *Gateway) memoryPut(ctx context.Context, a *Agent, key string, value jso
 }
 
 // memoryGet reads a key. A live read returns the agent's own key, falling back
-// to an org-shared key of the same name; a read of the past (at a version, or
+// to an org-shared key of the same name, ordered by version then producer ID.
+// from selects one visible live producer; a read of the past (at a version, or
 // as of a time) sees only the agent's own history.
-func (g *Gateway) memoryGet(ctx context.Context, a *Agent, key string, version *int64, asOf *time.Time) (*memoryState, *apiError) {
-	if key == "" {
-		return nil, errBadReq("key required")
+func (g *Gateway) memoryGet(ctx context.Context, a *Agent, key string, version *int64, asOf *time.Time, from *string) (*memoryState, *apiError) {
+	if aerr := validateMemoryRead(key, version, asOf, from, false); aerr != nil {
+		return nil, aerr
 	}
-	if version != nil && asOf != nil {
-		return nil, errBadReq("pass version or as_of, not both")
-	}
-	m := &memoryState{Key: key, Own: true}
+	m := &memoryState{Key: key, AgentID: a.ID, Own: true}
 	var deleted bool
 	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
 		switch {
@@ -929,10 +970,13 @@ func (g *Gateway) memoryGet(ctx context.Context, a *Agent, key string, version *
 				key, *asOf).Scan(&m.Value, &m.Shared, &m.Version, &deleted, &m.ChangedAt)
 		default:
 			return tx.QueryRow(ctx, `
-				SELECT value, shared, version, agent_id = swarmpg.current_agent() FROM swarmpg.memory
+				SELECT value, shared, version, agent_id = swarmpg.current_agent(), agent_id::text, updated_at
+				FROM swarmpg.memory
 				WHERE key = $1 AND (agent_id = swarmpg.current_agent()
 				                    OR (shared AND org_id = swarmpg.current_org()))
-				ORDER BY (agent_id = swarmpg.current_agent()) DESC LIMIT 1`, key).Scan(&m.Value, &m.Shared, &m.Version, &m.Own)
+				  AND ($2::uuid IS NULL OR agent_id = $2::uuid)
+				ORDER BY (agent_id = swarmpg.current_agent()) DESC, version DESC, agent_id ASC LIMIT 1`,
+				key, from).Scan(&m.Value, &m.Shared, &m.Version, &m.Own, &m.AgentID, &m.ChangedAt)
 		}
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -946,6 +990,69 @@ func (g *Gateway) memoryGet(ctx context.Context, a *Agent, key string, version *
 			Extra: map[string]any{"deleted_version": m.Version}}
 	}
 	return m, nil
+}
+
+// memoryShared lists every live, org-shared producer of a key. It never returns
+// a partial list: exceeding a row or byte budget is an explicit error so callers
+// cannot mistake omitted producers for absent ones.
+func (g *Gateway) memoryShared(ctx context.Context, a *Agent, key string) (*sharedMemoryResponse, *apiError) {
+	if aerr := validateMemoryRead(key, nil, nil, nil, true); aerr != nil {
+		return nil, aerr
+	}
+	out := &sharedMemoryResponse{Key: key, Memories: []memoryState{}}
+	maxRows := a.MaxRows
+	if g.sealed && g.ceilRows > 0 && maxRows >= g.ceilRows {
+		maxRows = g.ceilRows - 1 // reserve one row to detect an incomplete list
+	}
+	limitError := &apiError{Status: http.StatusRequestEntityTooLarge, Code: "result_limit_exceeded",
+		Message: "shared memory list exceeds the agent's result budget",
+		Hint:    "Use from to read a specific producer, or ask an administrator to raise the result budget."}
+	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT agent_id::text, value, version, agent_id = swarmpg.current_agent(), updated_at
+			FROM swarmpg.memory
+			WHERE key = $1 AND shared AND org_id = swarmpg.current_org()
+			ORDER BY version DESC, agent_id ASC LIMIT $2`, key, int64(maxRows)+1)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		// Include the enclosing JSON object and separators in the byte budget.
+		envelope, err := json.Marshal(out)
+		if err != nil {
+			return err
+		}
+		bytes := int64(len(envelope))
+		for rows.Next() {
+			if len(out.Memories) >= maxRows {
+				return limitError
+			}
+			m := memoryState{Key: key, Shared: true}
+			if err := rows.Scan(&m.AgentID, &m.Value, &m.Version, &m.Own, &m.ChangedAt); err != nil {
+				return err
+			}
+			encoded, err := json.Marshal(m)
+			if err != nil {
+				return err
+			}
+			bytes += int64(len(encoded))
+			if len(out.Memories) > 0 {
+				bytes++
+			}
+			if a.MaxResultBytes > 0 && bytes > a.MaxResultBytes {
+				return limitError
+			}
+			out.Memories = append(out.Memories, m)
+		}
+		if a.MaxResultBytes > 0 && bytes > a.MaxResultBytes {
+			return limitError
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, classifyPg(err)
+	}
+	return out, nil
 }
 
 // memoryDelete deletes one of the agent's own keys and returns the version of
@@ -1056,6 +1163,7 @@ func (g *Gateway) routes() http.Handler {
 		writeJSON(w, 200, map[string]any{
 			"ok": true, "requests": g.stats.requests.Load(), "rejected": g.stats.rejected.Load(),
 			"errors": g.stats.errors.Load(), "rate_limited": g.stats.limited.Load(), "audit_lost": g.stats.auditLost.Load(),
+			"audit_retries": g.stats.auditRetries.Load(), "audit": g.auditStatus(),
 			"runtime_pool": g.runtime.Stat().TotalConns(), "admin_pool": g.admin.Stat().TotalConns(),
 		})
 	})
@@ -1189,12 +1297,32 @@ func (g *Gateway) routes() http.Handler {
 			}
 			asOf = &t
 		}
-		m, aerr := g.memoryGet(r.Context(), a, r.PathValue("key"), version, asOf)
+		var from *string
+		if r.URL.Query().Has("from") {
+			id := r.URL.Query().Get("from")
+			from = &id
+		}
+		m, aerr := g.memoryGet(r.Context(), a, r.PathValue("key"), version, asOf, from)
 		if aerr != nil {
 			writeErr(w, aerr)
 			return
 		}
 		writeJSON(w, 200, m)
+	}))
+
+	mux.HandleFunc("GET /v1/memory/{key}/shared", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
+		for _, selector := range []string{"from", "version", "as_of"} {
+			if r.URL.Query().Has(selector) {
+				writeErr(w, errBadReq("shared listing cannot be combined with from, version or as_of"))
+				return
+			}
+		}
+		out, aerr := g.memoryShared(r.Context(), a, r.PathValue("key"))
+		if aerr != nil {
+			writeErr(w, aerr)
+			return
+		}
+		writeJSON(w, 200, out)
 	}))
 
 	mux.HandleFunc("DELETE /v1/memory/{key}", g.withAgent(func(w http.ResponseWriter, r *http.Request, a *Agent) {
@@ -1355,7 +1483,9 @@ func main() {
 		runtime:  mustPool(ctx, runtimeURL, 32, true),
 		adminKey: adminKey,
 	}
-	g.startWriters()
+	if err := g.startWriters(); err != nil {
+		log.Fatalf("configure audit: %v", err)
+	}
 	if err := g.admin.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_settings WHERE name = 'agent_principal')`).Scan(&g.sealed); err != nil {
 		log.Fatalf("detect kernel: %v", err)
 	}

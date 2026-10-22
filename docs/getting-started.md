@@ -1,7 +1,7 @@
 # Getting started
 
-From nothing to an agent reading and writing its own data over REST, MCP and SQL. Every
-command here runs as written against a local gateway; CI runs this page on every change.
+Create an agent and read/write its data over REST, MCP and SQL. CI runs the marked
+runnable examples against a local gateway; commands that start servers are skipped.
 
 ## 1. Start SwarmPG
 
@@ -45,7 +45,7 @@ created:
 |---|---|---|
 | `rps_limit` | 20 | requests per second (0: none) |
 | `max_concurrency` | 4 | requests in flight at once |
-| `max_rows` | 1000 | rows returned per query; on the kernel also rows one statement may modify |
+| `max_rows` | 1000 | rows returned per query; kernel attempted-write ceiling is `max_rows + 1`, including nested writes and trigger bookkeeping |
 | `max_result_bytes` | 4 MiB | bytes returned per query |
 | `max_cost` | 1e6 | planner cost a query may have before it runs (kernel) |
 | `statement_timeout_ms` | 5000 | time per statement |
@@ -105,8 +105,36 @@ curl -s -X POST -H "$AUTH" $GW/v1/memory/plan/undo | jq -c .
 
 Undo writes the previous value as a new version, so it can be undone too, and a deleted
 key (`DELETE /v1/memory/{key}`) can be restored the same way. `?as_of=<RFC 3339 time>`
-reads a key as it was at that time. A key written with `"shared": true` can be read, not
-written, by the other agents in your org.
+reads your own key as it was at that time. A key written with `"shared": true` can be
+read, not written, by other agents in your org. Successful reads include `agent_id` and
+`changed_at`, so the client can identify the producer and the value's timestamp.
+
+Create a second producer and publish the same shared key from both agents:
+
+<!-- doctest: expect publisher -->
+```bash
+PRODUCER=$(curl -s -H "$ADMIN" -d "{\"org_id\":\"$ORG\",\"name\":\"publisher\"}" $GW/v1/agents)
+PRODUCER_ID=$(echo "$PRODUCER" | jq -r .id)
+PRODUCER_AUTH="Authorization: Bearer $(echo "$PRODUCER" | jq -r .token)"
+curl -s -X PUT -H "$AUTH" -d '{"value":{"source":"researcher"},"shared":true}' $GW/v1/memory/shared-context | jq -c .
+curl -s -X PUT -H "$PRODUCER_AUTH" -d '{"value":{"source":"publisher"},"shared":true}' $GW/v1/memory/shared-context | jq -c .
+curl -s -H "$AUTH" "$GW/v1/memory/shared-context?from=$PRODUCER_ID" | jq -c '{agent_id,changed_at,own,value}'
+```
+
+Without `from`, your own live key wins. If you have no own key, shared fallback chooses
+by version descending then agent ID ascending. Versions are local to each producer, so
+use explicit selection when provenance matters. List all shared producers to compare:
+
+<!-- doctest: expect publisher -->
+```bash
+curl -s -H "$AUTH" $GW/v1/memory/shared-context/shared | jq -c '.memories | map({agent_id,version,changed_at,value})'
+```
+
+The listing returns `{key,memories:[]}`, ordered by version descending then agent ID
+ascending. It fails with `413 result_limit_exceeded` if all producers cannot fit the
+result budget; it never silently returns a partial list. No matches returns an empty
+list. `from` cannot reveal a private or cross-org key. Historical selectors remain
+owner-only, and cannot be combined with `from`, shared listing or each other.
 
 ## 5. The event journal
 
@@ -166,6 +194,17 @@ so the model sees it and can repair the call:
 mcp tools/call "{\"name\":\"query\",\"arguments\":{\"sql\":\"SELECT * FROM swarmpg.nope\"},$META}" query | jq -c '.result | {isError, code: .structuredContent.error.code}'
 ```
 
+The same producer selection and complete listing are available through `memory_get`:
+
+<!-- doctest: expect publisher -->
+```bash
+mcp tools/call "{\"name\":\"memory_get\",\"arguments\":{\"key\":\"shared-context\",\"from\":\"$PRODUCER_ID\"},$META}" memory_get | jq -c .result.structuredContent
+mcp tools/call "{\"name\":\"memory_get\",\"arguments\":{\"key\":\"shared-context\",\"list_shared\":true},$META}" memory_get | jq -c .result.structuredContent
+```
+
+`list_shared: true` cannot be combined with `from`, `version` or `as_of`; invalid
+combinations return `bad_request` as a tool error.
+
 Older clients (protocol 2025-11-25, 2025-06-18 or 2025-03-26) start with `initialize` and get
 the same tools. A browser page can only reach the endpoint from an origin listed in
 `MCP_ALLOWED_ORIGINS`.
@@ -194,8 +233,8 @@ All live in the `swarmpg` schema and see only the calling agent's keys.
 
 ## 8. What an agent cannot do
 
-Identity, other agents' rows and the control plane are out of reach, whatever SQL the agent
-writes:
+Through the gateway, an agent cannot choose a different identity, read private peer rows,
+or access the control plane. Shared peer rows are intentionally readable:
 
 <!-- doctest: expect not permitted -->
 ```bash
@@ -216,16 +255,22 @@ covered yet.
 | 403 | `42501`, `forbidden` | not allowed, agent disabled, or token expired | — |
 | 404 | `not_found` | no such key or version | — |
 | 409 | `version_conflict` | the key changed since you read it; `current_version` says to what | read again, then retry |
+| 413 | `result_limit_exceeded` | complete shared listing exceeds the result budget | select a producer with `from`, or raise the budget |
+| 503 | `audit_unavailable` | strict audit could not reserve an intent; SQL was not executed | restore spool capacity/availability, then retry |
 | 429 | `rate_limited`, `concurrency_limited` | over the rate or concurrency limit | wait `Retry-After` seconds |
 | 400 | `53400` | over the cost or row budget (kernel) | narrow the query or the write |
 | 400/504 | `57014`, `statement_timeout` | took longer than `statement_timeout_ms` | retry or narrow; `retryable` is true |
 
-`retryable: true` marks errors where sending the same request again can succeed.
+`retryable: true` describes a potentially temporary condition, not a guarantee that an
+arbitrary write is safe to repeat. Use event idempotency keys or memory compare-and-set,
+and inspect outcomes after a lost connection. An `audit_outcome_unknown` record means the
+SQL result was not durably recorded; it does not mean the SQL rolled back.
 
 ## 10. Run on the SwarmPG kernel
 
-The kernel makes the agent's identity and budgets hold even for SQL that never went
-through the gateway. Build it once (about 10 minutes), then run the same stack on it:
+With signing configured, the kernel enforces the pooled principal and row/cost ceilings
+even for SQL that never went through the gateway; other limits still belong to the gateway.
+Build it once (about 10 minutes), then run the same stack on it:
 
 <!-- doctest: skip -->
 ```bash
@@ -235,15 +280,48 @@ make pg-start KERNEL=1 && make gateway KERNEL=1
 
 `KERNEL=1` runs the cluster with `agent_principal_secret` set to `PRINCIPAL_SECRET`
 (`dev-principal-secret` by default) and gives the gateway the same secret, so every
-identity it seals is signed. Budgets now hold in the executor: a runaway query is refused
-before it runs.
+identity it seals is signed. A query whose planner estimate exceeds the cost budget is
+refused before execution. The attempted-write budget includes nested function/CTE writes
+and trigger history, and a refused statement rolls back its writes. It does not meter CPU
+or IO; a low estimated cost alone does not guarantee cheap execution.
 
 <!-- doctest: skip -->
 ```bash
 q "SELECT count(*) FROM generate_series(1, 100000) a, generate_series(1, 100000) b" | jq -c .error
 ```
 
-## 11. Before you deploy
+## 11. Choose query-audit delivery
+
+The default `AUDIT_MODE=best-effort` uses a bounded memory spool. A full spool drops new
+receipts and increments `audit_lost`; pending receipts are retried but do not survive a
+process crash unless `AUDIT_SPOOL_DIR` is configured.
+
+For strict SQL-query admission, mount persistent storage and configure the gateway:
+
+<!-- doctest: skip -->
+```bash
+AUDIT_MODE=strict AUDIT_SPOOL_DIR=/var/lib/swarmpg/audit AUDIT_SPOOL_CAPACITY=10000 make gateway
+```
+
+The directory must be writable by the gateway and retained across restarts. Strict mode
+fsyncs an intent before executing SQL; a full/unavailable spool returns
+`503 audit_unavailable` before execution. It persists completion afterwards. A crash
+between SQL commit and completion persistence is reported as `audit_outcome_unknown`;
+this is not exactly-once execution or an atomic SQL/audit commit.
+
+Audit applies to REST `/v1/query` and the MCP `query` tool, including guard refusals. Typed
+memory/event API and tool writes are outside this audit path. Stable receipt IDs
+deduplicate audit delivery, not arbitrary query retries. See the [full audit contract](gateway.md#audit-delivery).
+
+<!-- doctest: expect audit_lost -->
+```bash
+curl -s $GW/healthz | jq '{audit_lost,audit_retries,audit}'
+```
+
+Watch `audit.queued` against `audit.capacity`, plus loss/retry counters. A configured disk
+spool is not automatically replicated or backed up.
+
+## 12. Before you deploy
 
 - Set `ADMIN_KEY`, and on the kernel `PRINCIPAL_SECRET` and the server's matching
   `agent_principal_secret`, to long random values.
@@ -252,4 +330,7 @@ q "SELECT count(*) FROM generate_series(1, 100000) a, generate_series(1, 100000)
 - Terminate TLS in front of the gateway; it serves plain HTTP.
 - Use the kernel wherever an agent could reach Postgres without the gateway.
 - Monitor with a role in `pg_monitor`: statistics views are closed to everyone else.
+- Choose the audit policy deliberately, provision its persistent volume if needed, and
+  monitor its capacity and recovery. Verify backup/restore and schema-upgrade procedures
+  for your deployment; the development quickstart does not provide those guarantees.
 - Read the residual risks in [THREAT-MODEL.md](THREAT-MODEL.md).
