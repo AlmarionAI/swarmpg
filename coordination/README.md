@@ -39,8 +39,9 @@ files also remain for diagnosis. Docker containers are removed.
 - Healthy workers renew every third of a lease while reading inputs and calculating;
   deliberate pause faults never renew. Idle workers use seeded jitter with an
   exponential backoff capped at two seconds. Claim requests have a separate admission
-  limit of 16, acquired before the shared HTTP limit, to leave capacity for lease
-  holders. A heartbeat already in flight finishes before completion. Reports include
+  limit of 16, acquired before the shared HTTP limit and retained across retries,
+  so an already dispatched operation keeps its place ahead of new claimants.
+  HTTP capacity is released between attempts to leave room for lease holders. A heartbeat already in flight finishes before completion. Reports include
   both admission limits, empty claims and renewal outcomes.
 - The gateway receives SIGKILL and restarts; the database is crash-restarted while
   workers are active. Each fault must interrupt requests and be followed by a
@@ -76,7 +77,7 @@ files also remain for diagnosis. Docker containers are removed.
 | `COORD_DB_MODE` | `local` | `local` cluster or `docker` container |
 | `COORD_PG_IMAGE` | `postgres:17` | Stock Docker image |
 | `PG_BIN_DIR` | PostgreSQL tools on PATH | Binary directory; use the patched install with `KERNEL=1` |
-| `COORD_DATABASE_PORT` / `COORD_GATEWAY_PORT` | `55450` / `55451` | Must be unused |
+| `COORD_DATABASE_PORT` / `COORD_GATEWAY_PORT` | `16450` / `16451` | Must be unused |
 | `COORD_REPORT_DIR` | Fresh temporary directory | Retained evidence directory |
 
 `report.json` includes the source commit and source-tree SHA-256, database/Go/OS

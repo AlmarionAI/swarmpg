@@ -36,6 +36,10 @@ is enforcing this pooled principal even when an agent bypasses the gateway.
 - **Transactional outbox.** Task completion can atomically queue external tool effects.
   A separate dispatcher uses renewable leases and stable idempotency keys through
   crashes and retries. Receivers must deduplicate effects; see the [outbox contract](docs/outbox.md).
+- **Failover and recovery guards.** Opt-in database identity/timeline pins and synchronous
+  durability barriers protect acknowledged coordination across eligible failover. PITR
+  uses a new external generation and quarantines work until effect reconciliation;
+  operators still provide primary fencing. See the [recovery contract](docs/recovery.md).
 - **REST and MCP.** Seventeen MCP tools expose queries, schema, memory, tasks, outbox status and the event journal,
   with structured errors for clients to handle.
 - **Journal and query audit.** The event journal is append-only and hash-chained per
@@ -112,6 +116,11 @@ The [multi-gateway admission workload](docs/admission.md#reproducible-validation
 sustained thousands-of-agent tests with shared quotas, quiet-tenant progress and gateway
 failure. Its evidence must be assessed separately from the historical throughput benchmark.
 
+The [recovery workload](docs/recovery.md#reproducible-validation) adds synchronous primary
+failure, replication partitions and archive-based PITR on owned clusters. Its bounded
+correctness evidence depends on external primary fencing and explicit reconciliation;
+it is not an automatic HA service or a production capacity guarantee.
+
 Workspaces come after that proof. Storage branching, catalog virtualization, process-model
 rewrites and scale-to-zero are deferred research, outside the next milestone.
 [Design and acceptance criteria](docs/DESIGN.md) and [known limits](docs/THREAT-MODEL.md#residual-risks)
@@ -123,6 +132,8 @@ separate implemented behavior from planned work.
 - [Gateway reference](docs/gateway.md): the API, configuration and what each layer enforces
 - [Organization admission](docs/admission.md): shared quotas, local fairness, deadlines and overload behavior
 - [Tasks](docs/tasks.md): claims, leases, fencing, atomic completion and retry contracts
+- [External effects](docs/outbox.md): transactional intents, delivery and receiver deduplication
+- [Failover and recovery](docs/recovery.md): synchronous durability, fencing, PITR and reconciliation
 - [Threat model](docs/THREAT-MODEL.md): attackers, controls, the probe for each, residual risks
 - [Benchmark](bench/README.md): method, results, how to reproduce
 - [Kernel](kernel/README.md): the patch series and how to build it

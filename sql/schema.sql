@@ -754,6 +754,7 @@ CREATE OR REPLACE FUNCTION swarmpg._task_authorize(p_write boolean) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
 DECLARE a swarmpg.agents%ROWTYPE;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   SELECT * INTO a FROM swarmpg.agents
   WHERE id = swarmpg.current_agent() AND org_id = swarmpg.current_org();
   IF NOT FOUND OR a.disabled OR (a.token_expires_at IS NOT NULL AND a.token_expires_at <= clock_timestamp()) THEN
@@ -971,13 +972,16 @@ BEGIN
   IF p_queue IS NULL OR length(p_queue) NOT BETWEEN 1 AND 128 OR p_request_id IS NULL THEN
     RAISE EXCEPTION 'queue and claim request_id are required' USING ERRCODE = 'PT400';
   END IF;
-  INSERT INTO swarmpg.task_claim_requests(org_id, agent_id, request_id, queue, lease_ms)
-  VALUES (swarmpg.current_org(), swarmpg.current_agent(), p_request_id, p_queue, p_lease_ms)
+  INSERT INTO swarmpg.task_claim_requests(org_id, agent_id, request_id, queue, lease_ms, recovery_generation)
+  VALUES (swarmpg.current_org(), swarmpg.current_agent(), p_request_id, p_queue, p_lease_ms, swarmpg._recovery_generation())
   ON CONFLICT (org_id, agent_id, request_id) DO NOTHING;
   SELECT * INTO receipt FROM swarmpg.task_claim_requests
   WHERE org_id = swarmpg.current_org() AND agent_id = swarmpg.current_agent() AND request_id = p_request_id FOR UPDATE;
   IF receipt.queue <> p_queue OR receipt.lease_ms <> p_lease_ms THEN
     RAISE EXCEPTION 'claim request_id already identifies different parameters' USING ERRCODE = 'PT409';
+  END IF;
+  IF receipt.recovery_generation<>swarmpg._recovery_generation() THEN
+    RAISE EXCEPTION 'claim receipt belongs to an earlier recovery generation; use a fresh request ID' USING ERRCODE='PT410';
   END IF;
   IF receipt.response IS NOT NULL THEN
     RETURN swarmpg._task_response(receipt.response || jsonb_build_object('replayed', true), true);
@@ -993,7 +997,7 @@ BEGIN
   IF FOUND THEN
     PERFORM swarmpg._task_authorize_locked(true);
     UPDATE swarmpg.tasks SET state = 'claimed', owner_agent_id = swarmpg.current_agent(),
-      fence = fence + 1, lease_until = clock_timestamp() + p_lease_ms * interval '1 millisecond',
+      fence = swarmpg._next_fence(fence), lease_until = clock_timestamp() + p_lease_ms * interval '1 millisecond',
       attempts = attempts + 1, revision = revision + 1, updated_at = clock_timestamp()
     WHERE id = t.id RETURNING * INTO t;
     PERFORM swarmpg._task_event(t, 'claimed', swarmpg.current_agent(), jsonb_build_object('request_id', p_request_id));
@@ -1054,7 +1058,7 @@ BEGIN
   END IF;
   IF t.state = 'cancelled' THEN RETURN swarmpg._task_response(swarmpg._task_json(t), true); END IF;
   UPDATE swarmpg.tasks SET state = 'cancelled', owner_agent_id = NULL, lease_until = NULL,
-    fence = fence + 1, revision = revision + 1, updated_at = clock_timestamp()
+    fence = swarmpg._next_fence(fence), revision = revision + 1, updated_at = clock_timestamp()
   WHERE id = t.id RETURNING * INTO t;
   PERFORM swarmpg._task_event(t, 'cancelled', swarmpg.current_agent());
   RETURN swarmpg._task_response(swarmpg._task_json(t), true);
@@ -1082,6 +1086,7 @@ CREATE OR REPLACE FUNCTION swarmpg.task_recover(p_id uuid, p_reason text) RETURN
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
 DECLARE t swarmpg.tasks%ROWTYPE;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   IF p_reason IS NULL OR length(p_reason) NOT BETWEEN 1 AND 1000 THEN
     RAISE EXCEPTION 'recovery requires a reason of 1 to 1000 characters' USING ERRCODE = 'PT400';
   END IF;
@@ -1091,7 +1096,7 @@ BEGIN
     RAISE EXCEPTION 'a terminal task cannot be recovered' USING ERRCODE = 'PT409';
   END IF;
   UPDATE swarmpg.tasks SET state = 'ready', owner_agent_id = NULL, lease_until = NULL,
-    fence = fence + 1, revision = revision + 1, updated_at = clock_timestamp()
+    fence = swarmpg._next_fence(fence), revision = revision + 1, updated_at = clock_timestamp()
   WHERE id = t.id RETURNING * INTO t;
   PERFORM swarmpg._task_event(t, 'recovered', NULL, jsonb_build_object('reason', p_reason));
   RETURN swarmpg._task_json(t);
@@ -1287,6 +1292,7 @@ CREATE OR REPLACE FUNCTION swarmpg.outbox_claim(p_org uuid,p_destination text,p_
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 DECLARE m swarmpg.outbox_messages%ROWTYPE; r swarmpg.outbox_claim_requests%ROWTYPE; receipt jsonb;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   PERFORM swarmpg._task_lease(p_lease_ms);
   IF p_org IS NULL OR p_worker IS NULL OR p_request IS NULL OR p_destination IS NULL
      OR p_destination COLLATE "C" !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' THEN
@@ -1295,12 +1301,15 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM swarmpg.orgs WHERE id=p_org) THEN
     RAISE EXCEPTION 'organization not found' USING ERRCODE = 'PT404';
   END IF;
-  INSERT INTO swarmpg.outbox_claim_requests(org_id,worker_id,request_id,destination,lease_ms)
-  VALUES (p_org,p_worker,p_request,p_destination,p_lease_ms) ON CONFLICT DO NOTHING;
+  INSERT INTO swarmpg.outbox_claim_requests(org_id,worker_id,request_id,destination,lease_ms,recovery_generation)
+  VALUES (p_org,p_worker,p_request,p_destination,p_lease_ms,swarmpg._recovery_generation()) ON CONFLICT DO NOTHING;
   SELECT * INTO r FROM swarmpg.outbox_claim_requests
   WHERE org_id=p_org AND worker_id=p_worker AND request_id=p_request FOR UPDATE;
   IF r.destination <> p_destination OR r.lease_ms <> p_lease_ms THEN
     RAISE EXCEPTION 'claim request identifies different parameters' USING ERRCODE = 'PT409';
+  END IF;
+  IF r.recovery_generation<>swarmpg._recovery_generation() THEN
+    RAISE EXCEPTION 'outbox receipt belongs to an earlier recovery generation; use a fresh request ID' USING ERRCODE='PT410';
   END IF;
   IF r.response IS NOT NULL THEN RETURN r.response || jsonb_build_object('replayed',true); END IF;
   LOOP
@@ -1322,7 +1331,7 @@ BEGIN
       PERFORM swarmpg._outbox_event(m,'failed',NULL,jsonb_build_object('reason','delivery attempts exhausted'));
       CONTINUE;
     END IF;
-    UPDATE swarmpg.outbox_messages SET state='delivering',worker_id=p_worker,fence=fence+1,
+    UPDATE swarmpg.outbox_messages SET state='delivering',worker_id=p_worker,fence=swarmpg._next_fence(fence),
       lease_until=clock_timestamp()+p_lease_ms*interval '1 millisecond',attempts=attempts+1,
       total_attempts=total_attempts+1,revision=revision+1,updated_at=clock_timestamp()
     WHERE id=m.id RETURNING * INTO m;
@@ -1339,6 +1348,7 @@ CREATE OR REPLACE FUNCTION swarmpg.outbox_get(p_org uuid,p_id uuid) RETURNS json
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 DECLARE m swarmpg.outbox_messages%ROWTYPE;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id;
   IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE = 'PT404'; END IF;
   RETURN swarmpg._outbox_json(m);
@@ -1347,6 +1357,7 @@ CREATE OR REPLACE FUNCTION swarmpg.outbox_renew(p_org uuid,p_id uuid,p_worker uu
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 DECLARE m swarmpg.outbox_messages%ROWTYPE;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   PERFORM swarmpg._task_lease(p_lease_ms);
   SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE = 'PT404'; END IF;
@@ -1360,6 +1371,7 @@ CREATE OR REPLACE FUNCTION swarmpg.outbox_ack(p_org uuid,p_id uuid,p_worker uuid
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 DECLARE m swarmpg.outbox_messages%ROWTYPE;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   IF p_response IS NULL OR octet_length(p_response::text)>16384 OR p_worker IS NULL OR p_fence IS NULL OR p_fence<1 THEN
     RAISE EXCEPTION 'worker, positive fence and JSON response of at most 16 KiB required' USING ERRCODE = 'PT400';
   END IF;
@@ -1382,6 +1394,7 @@ CREATE OR REPLACE FUNCTION swarmpg.outbox_nack(p_org uuid,p_id uuid,p_worker uui
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 DECLARE m swarmpg.outbox_messages%ROWTYPE;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   IF p_error IS NULL OR length(p_error) NOT BETWEEN 1 AND 1000 OR p_retry_ms IS NULL
      OR p_retry_ms NOT BETWEEN 0 AND 3600000 OR p_permanent IS NULL THEN
     RAISE EXCEPTION 'error, retry_ms 0..3600000 and permanent are required' USING ERRCODE = 'PT400';
@@ -1400,13 +1413,14 @@ CREATE OR REPLACE FUNCTION swarmpg.outbox_retry(p_org uuid,p_id uuid,p_reason te
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 DECLARE m swarmpg.outbox_messages%ROWTYPE;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   IF p_reason IS NULL OR length(p_reason) NOT BETWEEN 1 AND 1000 THEN
     RAISE EXCEPTION 'retry reason must be 1 to 1000 characters' USING ERRCODE = 'PT400';
   END IF;
   SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE = 'PT404'; END IF;
   IF m.state <> 'failed' THEN RAISE EXCEPTION 'only failed messages can be retried' USING ERRCODE = 'PT409'; END IF;
-  UPDATE swarmpg.outbox_messages SET state='pending',worker_id=NULL,lease_until=NULL,attempts=0,fence=fence+1,
+  UPDATE swarmpg.outbox_messages SET state='pending',worker_id=NULL,lease_until=NULL,attempts=0,fence=swarmpg._next_fence(fence),
     available_at=clock_timestamp(),revision=revision+1,updated_at=clock_timestamp() WHERE id=m.id RETURNING * INTO m;
   PERFORM swarmpg._outbox_event(m,'retried',NULL,jsonb_build_object('reason',p_reason));
   RETURN swarmpg._outbox_json(m);
@@ -1503,6 +1517,7 @@ END $$;
 CREATE OR REPLACE FUNCTION swarmpg.admission_policy_get(p_org uuid) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   RETURN swarmpg._admission_policy_json(swarmpg._admission_policy(p_org));
 END $$;
 CREATE OR REPLACE FUNCTION swarmpg.admission_policy_set(p_org uuid,p_policy jsonb) RETURNS jsonb
@@ -1512,6 +1527,7 @@ DECLARE p swarmpg.admission_policies%ROWTYPE; b swarmpg.admission_buckets%ROWTYP
   new_burst integer; sampled_at timestamptz;
   fields text[] := ARRAY['general_rps','general_burst','general_concurrency','control_rps','control_burst','control_concurrency'];
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   IF p_policy IS NULL OR jsonb_typeof(p_policy)<>'object' OR NOT (p_policy ?& fields)
      OR (p_policy-fields)<>'{}'::jsonb THEN
     RAISE EXCEPTION 'policy requires exactly six admission fields' USING ERRCODE='PT400';
@@ -1556,6 +1572,7 @@ DECLARE p swarmpg.admission_policies%ROWTYPE; b swarmpg.admission_buckets%ROWTYP
   sampled_at timestamptz; earliest_expiry timestamptz; available numeric;
   rate integer; burst integer; ceiling integer; active integer; remaining integer; inserted boolean;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   IF p_org IS NULL OR p_agent IS NULL OR p_gateway IS NULL OR p_request IS NULL OR p_class IS NULL
      OR p_class NOT IN ('general','control') OR p_ttl_ms IS NULL OR p_ttl_ms NOT BETWEEN 100 AND 120000 THEN
     RAISE EXCEPTION 'valid organization, agent, gateway, request, class and TTL required' USING ERRCODE='PT400';
@@ -1624,6 +1641,7 @@ END $$;
 CREATE OR REPLACE FUNCTION swarmpg.admission_release(p_org uuid,p_gateway uuid,p_request uuid) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   DELETE FROM swarmpg.admission_permits WHERE org_id=p_org AND request_id=p_request AND gateway_id=p_gateway;
   -- Release refunds concurrent capacity, never an already consumed rate token.
   RETURN FOUND;
@@ -1632,6 +1650,7 @@ CREATE OR REPLACE FUNCTION swarmpg.admission_sweep(p_limit integer DEFAULT 1000)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 DECLARE removed integer;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 10000 THEN
     RAISE EXCEPTION 'sweep limit must be 1 to 10000' USING ERRCODE='PT400';
   END IF;
@@ -1647,6 +1666,7 @@ CREATE OR REPLACE FUNCTION swarmpg.admission_status(p_org uuid) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
 DECLARE p swarmpg.admission_policies%ROWTYPE; sampled_at timestamptz;
 BEGIN
+  PERFORM swarmpg._recovery_guard();
   p := swarmpg._admission_policy(p_org);
   sampled_at := clock_timestamp();
   RETURN jsonb_build_object('policy',swarmpg._admission_policy_json(p),'active',jsonb_build_object(
@@ -1663,4 +1683,254 @@ BEGIN
     AND (p.proname LIKE 'admission\_%' OR p.proname LIKE '\_admission\_%')
   LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC,agent_runtime',f); END LOOP;
 END $$;
+COMMIT;
+
+-- ---------------------------------------------------------------------------
+-- Opt-in failover and restore interlock. PostgreSQL does not elect/fence a
+-- primary: operators must fence the former primary and preserve a generation
+-- ledger outside this database before activating a changed history.
+-- ---------------------------------------------------------------------------
+BEGIN;
+CREATE TABLE IF NOT EXISTS swarmpg.recovery_control (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+  system_identifier text NOT NULL,
+  timeline bigint NOT NULL CHECK(timeline>0),
+  generation bigint NOT NULL CHECK(generation BETWEEN 1 AND 2147483647),
+  state text NOT NULL CHECK(state IN ('active','quarantined')),
+  changed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  reason text NOT NULL
+);
+CREATE TABLE IF NOT EXISTS swarmpg.recovery_history (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  system_identifier text NOT NULL, timeline bigint NOT NULL, generation bigint NOT NULL,
+  event text NOT NULL, evidence text NOT NULL, detail jsonb NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS swarmpg.recovery_outbox_resolutions (
+  generation bigint NOT NULL, org_id uuid NOT NULL, message_id uuid NOT NULL,
+  action text NOT NULL CHECK(action IN ('delivered','retry','failed')),
+  evidence text NOT NULL, resolved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY(generation,org_id,message_id),
+  FOREIGN KEY(org_id,message_id) REFERENCES swarmpg.outbox_messages(org_id,id) ON DELETE CASCADE
+);
+REVOKE ALL ON swarmpg.recovery_control,swarmpg.recovery_history,swarmpg.recovery_outbox_resolutions FROM PUBLIC,agent_runtime;
+ALTER TABLE swarmpg.task_claim_requests ADD COLUMN IF NOT EXISTS recovery_generation bigint NOT NULL DEFAULT 0;
+ALTER TABLE swarmpg.outbox_claim_requests ADD COLUMN IF NOT EXISTS recovery_generation bigint NOT NULL DEFAULT 0;
+
+CREATE OR REPLACE FUNCTION swarmpg._recovery_identity() RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE sid text; tid bigint;
+BEGIN
+  IF pg_is_in_recovery() THEN RAISE EXCEPTION 'recovery requires the fenced writable primary' USING ERRCODE='SR503'; END IF;
+  SELECT system_identifier::text INTO sid FROM pg_control_system();
+  -- The WAL filename identifies the current timeline, including immediately
+  -- after promotion; a checkpoint's timeline can describe older history.
+  tid := ('x'||substr(pg_walfile_name(pg_current_wal_insert_lsn()),1,8))::bit(32)::bigint;
+  RETURN jsonb_build_object('system_identifier',sid,'timeline',tid);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg._recovery_durability() RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE names text:=current_setting('synchronous_standby_names'); required integer:=1; live integer; matched text[];
+BEGIN
+  IF current_setting('synchronous_commit')<>'remote_apply' OR names='' OR current_setting('fsync')<>'on'
+     OR current_setting('full_page_writes')<>'on' OR current_setting('wal_level') NOT IN ('replica','logical') THEN
+    RAISE EXCEPTION 'recovery requires remote_apply, synchronous standbys and durable WAL settings' USING ERRCODE='SR503';
+  END IF;
+  matched := regexp_match(names,'^\s*(?:(?:FIRST|ANY)\s+)?([0-9]+)\s*\(','i');
+  IF matched IS NOT NULL THEN required:=matched[1]::integer; END IF;
+  SELECT count(*) INTO live FROM pg_stat_replication WHERE state='streaming' AND sync_state IN ('sync','quorum');
+  IF required<1 OR live<required THEN RAISE EXCEPTION 'required synchronous standbys are unavailable' USING ERRCODE='SR503'; END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg._recovery_generation() RETURNS bigint
+LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+  SELECT coalesce((SELECT generation FROM swarmpg.recovery_control WHERE singleton),0)
+$$;
+CREATE OR REPLACE FUNCTION swarmpg._next_fence(p_previous bigint) RETURNS bigint
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE g bigint:=swarmpg._recovery_generation(); base numeric:=g::numeric*4294967296; candidate numeric;
+BEGIN
+  candidate:=greatest(p_previous::numeric+1,CASE WHEN g=0 THEN 1 ELSE base+1 END);
+  IF p_previous IS NULL OR p_previous<0 OR candidate>9223372036854775807
+     OR (g>0 AND candidate>base+4294967295) THEN
+    RAISE EXCEPTION 'fencing token generation is exhausted or inconsistent' USING ERRCODE='SR409';
+  END IF;
+  RETURN candidate::bigint;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg._recovery_guard() RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE c swarmpg.recovery_control%ROWTYPE; identity jsonb;
+BEGIN
+  IF current_setting('transaction_read_only')='on' THEN
+    SELECT * INTO c FROM swarmpg.recovery_control WHERE singleton;
+  ELSE
+    -- Activation waits for every admitted write transaction to finish.
+    SELECT * INTO c FROM swarmpg.recovery_control WHERE singleton FOR SHARE;
+  END IF;
+  IF NOT FOUND THEN RETURN; END IF;
+  identity:=swarmpg._recovery_identity();
+  IF c.state<>'active' OR c.system_identifier<>identity->>'system_identifier' OR c.timeline<>(identity->>'timeline')::bigint THEN
+    RAISE EXCEPTION 'database history is quarantined or has not been activated' USING ERRCODE='SR503';
+  END IF;
+  PERFORM set_config('synchronous_commit','remote_apply',true);
+  PERFORM swarmpg._recovery_durability();
+  -- A receipt replay can otherwise be a WAL-free transaction and acknowledge
+  -- history from an earlier locally committed, cancelled replication wait.
+  -- Transactional logical messages force a commit WAL record without a hot row.
+  PERFORM pg_logical_emit_message(true,'swarmpg.recovery','');
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.recovery_check(p_systemid text,p_timeline bigint,p_generation bigint) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE c swarmpg.recovery_control%ROWTYPE;
+BEGIN
+  IF current_setting('synchronous_commit')<>'remote_apply' THEN
+    RAISE EXCEPTION 'gateway must require synchronous remote_apply commits' USING ERRCODE='SR503';
+  END IF;
+  PERFORM swarmpg._recovery_guard();
+  SELECT * INTO c FROM swarmpg.recovery_control WHERE singleton;
+  IF NOT FOUND OR p_systemid IS NULL OR p_timeline IS NULL OR p_generation IS NULL
+     OR c.system_identifier<>p_systemid OR c.timeline<>p_timeline OR c.generation<>p_generation THEN
+    RAISE EXCEPTION 'gateway recovery identity does not match the activated database history' USING ERRCODE='SR503';
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.recovery_status() RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE c swarmpg.recovery_control%ROWTYPE; identity jsonb;
+BEGIN
+  identity:=swarmpg._recovery_identity();
+  SELECT * INTO c FROM swarmpg.recovery_control WHERE singleton;
+  RETURN jsonb_build_object('enabled',FOUND,'current',identity,'control',CASE WHEN FOUND THEN to_jsonb(c) ELSE NULL END,
+    'unresolved_outbox',(SELECT count(*) FROM swarmpg.outbox_messages m WHERE m.state<>'delivered'
+      AND NOT EXISTS(SELECT 1 FROM swarmpg.recovery_outbox_resolutions r WHERE r.generation=c.generation AND r.org_id=m.org_id AND r.message_id=m.id)));
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.recovery_activate(p_systemid text,p_timeline bigint,p_generation bigint,p_mode text,p_reason text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE c swarmpg.recovery_control%ROWTYPE; identity jsonb; existing boolean; t swarmpg.tasks%ROWTYPE; m swarmpg.outbox_messages%ROWTYPE;
+BEGIN
+  IF p_systemid IS NULL OR p_timeline IS NULL OR p_generation IS NULL OR p_generation NOT BETWEEN 1 AND 2147483647
+     OR p_mode IS NULL OR p_mode NOT IN ('bootstrap','failover','restore') OR p_reason IS NULL OR length(p_reason) NOT BETWEEN 1 AND 4000 THEN
+    RAISE EXCEPTION 'activation requires identity, positive generation, mode and fencing/recovery evidence' USING ERRCODE='PT400';
+  END IF;
+  identity:=swarmpg._recovery_identity();
+  IF p_systemid<>identity->>'system_identifier' OR p_timeline<>(identity->>'timeline')::bigint THEN
+    RAISE EXCEPTION 'activation identity does not match this primary' USING ERRCODE='SR503';
+  END IF;
+  PERFORM swarmpg._recovery_durability();
+  LOCK TABLE swarmpg.recovery_control IN SHARE ROW EXCLUSIVE MODE;
+  SELECT * INTO c FROM swarmpg.recovery_control WHERE singleton FOR UPDATE;
+  existing:=FOUND;
+  IF p_mode='bootstrap' AND existing THEN RAISE EXCEPTION 'recovery is already initialized' USING ERRCODE='SR409'; END IF;
+  IF p_mode<>'bootstrap' AND NOT existing THEN RAISE EXCEPTION 'recovery must be initialized before transition' USING ERRCODE='SR409'; END IF;
+  IF existing AND (p_systemid<>c.system_identifier OR (p_mode='failover' AND (p_generation<>c.generation OR p_timeline<=c.timeline OR c.state<>'active'))
+       OR (p_mode='restore' AND p_generation<=c.generation)) THEN
+    RAISE EXCEPTION 'invalid recovery transition or reused generation' USING ERRCODE='SR409';
+  END IF;
+  INSERT INTO swarmpg.recovery_control(singleton,system_identifier,timeline,generation,state,reason)
+  VALUES(true,p_systemid,p_timeline,p_generation,CASE WHEN p_mode='restore' THEN 'quarantined' ELSE 'active' END,p_reason)
+  ON CONFLICT(singleton) DO UPDATE SET system_identifier=EXCLUDED.system_identifier,timeline=EXCLUDED.timeline,
+    generation=EXCLUDED.generation,state=EXCLUDED.state,changed_at=clock_timestamp(),reason=EXCLUDED.reason;
+  IF p_mode='restore' THEN
+    FOR t IN UPDATE swarmpg.tasks SET state='ready',owner_agent_id=NULL,lease_until=NULL,
+        fence=swarmpg._next_fence(fence),revision=revision+1,updated_at=clock_timestamp()
+        WHERE state IN ('ready','claimed') RETURNING * LOOP
+      PERFORM swarmpg._task_event(t,'restore_invalidated',NULL,jsonb_build_object('generation',p_generation,'reason',p_reason));
+    END LOOP;
+    FOR m IN UPDATE swarmpg.outbox_messages SET state=CASE WHEN state='delivering' THEN 'pending' ELSE state END,
+        worker_id=NULL,lease_until=NULL,fence=swarmpg._next_fence(fence),revision=revision+1,updated_at=clock_timestamp()
+        WHERE state<>'delivered' RETURNING * LOOP
+      PERFORM swarmpg._outbox_event(m,'restore_quarantined',NULL,jsonb_build_object('generation',p_generation,'reason',p_reason));
+    END LOOP;
+    DELETE FROM swarmpg.admission_permits;
+    -- A claim request issued after the restore point has no surviving receipt.
+    -- Revoke every old bearer credential so such requests cannot silently claim
+    -- different work. Operators rotate and explicitly re-enable reconciled agents.
+    UPDATE swarmpg.agents SET disabled=true,
+      token_hash=sha256(convert_to(gen_random_uuid()::text,'UTF8'));
+  END IF;
+  INSERT INTO swarmpg.recovery_history(system_identifier,timeline,generation,event,evidence)
+    VALUES(p_systemid,p_timeline,p_generation,p_mode,p_reason);
+  RETURN swarmpg.recovery_status();
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.recovery_resolve_outbox(p_org uuid,p_id uuid,p_action text,p_evidence text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE c swarmpg.recovery_control%ROWTYPE; m swarmpg.outbox_messages%ROWTYPE; identity jsonb;
+BEGIN
+  SELECT * INTO c FROM swarmpg.recovery_control WHERE singleton FOR UPDATE;
+  identity:=swarmpg._recovery_identity();
+  IF NOT FOUND OR c.state<>'quarantined' OR c.system_identifier<>identity->>'system_identifier' OR c.timeline<>(identity->>'timeline')::bigint THEN
+    RAISE EXCEPTION 'outbox reconciliation requires the quarantined activated history' USING ERRCODE='SR503';
+  END IF;
+  PERFORM swarmpg._recovery_durability();
+  IF p_action IS NULL OR p_action NOT IN ('delivered','retry','failed') OR p_evidence IS NULL OR length(p_evidence) NOT BETWEEN 1 AND 4000 THEN
+    RAISE EXCEPTION 'resolution requires an action and receiver reconciliation evidence' USING ERRCODE='PT400';
+  END IF;
+  SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE='PT404'; END IF;
+  IF m.state='delivered' OR EXISTS(SELECT 1 FROM swarmpg.recovery_outbox_resolutions WHERE generation=c.generation AND org_id=p_org AND message_id=p_id) THEN
+    RAISE EXCEPTION 'outbox message has already been resolved' USING ERRCODE='SR409';
+  END IF;
+  UPDATE swarmpg.outbox_messages SET state=CASE p_action WHEN 'retry' THEN 'pending' ELSE p_action END,
+    worker_id=NULL,lease_until=NULL,fence=swarmpg._next_fence(fence),revision=revision+1,updated_at=clock_timestamp(),
+    attempts=CASE WHEN p_action='retry' THEN 0 ELSE attempts END,available_at=clock_timestamp(),
+    last_error=CASE WHEN p_action='failed' THEN p_evidence ELSE NULL END,
+    delivery_response=CASE WHEN p_action='delivered' THEN jsonb_build_object('recovery_evidence',p_evidence) ELSE NULL END,
+    delivered_at=CASE WHEN p_action='delivered' THEN clock_timestamp() ELSE NULL END
+    WHERE org_id=p_org AND id=p_id RETURNING * INTO m;
+  INSERT INTO swarmpg.recovery_outbox_resolutions(generation,org_id,message_id,action,evidence) VALUES(c.generation,p_org,p_id,p_action,p_evidence);
+  PERFORM swarmpg._outbox_event(m,'restore_resolved',NULL,jsonb_build_object('action',p_action,'evidence',p_evidence,'generation',c.generation));
+  INSERT INTO swarmpg.recovery_history(system_identifier,timeline,generation,event,evidence,detail)
+    VALUES(c.system_identifier,c.timeline,c.generation,'outbox_resolved',p_evidence,jsonb_build_object('org_id',p_org,'message_id',p_id,'action',p_action));
+  RETURN swarmpg._outbox_json(m);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.recovery_resume(p_systemid text,p_timeline bigint,p_generation bigint,p_reason text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+DECLARE c swarmpg.recovery_control%ROWTYPE; identity jsonb;
+BEGIN
+  SELECT * INTO c FROM swarmpg.recovery_control WHERE singleton FOR UPDATE;
+  identity:=swarmpg._recovery_identity();
+  IF NOT FOUND OR c.state<>'quarantined' OR p_systemid IS NULL OR p_timeline IS NULL OR p_generation IS NULL
+     OR c.system_identifier<>p_systemid OR c.timeline<>p_timeline OR c.generation<>p_generation
+     OR p_systemid<>identity->>'system_identifier' OR p_timeline<>(identity->>'timeline')::bigint THEN
+    RAISE EXCEPTION 'resume requires the exact quarantined history' USING ERRCODE='SR503';
+  END IF;
+  PERFORM swarmpg._recovery_durability();
+  IF p_reason IS NULL OR length(p_reason) NOT BETWEEN 1 AND 4000 THEN
+    RAISE EXCEPTION 'resume requires evidence that lost history and external effects have been reconciled' USING ERRCODE='PT400';
+  END IF;
+  IF EXISTS(SELECT 1 FROM swarmpg.outbox_messages m WHERE m.state<>'delivered' AND NOT EXISTS(
+      SELECT 1 FROM swarmpg.recovery_outbox_resolutions r WHERE r.generation=c.generation AND r.org_id=m.org_id AND r.message_id=m.id)) THEN
+    RAISE EXCEPTION 'every restored undelivered outbox message must be reconciled before resume' USING ERRCODE='SR409';
+  END IF;
+  UPDATE swarmpg.recovery_control SET state='active',changed_at=clock_timestamp(),reason=p_reason WHERE singleton;
+  INSERT INTO swarmpg.recovery_history(system_identifier,timeline,generation,event,evidence)
+    VALUES(p_systemid,p_timeline,p_generation,'resumed',p_reason);
+  RETURN swarmpg.recovery_status();
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg._recovery_write_trigger() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,swarmpg,pg_temp AS $$
+BEGIN
+  -- Administrative maintenance and reconciliation use explicit guarded APIs.
+  IF session_user='agent_runtime' THEN PERFORM swarmpg._recovery_guard(); END IF;
+  RETURN NULL;
+END $$;
+DO $$
+DECLARE table_name text; f regprocedure;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY['memory','documents','events','idempotency'] LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS swarmpg_recovery_write ON swarmpg.%I',table_name);
+    EXECUTE format('CREATE TRIGGER swarmpg_recovery_write BEFORE INSERT OR UPDATE OR DELETE ON swarmpg.%I FOR EACH STATEMENT EXECUTE FUNCTION swarmpg._recovery_write_trigger()',table_name);
+  END LOOP;
+  FOR f IN SELECT p.oid::regprocedure FROM pg_proc p WHERE p.pronamespace='swarmpg'::regnamespace
+    AND (p.proname LIKE 'recovery\_%' OR p.proname LIKE '\_recovery\_%' OR p.proname='_next_fence')
+  LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC,agent_runtime',f); END LOOP;
+END $$;
+GRANT EXECUTE ON FUNCTION swarmpg.recovery_check(text,bigint,bigint) TO agent_runtime;
 COMMIT;

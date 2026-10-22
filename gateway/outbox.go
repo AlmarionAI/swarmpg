@@ -150,7 +150,7 @@ func outboxClaimLease(raw json.RawMessage) (int, *apiError) {
 // claim receipts, fencing and state changes; an adapter never updates tables.
 func (g *Gateway) outboxCall(ctx context.Context, query string, args ...any) (json.RawMessage, *apiError) {
 	var out json.RawMessage
-	if err := g.admin.QueryRow(ctx, query, args...).Scan(&out); err != nil {
+	if err := g.adminRow(ctx, query, args, &out); err != nil {
 		return nil, classifyPg(err)
 	}
 	return out, nil

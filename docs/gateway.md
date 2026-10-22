@@ -32,6 +32,9 @@ deployment.
 | `AUDIT_MODE` | `best-effort` | `best-effort` drops new receipts when the bounded spool is full; `strict` refuses SQL-query admission unless an intent can be durably reserved |
 | `AUDIT_SPOOL_CAPACITY` | `10000` | Maximum outstanding receipts for new admission, including active requests and retries; must be positive; a recovered backlog is never discarded to meet a smaller limit |
 | `AUDIT_SPOOL_DIR` | none | Optional persistent spool directory in best-effort mode; required on persistent storage in strict mode. One gateway process owns each directory |
+| `RECOVERY_SYSTEM_ID` | none | Pinned PostgreSQL system identifier; requires both recovery settings below |
+| `RECOVERY_TIMELINE` | none | Pinned writable-primary timeline |
+| `RECOVERY_GENERATION` | none | Externally allocated and SQL-activated recovery generation |
 
 The runtime pool holds 32 connections; administrative/audit, authentication and admission
 pools each hold 4, for up to 44 database connections per gateway. Organization admission
@@ -39,6 +42,14 @@ is always enabled in the production gateway. Its default local slots reserve 24 
 general work and 8 for task renew/release/complete. See [organization admission](admission.md)
 for `ADMISSION_*` settings, shared policies, overload codes and capacity planning. The
 gateway detects the kernel at startup and logs which mode it runs in.
+
+Set all three `RECOVERY_*` values for a guarded replicated deployment. The
+[recovery contract](recovery.md) requires synchronous durability, primary fencing and
+new pins after promotion; PITR additionally requires a new external generation and
+effect reconciliation before runtime or dispatch resumes. Legacy installations with no
+recovery activation retain their existing behavior. Unknown commit outcomes require the
+operation's durable retry identity; recovery mode does not make arbitrary SQL safe to
+replay blindly.
 
 ## API
 
@@ -64,7 +75,7 @@ gateway detects the kernel at startup and logs which mode it runs in.
 | `/v1/admin/outbox/…` | admin | claim/renew/ack/nack, inspect and retry external deliveries; [outbox contract and dispatcher](outbox.md) |
 | `POST /mcp` | agent | the same operations as MCP tools (see below) |
 | `GET /healthz` | none | liveness, request/error counters, pool sizes, audit status and local admission counters/capacities |
-| `GET /readyz` | none | controller presence, admission-pool connectivity and required admission catalog objects |
+| `GET /readyz` | none | controller presence, admission-pool connectivity and required admission catalog objects; configured recovery pins and synchronous durability barrier |
 
 `POST /v1/events` honours an `Idempotency-Key` header: a retry after a timeout replays the
 stored response instead of appending twice. Memory `expected_version` detects a stale or

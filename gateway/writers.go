@@ -174,7 +174,7 @@ func (g *Gateway) flushAudit(parent context.Context, batch []auditRecord) error 
 	}
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	_, err := g.admin.Exec(ctx, `
+	err := g.adminExec(ctx, `
         SELECT swarmpg.record_audit_receipt(i, a, o, t, h, s, p, r, b, f, m, st, e)
         FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::timestamptz[], $5::text[], $6::text[],
                     $7::int[], $8::int[], $9::bigint[], $10::bigint[], $11::float8[], $12::text[], $13::text[])
@@ -203,7 +203,7 @@ func (g *Gateway) seenWriter() {
 			}
 			clear(pending)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_, _ = g.admin.Exec(ctx, `UPDATE swarmpg.agents SET last_seen_at = now() WHERE id = ANY($1::uuid[])`, ids)
+			_ = g.adminExec(ctx, `UPDATE swarmpg.agents SET last_seen_at = now() WHERE id = ANY($1::uuid[])`, ids)
 			cancel()
 		}
 	}

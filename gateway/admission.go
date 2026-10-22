@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -91,8 +92,9 @@ type admissionStore interface {
 }
 
 type postgresAdmissionStore struct {
-	pool *pgxpool.Pool
-	gate chan struct{}
+	pool     *pgxpool.Pool
+	gate     chan struct{}
+	recovery *recoveryConfig
 }
 
 func (s *postgresAdmissionStore) call(ctx context.Context, query string, args ...any) (json.RawMessage, error) {
@@ -105,7 +107,16 @@ func (s *postgresAdmissionStore) call(ctx context.Context, query string, args ..
 	ctx, cancel := context.WithTimeout(ctx, admissionDBTimeout)
 	defer cancel()
 	var raw json.RawMessage
-	err := s.pool.QueryRow(ctx, query, args...).Scan(&raw)
+	if s.recovery == nil {
+		// Preserve the single-statement transaction in legacy mode: the server
+		// releases the shared bucket lock before returning the receipt. Recovery
+		// mode needs an explicit COMMIT to observe replication warnings.
+		err := s.pool.QueryRow(ctx, query, args...).Scan(&raw)
+		return raw, err
+	}
+	err := recoveryTransaction(ctx, s.pool, s.recovery, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, args...).Scan(&raw)
+	})
 	return raw, err
 }
 
@@ -364,6 +375,10 @@ func (g *Gateway) admissionRoutes(mux *http.ServeMux) {
 			to_regprocedure('swarmpg.admission_status(uuid)') IS NOT NULL`).Scan(&installed)
 		if err != nil || !installed {
 			writeErr(w, admissionUnavailable())
+			return
+		}
+		if err := g.recoveryReady(ctx); err != nil {
+			writeErr(w, classifyPg(err))
 			return
 		}
 		writeJSON(w, 200, map[string]bool{"ready": true})

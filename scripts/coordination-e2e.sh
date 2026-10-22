@@ -18,8 +18,10 @@ import os, sys
 if any(os.scandir(sys.argv[1])):
     sys.exit("COORD_REPORT_DIR must be an empty directory; existing evidence is retained")
 PY
-export COORD_GATEWAY_PORT=${COORD_GATEWAY_PORT:-55451}
-export COORD_DATABASE_PORT=${COORD_DATABASE_PORT:-55450}
+# Keep defaults outside Linux/macOS ephemeral ranges so outbound test traffic
+# cannot temporarily occupy a future service listener. Explicit ports are checked.
+export COORD_GATEWAY_PORT=${COORD_GATEWAY_PORT:-16451}
+export COORD_DATABASE_PORT=${COORD_DATABASE_PORT:-16450}
 export COORD_GATEWAY_BIN="$COORD_RUN_DIR/gateway"
 export COORD_DATABASE_NAME=coordination_test
 export COORD_DATABASE_USER=coord_admin

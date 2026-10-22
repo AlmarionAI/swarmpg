@@ -48,6 +48,7 @@ test:
 	cd outbox && go vet ./... && go test ./...
 	cd admission && go vet ./... && go test ./...
 	python3 -m unittest discover -s scripts -p 'test_outbox_recovery.py'
+	python3 -m unittest discover -s scripts -p 'test_recovery*.py'
 	cd bench && go vet ./...
 
 # Creates and crashes only its own disposable database and gateway.
@@ -60,4 +61,8 @@ outbox-test:
 admission-test:
 	scripts/admission-e2e.sh
 
-.PHONY: pg-start pg-stop gateway loadtest e2e kernel kernel-check test coordination-test outbox-test admission-test
+# Owns its primary/standby clusters, fault proxies, backup and receiver ledger.
+recovery-test:
+	python3 scripts/recovery-e2e.py
+
+.PHONY: pg-start pg-stop gateway loadtest e2e kernel kernel-check test coordination-test outbox-test admission-test recovery-test

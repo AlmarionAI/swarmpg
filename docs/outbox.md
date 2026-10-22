@@ -12,6 +12,12 @@ successful outcome on duplicates. Without that receiver contract, a crash after 
 external effect but before acknowledgement can produce duplicate effects. Database
 fencing alone cannot prevent an already-sent HTTP request from reaching a receiver.
 
+The [recovery contract](recovery.md) adds opt-in synchronous failover protection and
+PITR quarantine. An intentional rewind can remove an intent whose effect already
+happened; recreating it may produce a new idempotency key. Reconcile the receiver ledger
+and missing business history before resuming dispatch. Stable keys alone do not solve
+that recovery case.
+
 ## Commit intents with the result
 
 `POST /v1/tasks/{id}/complete`, MCP `task_complete`, and the four-argument SQL function
@@ -200,6 +206,8 @@ no automatic retention. Polling creates durable claim receipts, including empty 
 Configure polling and concurrency for the workload and monitor pending age, failed rows,
 attempts and growing tables. An unconfigured destination stays pending. This milestone
 does not establish cross-destination ordering, production throughput, backup/PITR
-acceptance or distributed failover guarantees. [Organization admission](admission.md)
+acceptance or distributed failover guarantees. The separate [recovery workload](recovery.md#reproducible-validation)
+tests those database failure scenarios under its explicit fencing, durability and
+reconciliation contract. [Organization admission](admission.md)
 limits agent requests across gateways; administrative outbox delivery calls and receiver
 capacity require separate operator limits.

@@ -224,28 +224,13 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// Claim waiters queue outside the shared HTTP budget. Reserving capacity for
-// lease holders prevents idle polls from starving renewals and completions.
-func (r *run) admitRequest(ctx context.Context, claim bool) (func(), error) {
-	if claim {
-		select {
-		case r.claimSem <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
+// HTTP capacity is held only while an attempt is in flight. Claim operations
+// separately retain their place across retries, outside this shared budget.
+func (r *run) admitRequest(ctx context.Context) (func(), error) {
 	select {
 	case r.sem <- struct{}{}:
-		return func() {
-			<-r.sem
-			if claim {
-				<-r.claimSem
-			}
-		}, nil
+		return func() { <-r.sem }, nil
 	case <-ctx.Done():
-		if claim {
-			<-r.claimSem
-		}
 		return nil, ctx.Err()
 	}
 }
@@ -295,9 +280,20 @@ func (r *run) callWithRetryPolicy(ctx context.Context, a agent, method, path str
 			return apiResponse{}, err
 		}
 	}
+	isClaim := method == "POST" && path == "/v1/tasks/claim"
+	if isClaim {
+		// Keep the operation's claim slot through retries. Rejoining every waiter
+		// after each 429 can consume the retry deadline without another useful
+		// attempt, especially while crash-retained permits await expiry.
+		select {
+		case r.claimSem <- struct{}{}:
+			defer func() { <-r.claimSem }()
+		case <-ctx.Done():
+			return apiResponse{}, ctx.Err()
+		}
+	}
 	for attempt := 0; ; attempt++ {
-		isClaim := method == "POST" && path == "/v1/tasks/claim"
-		release, err := r.admitRequest(ctx, isClaim)
+		release, err := r.admitRequest(ctx)
 		if err != nil {
 			return apiResponse{}, err
 		}
