@@ -156,8 +156,12 @@ func (g *Gateway) authenticate(ctx context.Context, r *http.Request) (*Agent, er
 		FROM swarmpg.agents WHERE token_hash = $1`, h).
 		Scan(&a.ID, &a.OrgID, &a.Name, &a.Shard, &a.RPS, &a.MaxRows, &a.MaxResultBytes,
 			&a.MaxConcurrency, &a.MaxCost, &a.StatementTimeoutMS, &a.ReadOnly, &a.Disabled, &expiresAt)
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, errAuth("invalid token")
+	}
+	if err != nil {
+		return nil, &apiError{Status: http.StatusServiceUnavailable, Code: "auth_unavailable",
+			Message: "authentication service temporarily unavailable", Retryable: true}
 	}
 	if expiresAt != nil && time.Now().After(*expiresAt) {
 		a.Expired = true
@@ -330,6 +334,20 @@ func classifyPg(err error) *apiError {
 			}
 		case "SW404": // memory key or version not found (schema.sql)
 			status, code = 404, "not_found"
+		case "PT400":
+			status, code = 400, "bad_request"
+		case "PT404":
+			status, code = 404, "not_found"
+		case "PT409":
+			status, code = 409, "task_conflict"
+		case "PT410":
+			status, code = 409, "stale_claim"
+		case "PT411":
+			status, code = 409, "lease_expired"
+		case "PT412":
+			status, code = 409, "inputs_changed"
+		case "PT413":
+			status, code = 413, "result_limit_exceeded"
 		}
 		return &apiError{Status: status, Code: code, Message: pg.Message,
 			Detail: pg.Detail, Hint: pg.Hint, Position: int(pg.Position), Retryable: retryable, Extra: extra}
@@ -677,14 +695,14 @@ func stableValue(v any) any {
 // ---- LLM-oriented schema description (static; same for every agent, no leakage).
 func (g *Gateway) describe(ctx context.Context, a *Agent) (string, *apiError) {
 	var sb strings.Builder
-	sb.WriteString("# Tables you can use. Rows are isolated to your agent_id by the database (row-level security).\n")
+	sb.WriteString("# Tables you can use. Private data is isolated to your agent_id; shared memory and task queues are scoped to your org by the database.\n")
 	err := g.withConn(ctx, a, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT c.table_name,
 			       string_agg(c.column_name || ' ' || c.data_type, ', ' ORDER BY c.ordinal_position)
 			FROM information_schema.columns c
 			WHERE c.table_schema = 'swarmpg'
-			  AND c.table_name IN ('memory','memory_history','documents','events')
+			  AND c.table_name IN ('memory','memory_history','documents','events','tasks','task_history')
 			GROUP BY c.table_name ORDER BY c.table_name`)
 		if err != nil {
 			return err
@@ -707,6 +725,12 @@ func (g *Gateway) describe(ctx context.Context, a *Agent) (string, *apiError) {
 		"  a stale version fails with version_conflict). Read the past with swarmpg.memory_at_version(key, v)\n" +
 		"  or swarmpg.memory_as_of(key, ts); swarmpg.memory_undo(key) restores the previous version.\n" +
 		"- Use swarmpg.documents (collection, body jsonb) for your own structured data; you cannot CREATE TABLE.\n" +
+		"- Task queues are shared within your org. Use task_enqueue(queue,key,payload,dependencies,inputs),\n" +
+		"  task_claim(queue,request_id,lease_ms), task_get(id), task_renew(id,fence,lease_ms),\n" +
+		"  task_release(id,fence), task_complete(id,fence,result), task_cancel(id) and task_history(id,limit).\n" +
+		"  Prefix SQL calls with swarmpg.; task tables/history are read-only. Keep fencing tokens as strings\n" +
+		"  in REST/MCP; SQL takes bigint. Reuse a claim request UUID on retry. Completion checks your current\n" +
+		"  unexpired lease and all declared producer-selected memory input versions in one transaction.\n" +
 		"- Parameterise with $1,$2,...; results are capped by your row and byte budgets.\n" +
 		"- On error you get a SQLSTATE code, detail, hint and position for repair.\n")
 	if err != nil {
@@ -1400,6 +1424,7 @@ func (g *Gateway) routes() http.Handler {
 		_, _ = w.Write(out)
 	}))
 
+	g.taskRoutes(mux)
 	mux.HandleFunc("/mcp", g.handleMCP)
 
 	return mux

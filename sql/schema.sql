@@ -668,3 +668,480 @@ CREATE EVENT TRIGGER swarmpg_block_ddl ON ddl_command_start
 DROP EVENT TRIGGER IF EXISTS swarmpg_block_ddl_rewrite;
 CREATE EVENT TRIGGER swarmpg_block_ddl_rewrite ON table_rewrite
   EXECUTE FUNCTION swarmpg.block_agent_ddl();
+
+-- ---------------------------------------------------------------------------
+-- Durable org-scoped task coordination. Agent DML is confined to the functions
+-- below: RLS protects reads, while state transitions use explicit authorization
+-- and row locks. Keep this additive migration atomic when upgrading a live DB.
+-- ---------------------------------------------------------------------------
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS swarmpg.tasks (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id uuid NOT NULL REFERENCES swarmpg.orgs(id),
+  created_by uuid NOT NULL,
+  queue text NOT NULL CHECK (length(queue) BETWEEN 1 AND 128),
+  task_key text NOT NULL CHECK (length(task_key) BETWEEN 1 AND 256),
+  payload jsonb NOT NULL CHECK (octet_length(payload::text) <= 65536),
+  dependencies uuid[] NOT NULL DEFAULT '{}',
+  inputs jsonb NOT NULL DEFAULT '[]',
+  state text NOT NULL DEFAULT 'ready' CHECK (state IN ('ready', 'claimed', 'completed', 'cancelled')),
+  owner_agent_id uuid,
+  fence bigint NOT NULL DEFAULT 0 CHECK (fence >= 0),
+  lease_until timestamptz,
+  attempts bigint NOT NULL DEFAULT 0,
+  result jsonb CHECK (octet_length(result::text) <= 65536),
+  revision bigint NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  completed_at timestamptz,
+  UNIQUE (org_id, queue, task_key),
+  UNIQUE (org_id, id),
+  CHECK (state <> 'claimed' OR (owner_agent_id IS NOT NULL AND lease_until IS NOT NULL)),
+  CHECK ((state = 'completed') = (completed_at IS NOT NULL)),
+  CHECK ((state = 'completed') = (result IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS tasks_claim_idx ON swarmpg.tasks(org_id, queue, created_at, id)
+  WHERE state IN ('ready', 'claimed');
+
+CREATE TABLE IF NOT EXISTS swarmpg.task_history (
+  task_id uuid NOT NULL,
+  org_id uuid NOT NULL,
+  revision bigint NOT NULL,
+  event text NOT NULL,
+  actor_agent_id uuid,
+  fence bigint NOT NULL,
+  state text NOT NULL,
+  owner_agent_id uuid,
+  lease_until timestamptz,
+  at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  detail jsonb NOT NULL DEFAULT '{}',
+  PRIMARY KEY (task_id, revision),
+  FOREIGN KEY (org_id, task_id) REFERENCES swarmpg.tasks(org_id, id) ON DELETE CASCADE
+);
+
+-- A claim retry must never quietly claim a second task. The receipt, task
+-- transition and history commit together, including an empty queue response.
+CREATE TABLE IF NOT EXISTS swarmpg.task_claim_requests (
+  org_id uuid NOT NULL REFERENCES swarmpg.orgs(id),
+  agent_id uuid NOT NULL,
+  request_id uuid NOT NULL,
+  queue text NOT NULL,
+  lease_ms integer NOT NULL,
+  response jsonb,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (org_id, agent_id, request_id)
+);
+
+ALTER TABLE swarmpg.tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.tasks FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS task_read ON swarmpg.tasks;
+CREATE POLICY task_read ON swarmpg.tasks FOR SELECT
+  USING (org_id = swarmpg.current_org());
+ALTER TABLE swarmpg.task_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.task_history FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS task_history_read ON swarmpg.task_history;
+CREATE POLICY task_history_read ON swarmpg.task_history FOR SELECT
+  USING (org_id = swarmpg.current_org());
+ALTER TABLE swarmpg.task_claim_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.task_claim_requests FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON swarmpg.tasks, swarmpg.task_history, swarmpg.task_claim_requests FROM PUBLIC, agent_runtime;
+GRANT SELECT ON swarmpg.tasks, swarmpg.task_history TO agent_runtime;
+
+-- These helpers are private to the schema owner. In particular callers cannot
+-- supply another agent identity to a privileged transition function.
+CREATE OR REPLACE FUNCTION swarmpg._task_authorize(p_write boolean) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE a swarmpg.agents%ROWTYPE;
+BEGIN
+  SELECT * INTO a FROM swarmpg.agents
+  WHERE id = swarmpg.current_agent() AND org_id = swarmpg.current_org();
+  IF NOT FOUND OR a.disabled OR (a.token_expires_at IS NOT NULL AND a.token_expires_at <= clock_timestamp()) THEN
+    RAISE EXCEPTION 'task operation requires an enabled agent in the current organization' USING ERRCODE = '42501';
+  END IF;
+  IF p_write AND a.read_only THEN
+    RAISE EXCEPTION 'read-only agents cannot change tasks' USING ERRCODE = '42501';
+  END IF;
+END $$;
+
+-- Take this barrier only after task/input locks, not at request entry. An
+-- administrator can therefore revoke an agent while it waits for work. Once
+-- admitted here, the registry row remains share-locked through commit, ordering
+-- the transition before a subsequent revocation. Expiry is still checked using
+-- database wall time, including again at the final response boundary.
+CREATE OR REPLACE FUNCTION swarmpg._task_authorize_locked(p_write boolean) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+BEGIN
+  PERFORM 1 FROM swarmpg.agents
+  WHERE id = swarmpg.current_agent() AND org_id = swarmpg.current_org() FOR SHARE;
+  PERFORM swarmpg._task_authorize(p_write);
+END $$;
+
+-- Bound task receipts in SQL as well as in typed REST/MCP handlers. A raw SQL
+-- call through /query must not commit a transition whose receipt would require
+-- truncation. jsonb text includes insignificant spaces, making this conservative;
+-- also account for escaping performed by Go's default JSON encoder.
+CREATE OR REPLACE FUNCTION swarmpg._task_response(p_response jsonb, p_write boolean DEFAULT false) RETURNS jsonb
+LANGUAGE plpgsql SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE row_limit integer; byte_limit bigint; body text := p_response::text; encoded_bytes bigint;
+BEGIN
+  IF p_write THEN
+    PERFORM swarmpg._task_authorize_locked(true);
+  ELSE
+    -- Read-only transactions cannot take row locks, and have no transition
+    -- that needs serialization against an administrator's revocation.
+    PERFORM swarmpg._task_authorize(false);
+  END IF;
+  SELECT max_rows, max_result_bytes INTO row_limit, byte_limit FROM swarmpg.agents
+  WHERE id = swarmpg.current_agent() AND org_id = swarmpg.current_org();
+  encoded_bytes := octet_length(body)
+    + 5::bigint * (length(body) - length(translate(body, '<>&', '')))
+    + 3::bigint * (length(body) - length(translate(body, chr(8232) || chr(8233), '')));
+  IF row_limit < 1 OR (byte_limit > 0 AND encoded_bytes > byte_limit) THEN
+    RAISE EXCEPTION 'complete task response exceeds the agent result budget; operation was not committed'
+      USING ERRCODE = 'PT413', HINT = 'Raise the result budget before retrying; task receipts are never truncated.';
+  END IF;
+  RETURN p_response;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg._task_json(t swarmpg.tasks) RETURNS jsonb
+LANGUAGE sql STABLE SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+  SELECT to_jsonb(t) || jsonb_build_object('fence', t.fence::text)
+$$;
+
+CREATE OR REPLACE FUNCTION swarmpg._task_event(t swarmpg.tasks, p_event text,
+                                               p_actor uuid, p_detail jsonb DEFAULT '{}') RETURNS void
+LANGUAGE sql SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+  INSERT INTO swarmpg.task_history(task_id, org_id, revision, event, actor_agent_id,
+                                  fence, state, owner_agent_id, lease_until, detail)
+  VALUES (t.id, t.org_id, t.revision, p_event, p_actor, t.fence, t.state,
+          t.owner_agent_id, t.lease_until, p_detail)
+$$;
+
+CREATE OR REPLACE FUNCTION swarmpg._task_lease(p_lease_ms integer) RETURNS void
+LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+BEGIN
+  IF p_lease_ms IS NULL OR p_lease_ms < 100 OR p_lease_ms > 300000 THEN
+    RAISE EXCEPTION 'lease_ms must be between 100 and 300000' USING ERRCODE = 'PT400';
+  END IF;
+END $$;
+
+-- Normalize the input set so ordering and UUID spelling do not affect enqueue
+-- replay. Versions are integral positive JSON numbers, not floating-point IDs.
+CREATE OR REPLACE FUNCTION swarmpg._task_inputs(p_inputs jsonb) RETURNS jsonb
+LANGUAGE plpgsql SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE item jsonb; producer uuid; input_key text; input_version bigint; normalized jsonb := '[]';
+BEGIN
+  IF p_inputs IS NULL OR jsonb_typeof(p_inputs) <> 'array' OR jsonb_array_length(p_inputs) > 64 THEN
+    RAISE EXCEPTION 'inputs must be an array of at most 64 producer/key/version references' USING ERRCODE = 'PT400';
+  END IF;
+  FOR item IN SELECT value FROM jsonb_array_elements(p_inputs) LOOP
+    IF jsonb_typeof(item) <> 'object' OR NOT (item ?& ARRAY['agent_id','key','version'])
+       OR item - ARRAY['agent_id','key','version'] <> '{}'::jsonb
+       OR jsonb_typeof(item->'agent_id') <> 'string' OR jsonb_typeof(item->'key') <> 'string'
+       OR jsonb_typeof(item->'version') <> 'number'
+       OR (item->>'version') !~ '^[1-9][0-9]*$' THEN
+      RAISE EXCEPTION 'each input requires exactly agent_id, key and a positive integer version' USING ERRCODE = 'PT400';
+    END IF;
+    BEGIN
+      producer := (item->>'agent_id')::uuid;
+      input_version := (item->>'version')::bigint;
+    EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+      RAISE EXCEPTION 'invalid input agent_id or version' USING ERRCODE = 'PT400';
+    END;
+    input_key := item->>'key';
+    IF length(input_key) NOT BETWEEN 1 AND 256 THEN
+      RAISE EXCEPTION 'input key must contain 1 to 256 characters' USING ERRCODE = 'PT400';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(normalized) x
+               WHERE x->>'agent_id' = producer::text AND x->>'key' = input_key) THEN
+      RAISE EXCEPTION 'an input producer/key may appear only once' USING ERRCODE = 'PT400';
+    END IF;
+    normalized := normalized || jsonb_build_array(jsonb_build_object('agent_id', producer,
+                                                    'key', input_key, 'version', input_version));
+  END LOOP;
+  RETURN coalesce((SELECT jsonb_agg(x ORDER BY x->>'agent_id', x->>'key')
+                   FROM jsonb_array_elements(normalized) x), '[]'::jsonb);
+END $$;
+
+-- FOR SHARE holds every declared live input stable until completion commits.
+-- The same lock order in every task reduces lock-order inversions. Visibility
+-- is rechecked after waiting for a concurrent publisher, not inferred from an
+-- earlier unlocked read. A revoked share is an input change too.
+CREATE OR REPLACE FUNCTION swarmpg._task_check_inputs(p_inputs jsonb, p_enqueuing boolean DEFAULT false) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE item jsonb; current_version bigint;
+BEGIN
+  FOR item IN SELECT value FROM jsonb_array_elements(p_inputs)
+              ORDER BY value->>'agent_id', value->>'key' LOOP
+    SELECT m.version INTO current_version FROM swarmpg.memory m
+    WHERE m.agent_id = (item->>'agent_id')::uuid AND m.key = item->>'key'
+      AND m.org_id = swarmpg.current_org()
+      AND (m.agent_id = swarmpg.current_agent() OR m.shared)
+    FOR SHARE;
+    IF NOT FOUND AND p_enqueuing THEN
+      RAISE EXCEPTION 'task input not found' USING ERRCODE = 'PT404';
+    END IF;
+    IF NOT FOUND OR current_version <> (item->>'version')::bigint THEN
+      RAISE EXCEPTION 'a declared task input is unavailable or changed' USING ERRCODE = 'PT412',
+        HINT = 'Read the selected producers again and enqueue a new task with current input versions.';
+    END IF;
+  END LOOP;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg._task_require_claim(t swarmpg.tasks, p_fence bigint) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+BEGIN
+  IF p_fence IS NULL OR p_fence < 1 THEN
+    RAISE EXCEPTION 'fence must be a positive integer' USING ERRCODE = 'PT400';
+  END IF;
+  IF t.state <> 'claimed' OR t.owner_agent_id IS DISTINCT FROM swarmpg.current_agent() OR t.fence <> p_fence THEN
+    RAISE EXCEPTION 'task claim is no longer owned by this agent and fence' USING ERRCODE = 'PT410';
+  END IF;
+  IF t.lease_until <= clock_timestamp() THEN
+    RAISE EXCEPTION 'task lease has expired' USING ERRCODE = 'PT411';
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_enqueue(p_queue text, p_key text, p_payload jsonb,
+                        p_dependencies uuid[] DEFAULT '{}', p_inputs jsonb DEFAULT '[]') RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE; deps uuid[]; input_set jsonb; dependency uuid; inserted boolean;
+BEGIN
+  PERFORM swarmpg._task_authorize(true);
+  IF p_queue IS NULL OR length(p_queue) NOT BETWEEN 1 AND 128
+     OR p_key IS NULL OR length(p_key) NOT BETWEEN 1 AND 256
+     OR p_payload IS NULL OR octet_length(p_payload::text) > 65536 THEN
+    RAISE EXCEPTION 'queue/key required (128/256 characters); payload must be at most 64 KiB' USING ERRCODE = 'PT400';
+  END IF;
+  IF p_dependencies IS NULL OR cardinality(p_dependencies) > 64
+     OR coalesce(array_ndims(p_dependencies), 1) <> 1 OR array_position(p_dependencies, NULL) IS NOT NULL THEN
+    RAISE EXCEPTION 'dependencies must contain at most 64 distinct non-null task IDs' USING ERRCODE = 'PT400';
+  END IF;
+  SELECT coalesce(array_agg(DISTINCT x ORDER BY x), '{}'::uuid[]) INTO deps FROM unnest(p_dependencies) x;
+  IF cardinality(deps) <> cardinality(p_dependencies) THEN
+    RAISE EXCEPTION 'duplicate task dependency' USING ERRCODE = 'PT400';
+  END IF;
+  input_set := swarmpg._task_inputs(p_inputs);
+
+  INSERT INTO swarmpg.tasks(org_id, created_by, queue, task_key, payload, dependencies, inputs)
+  VALUES (swarmpg.current_org(), swarmpg.current_agent(), p_queue, p_key, p_payload, deps, input_set)
+  ON CONFLICT (org_id, queue, task_key) DO NOTHING RETURNING * INTO t;
+  inserted := FOUND;
+  IF NOT inserted THEN
+    SELECT * INTO t FROM swarmpg.tasks
+    WHERE org_id = swarmpg.current_org() AND queue = p_queue AND task_key = p_key FOR SHARE;
+    IF t.created_by <> swarmpg.current_agent() OR t.payload <> p_payload
+       OR t.dependencies <> deps OR t.inputs <> input_set THEN
+      RAISE EXCEPTION 'task key already identifies a different enqueue request' USING ERRCODE = 'PT409';
+    END IF;
+    RETURN swarmpg._task_response(jsonb_build_object('task', swarmpg._task_json(t), 'replayed', true), true);
+  END IF;
+  -- Dependencies can only name pre-existing tasks: no mutation can later add a
+  -- back edge, and every dependency belongs to the same organization.
+  FOREACH dependency IN ARRAY deps LOOP
+    PERFORM 1 FROM swarmpg.tasks WHERE id = dependency AND org_id = swarmpg.current_org() AND id <> t.id;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'task dependency not found in this organization' USING ERRCODE = 'PT404';
+    END IF;
+  END LOOP;
+  PERFORM swarmpg._task_check_inputs(input_set, true);
+  PERFORM swarmpg._task_authorize_locked(true);
+  PERFORM swarmpg._task_event(t, 'enqueued', swarmpg.current_agent());
+  RETURN swarmpg._task_response(jsonb_build_object('task', swarmpg._task_json(t), 'replayed', false), true);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_get(p_id uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE;
+BEGIN
+  PERFORM swarmpg._task_authorize(false);
+  SELECT * INTO t FROM swarmpg.tasks WHERE id = p_id AND org_id = swarmpg.current_org();
+  IF NOT FOUND THEN RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404'; END IF;
+  RETURN swarmpg._task_response(swarmpg._task_json(t));
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_claim(p_queue text, p_request_id uuid,
+                                               p_lease_ms integer DEFAULT 30000) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE; receipt swarmpg.task_claim_requests%ROWTYPE; v_response jsonb;
+BEGIN
+  PERFORM swarmpg._task_authorize(true);
+  PERFORM swarmpg._task_lease(p_lease_ms);
+  IF p_queue IS NULL OR length(p_queue) NOT BETWEEN 1 AND 128 OR p_request_id IS NULL THEN
+    RAISE EXCEPTION 'queue and claim request_id are required' USING ERRCODE = 'PT400';
+  END IF;
+  INSERT INTO swarmpg.task_claim_requests(org_id, agent_id, request_id, queue, lease_ms)
+  VALUES (swarmpg.current_org(), swarmpg.current_agent(), p_request_id, p_queue, p_lease_ms)
+  ON CONFLICT (org_id, agent_id, request_id) DO NOTHING;
+  SELECT * INTO receipt FROM swarmpg.task_claim_requests
+  WHERE org_id = swarmpg.current_org() AND agent_id = swarmpg.current_agent() AND request_id = p_request_id FOR UPDATE;
+  IF receipt.queue <> p_queue OR receipt.lease_ms <> p_lease_ms THEN
+    RAISE EXCEPTION 'claim request_id already identifies different parameters' USING ERRCODE = 'PT409';
+  END IF;
+  IF receipt.response IS NOT NULL THEN
+    RETURN swarmpg._task_response(receipt.response || jsonb_build_object('replayed', true), true);
+  END IF;
+  SELECT candidate.* INTO t FROM swarmpg.tasks candidate
+  WHERE candidate.org_id = swarmpg.current_org() AND candidate.queue = p_queue
+    AND (candidate.state = 'ready' OR (candidate.state = 'claimed' AND candidate.lease_until <= clock_timestamp()))
+    AND NOT EXISTS (
+      SELECT 1 FROM unnest(candidate.dependencies) dep
+      LEFT JOIN swarmpg.tasks parent ON parent.id = dep AND parent.org_id = candidate.org_id
+      WHERE parent.state IS DISTINCT FROM 'completed')
+  ORDER BY candidate.created_at, candidate.id LIMIT 1 FOR UPDATE OF candidate SKIP LOCKED;
+  IF FOUND THEN
+    PERFORM swarmpg._task_authorize_locked(true);
+    UPDATE swarmpg.tasks SET state = 'claimed', owner_agent_id = swarmpg.current_agent(),
+      fence = fence + 1, lease_until = clock_timestamp() + p_lease_ms * interval '1 millisecond',
+      attempts = attempts + 1, revision = revision + 1, updated_at = clock_timestamp()
+    WHERE id = t.id RETURNING * INTO t;
+    PERFORM swarmpg._task_event(t, 'claimed', swarmpg.current_agent(), jsonb_build_object('request_id', p_request_id));
+    v_response := jsonb_build_object('task', swarmpg._task_json(t), 'replayed', false);
+  ELSE
+    v_response := jsonb_build_object('task', NULL, 'replayed', false);
+  END IF;
+  UPDATE swarmpg.task_claim_requests SET response = v_response
+  WHERE org_id = swarmpg.current_org() AND agent_id = swarmpg.current_agent() AND request_id = p_request_id;
+  RETURN swarmpg._task_response(v_response, true);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_renew(p_id uuid, p_fence bigint,
+                                               p_lease_ms integer DEFAULT 30000) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE;
+BEGIN
+  PERFORM swarmpg._task_authorize(true);
+  PERFORM swarmpg._task_lease(p_lease_ms);
+  SELECT * INTO t FROM swarmpg.tasks WHERE id = p_id AND org_id = swarmpg.current_org() FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404'; END IF;
+  PERFORM swarmpg._task_authorize_locked(true);
+  PERFORM swarmpg._task_require_claim(t, p_fence);
+  UPDATE swarmpg.tasks SET lease_until = greatest(lease_until, clock_timestamp() + p_lease_ms * interval '1 millisecond'),
+    revision = revision + 1, updated_at = clock_timestamp() WHERE id = t.id RETURNING * INTO t;
+  PERFORM swarmpg._task_event(t, 'renewed', swarmpg.current_agent());
+  RETURN swarmpg._task_response(swarmpg._task_json(t), true);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_release(p_id uuid, p_fence bigint) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE;
+BEGIN
+  PERFORM swarmpg._task_authorize(true);
+  SELECT * INTO t FROM swarmpg.tasks WHERE id = p_id AND org_id = swarmpg.current_org() FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404'; END IF;
+  PERFORM swarmpg._task_authorize_locked(true);
+  PERFORM swarmpg._task_require_claim(t, p_fence);
+  UPDATE swarmpg.tasks SET state = 'ready', owner_agent_id = NULL, lease_until = NULL,
+    revision = revision + 1, updated_at = clock_timestamp() WHERE id = t.id RETURNING * INTO t;
+  PERFORM swarmpg._task_event(t, 'released', swarmpg.current_agent());
+  RETURN swarmpg._task_response(swarmpg._task_json(t), true);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_complete(p_id uuid, p_fence bigint, p_result jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE;
+BEGIN
+  PERFORM swarmpg._task_authorize(true);
+  IF p_result IS NULL OR octet_length(p_result::text) > 65536 THEN
+    RAISE EXCEPTION 'result must be a JSON value of at most 64 KiB' USING ERRCODE = 'PT400';
+  END IF;
+  IF p_fence IS NULL OR p_fence < 1 THEN
+    RAISE EXCEPTION 'fence must be a positive integer' USING ERRCODE = 'PT400';
+  END IF;
+  SELECT * INTO t FROM swarmpg.tasks WHERE id = p_id AND org_id = swarmpg.current_org() FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404'; END IF;
+  IF t.state = 'completed' AND t.owner_agent_id = swarmpg.current_agent() AND t.fence = p_fence THEN
+    IF t.result IS DISTINCT FROM p_result THEN
+      RAISE EXCEPTION 'completed task already contains a different result' USING ERRCODE = 'PT409';
+    END IF;
+    RETURN swarmpg._task_response(jsonb_build_object('task', swarmpg._task_json(t), 'replayed', true), true);
+  END IF;
+  PERFORM swarmpg._task_require_claim(t, p_fence);
+  PERFORM swarmpg._task_check_inputs(t.inputs);
+  PERFORM swarmpg._task_authorize_locked(true);
+  -- Input and authorization locks may outlast the remaining lease.
+  PERFORM swarmpg._task_require_claim(t, p_fence);
+  UPDATE swarmpg.tasks SET state = 'completed', result = p_result, lease_until = NULL,
+    completed_at = clock_timestamp(), updated_at = clock_timestamp(), revision = revision + 1
+  WHERE id = t.id RETURNING * INTO t;
+  PERFORM swarmpg._task_event(t, 'completed', swarmpg.current_agent());
+  RETURN swarmpg._task_response(jsonb_build_object('task', swarmpg._task_json(t), 'replayed', false), true);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_cancel(p_id uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE;
+BEGIN
+  PERFORM swarmpg._task_authorize(true);
+  SELECT * INTO t FROM swarmpg.tasks WHERE id = p_id AND org_id = swarmpg.current_org() FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404'; END IF;
+  PERFORM swarmpg._task_authorize_locked(true);
+  IF t.created_by <> swarmpg.current_agent() THEN
+    RAISE EXCEPTION 'only the task creator may cancel it' USING ERRCODE = '42501';
+  END IF;
+  IF t.state = 'completed' THEN
+    RAISE EXCEPTION 'a completed task is immutable' USING ERRCODE = 'PT409';
+  END IF;
+  IF t.state = 'cancelled' THEN RETURN swarmpg._task_response(swarmpg._task_json(t), true); END IF;
+  UPDATE swarmpg.tasks SET state = 'cancelled', owner_agent_id = NULL, lease_until = NULL,
+    fence = fence + 1, revision = revision + 1, updated_at = clock_timestamp()
+  WHERE id = t.id RETURNING * INTO t;
+  PERFORM swarmpg._task_event(t, 'cancelled', swarmpg.current_agent());
+  RETURN swarmpg._task_response(swarmpg._task_json(t), true);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_history(p_id uuid, p_limit integer DEFAULT 50) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+BEGIN
+  PERFORM swarmpg._task_authorize(false);
+  IF p_limit IS NULL OR p_limit < 1 OR p_limit > 1000 THEN
+    RAISE EXCEPTION 'history limit must be between 1 and 1000' USING ERRCODE = 'PT400';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM swarmpg.tasks WHERE id = p_id AND org_id = swarmpg.current_org()) THEN
+    RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404';
+  END IF;
+  RETURN swarmpg._task_response(jsonb_build_object('events', coalesce((SELECT jsonb_agg(to_jsonb(h) || jsonb_build_object('fence', h.fence::text)
+                                                               ORDER BY h.revision DESC)
+    FROM (SELECT * FROM swarmpg.task_history WHERE task_id = p_id AND org_id = swarmpg.current_org()
+          ORDER BY revision DESC LIMIT p_limit) h), '[]'::jsonb)));
+END $$;
+
+-- Administrative recovery is explicitly separate from agent authorization.
+-- It never rewrites completed results or refreshes declared input snapshots.
+CREATE OR REPLACE FUNCTION swarmpg.task_recover(p_id uuid, p_reason text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE;
+BEGIN
+  IF p_reason IS NULL OR length(p_reason) NOT BETWEEN 1 AND 1000 THEN
+    RAISE EXCEPTION 'recovery requires a reason of 1 to 1000 characters' USING ERRCODE = 'PT400';
+  END IF;
+  SELECT * INTO t FROM swarmpg.tasks WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404'; END IF;
+  IF t.state IN ('completed', 'cancelled') THEN
+    RAISE EXCEPTION 'a terminal task cannot be recovered' USING ERRCODE = 'PT409';
+  END IF;
+  UPDATE swarmpg.tasks SET state = 'ready', owner_agent_id = NULL, lease_until = NULL,
+    fence = fence + 1, revision = revision + 1, updated_at = clock_timestamp()
+  WHERE id = t.id RETURNING * INTO t;
+  PERFORM swarmpg._task_event(t, 'recovered', NULL, jsonb_build_object('reason', p_reason));
+  RETURN swarmpg._task_json(t);
+END $$;
+
+-- Revoke default PUBLIC execution for every task function, including private
+-- helpers and administrative recovery. Grant only the intended agent surface.
+DO $$
+DECLARE f regprocedure;
+BEGIN
+  FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
+           WHERE p.pronamespace = 'swarmpg'::regnamespace
+             AND (p.proname LIKE 'task\_%' OR p.proname LIKE '\_task\_%')
+  LOOP
+    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC, agent_runtime', f);
+  END LOOP;
+END $$;
+GRANT EXECUTE ON FUNCTION swarmpg.task_enqueue(text,text,jsonb,uuid[],jsonb),
+  swarmpg.task_get(uuid), swarmpg.task_claim(text,uuid,integer), swarmpg.task_renew(uuid,bigint,integer),
+  swarmpg.task_release(uuid,bigint), swarmpg.task_complete(uuid,bigint,jsonb), swarmpg.task_cancel(uuid),
+  swarmpg.task_history(uuid,integer) TO agent_runtime;
+COMMIT;

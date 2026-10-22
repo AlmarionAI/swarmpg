@@ -57,7 +57,8 @@ const mcpInstructions = "SwarmPG gives you a private, database-enforced slice of
 	"Your identity, org and budgets come from your token and cannot be changed from SQL. " +
 	"You have versioned key/value JSON memory (optionally shared with your org) with compare-and-set " +
 	"writes, history and undo, JSON documents in named " +
-	"collections, and an append-only, hash-chained event journal. Call schema first, then use query " +
+	"collections, an append-only, hash-chained event journal, and org-shared task queues with leases, " +
+	"fencing tokens and atomic completion. Call schema first, then use query " +
 	"for SQL with $1, $2 parameters; errors return a SQLSTATE code, hint and position so you can fix " +
 	"the statement and retry."
 
@@ -91,7 +92,7 @@ func annotations(title string, readOnly, destructive, idempotent bool) map[strin
 }
 
 // mcpTools is in the order tools/list returns them.
-var mcpTools = []mcpTool{
+var mcpTools = append([]mcpTool{
 	{mcpToolDef{
 		Name:  "schema",
 		Title: "Describe your tables",
@@ -192,7 +193,7 @@ var mcpTools = []mcpTool{
 		}, "kind"),
 		Annotations: annotations("Append to your journal", false, false, false),
 	}, toolEventsAppend},
-}
+}, taskMCPTools...)
 
 var mcpToolDefs, mcpToolsByName = func() ([]mcpToolDef, map[string]mcpTool) {
 	defs := make([]mcpToolDef, len(mcpTools))

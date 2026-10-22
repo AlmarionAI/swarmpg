@@ -26,12 +26,13 @@ client from choosing an identity. This is the advantage to preserve and measure.
 | Budgets | Gateway rate/concurrency/time/result limits; kernel plan-cost gate and cumulative attempted-write cap |
 | Memory | Per-key versions, compare-and-set, history, time reads and undo; producer identity, explicit producer selection and shared listing |
 | Records | Hash-chained per-agent journal; SQL-query audit with bounded retry spooling and a strict durable-intent mode |
-| Validation | Go tests, stock/kernel e2e probes and upstream kernel regressions; a small independent-agent benchmark |
+| Tasks | Org-shared queues, immutable dependencies/input snapshots, atomic claims, leases, fencing, completion replay and attributed history |
+| Validation | Go tests, stock/kernel e2e probes, upstream kernel regressions and a reproducible collaborative failure workload |
 
 Memory history is logical history for this schema, not PostgreSQL storage-level time
 travel. A memory key belongs to one producer. Selecting a peer's shared value does not
-grant permission to overwrite it. There is no task queue, lease protocol, fencing-token
-API, shared editable workspace or branch/merge workflow yet.
+grant permission to overwrite it. Task state is shared within an org through controlled
+SQL transitions. Shared editable workspaces and branch/merge workflows remain unbuilt.
 
 The write budget is cumulative across nested function execution, CTEs and triggers.
 Internal writes count too: a memory update also records history. It is a cap on attempted
@@ -57,33 +58,35 @@ SQL query and persists completion afterwards. The SQL transaction and audit comp
 are not atomic: a crash between them produces `audit_outcome_unknown`. Stable receipt
 IDs deduplicate delivery, not execution of arbitrary SQL. See [audit delivery](gateway.md#audit-delivery).
 
-## Next milestone: durable task coordination
+## Durable task coordination
 
-**Planned; not implemented.** Build coordination on the current transactional database
-before introducing workspaces or replacing PostgreSQL internals.
+**Implemented in the schema, REST and MCP.** The [task contract](tasks.md) is enforced
+inside PostgreSQL; it adds no kernel patch or alternative storage layer.
 
-1. **Task claims.** A worker atomically claims an eligible task; ownership and state
-   transitions are checked in the database. Concurrent claimers cannot both acquire the
-   same current claim. Include organization boundaries and explicit authorization.
-2. **Leases and recovery.** Claims expire using a documented database-time rule. Heartbeats
+1. **Task claims.** `FOR UPDATE SKIP LOCKED` selects one eligible org task after its
+   dependencies complete. A durable per-agent request UUID prevents a lost reply from
+   causing a retry to claim another task. Direct agent DML on task tables is revoked.
+2. **Leases and recovery.** Claims expire using database `clock_timestamp()`. Heartbeats
    renew a current claim; another worker can reclaim abandoned work. Agents do not hold
    database transactions open while waiting on a model or an external tool.
-3. **Fencing tokens.** Each new claim gets a monotonically advancing token. Every task
+3. **Fencing tokens.** Each new claim gets a monotonically advancing per-task token. Every task
    state update and completion checks it, so a paused worker cannot resume and overwrite
    the new owner's result. External systems must support fencing or idempotency for the
    same guarantee to extend beyond PostgreSQL.
-4. **Atomic completion.** Persist the result and transition the task to completed in one
-   transaction, guarded by the current claim/token. Retried completion returns a defined
-   outcome. If publishing an external event is required, use an outbox and explicitly
-   document its delivery/retry contract; do not promise exactly-once external effects.
+4. **Atomic completion.** Result, completed state and history commit together. The
+   current owner/fence and unexpired lease are checked before and after locking all
+   declared producer-selected memory inputs and checking their versions. Identical
+   successful completion retries replay the result. No external outbox or exactly-once
+   external effect is promised.
 
-Define the SQL contract first, then expose it consistently over REST and MCP. Add clear
-conflict, stale-claim and expired-lease errors, bounded retries, inspectable task history
-and administrative recovery. This milestone does not require a new page service.
+SQL, REST and MCP expose matching conflict, stale-claim, expired-lease and changed-input
+errors. The task creator can cancel; an administrator can requeue a nonterminal task
+with a reason while invalidating its fence. History and claim receipts persist without
+automatic retention. Read-only/disabled/expired-agent checks run inside SQL mutations.
 
 ## Acceptance workload: collaborative work under failure
 
-**Planned; not implemented.** Run 100–1,000 worker identities on a shared task graph with
+The [reproducible runner](../coordination/README.md) exercises 100–1,000 worker identities on a shared task graph with
 real dependencies and competing claims. Mix workers that complete useful steps with
 workers that retry, crash, pause past their lease, or attempt stale writes. Exercise
 producer-selected shared memory as input to the workflow. Include one noisy organization

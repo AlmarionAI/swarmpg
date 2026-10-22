@@ -26,7 +26,10 @@ is enforcing this pooled principal even when an agent bypasses the gateway.
   an open transaction. Shared reads identify their producer; callers can choose a
   producer or list the visible shared values. Sharing is owner-written and org-readable,
   not a jointly editable workspace.
-- **REST and MCP.** Eight MCP tools expose queries, schema, memory and the event journal,
+- **Task coordination.** Org-shared queues, dependency-aware claims, expiring leases,
+  monotonic fencing tokens and atomic completion against declared memory versions.
+  Durable request receipts resolve retries; attributed history commits with transitions.
+- **REST and MCP.** Sixteen MCP tools expose queries, schema, memory, tasks and the event journal,
   with structured errors for clients to handle.
 - **Journal and query audit.** The event journal is append-only and hash-chained per
   agent. SQL-query audit has a bounded retry spool and optional disk persistence; strict mode
@@ -91,11 +94,12 @@ not evidence of production readiness or a completed public launch. CI defines Go
 end-to-end probes and upstream kernel regression tests. SDK interoperability and benchmark
 results reported for earlier revisions do not substitute for checks on the current commit.
 
-The next milestone is **durable task coordination**: claims, leases, fencing tokens and
-atomic completion, followed by a 100–1,000-worker collaborative workload that injects
-crashes, retries, stale workers and shared-state contention. It must compare stock and
-kernel deployments and measure correct completed work. Those coordination primitives and
-that workload are **not implemented yet**.
+**Durable task coordination** is implemented in the schema and exposed through REST/MCP.
+The [task contract](docs/tasks.md) defines ownership, lease timing, fencing, input-version
+validation and retry behavior. The [failure workload](coordination/README.md)
+exercises 100–1,000 worker identities against stock and kernel deployments, with restarts,
+abandoned claims, duplicate requests, changed inputs and a noisy tenant. Its reports count
+correct completed work and record the conditions tested; they are not a production scale guarantee.
 
 Workspaces come after that proof. Storage branching, catalog virtualization, process-model
 rewrites and scale-to-zero are deferred research, outside the next milestone.
@@ -106,6 +110,7 @@ separate implemented behavior from planned work.
 
 - [Getting started](docs/getting-started.md): REST, MCP and SQL, step by step
 - [Gateway reference](docs/gateway.md): the API, configuration and what each layer enforces
+- [Tasks](docs/tasks.md): claims, leases, fencing, atomic completion and retry contracts
 - [Threat model](docs/THREAT-MODEL.md): attackers, controls, the probe for each, residual risks
 - [Benchmark](bench/README.md): method, results, how to reproduce
 - [Kernel](kernel/README.md): the patch series and how to build it

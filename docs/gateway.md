@@ -52,6 +52,8 @@ kernel at startup and logs which mode it runs in.
 | `GET /v1/memory/{key}/history[?limit=N]` | agent | the key's versions, newest first, including deletes |
 | `POST /v1/memory/{key}/undo {to_version,expected_version}` | agent | restore the state before the latest change, or `to_version`, as a new version |
 | `POST /v1/events {kind,payload}` | agent | hash-chained append-only journal; honours `Idempotency-Key` |
+| `/v1/tasks` and `/v1/tasks/{id}/…` | agent | enqueue/get/history, claim, renew, release, complete and cancel; [task contract and route reference](tasks.md) |
+| `POST /v1/admin/tasks/{id}/recover {reason}` | admin | invalidate a nonterminal claim and requeue, with attributed recovery history |
 | `POST /mcp` | agent | the same operations as MCP tools (see below) |
 | `GET /healthz` | none | liveness, request/error counters, pool sizes, `audit_lost`, `audit_retries` and `audit:{mode,queued,capacity,durable_spool}` |
 
@@ -82,7 +84,7 @@ other, `from`, or shared listing. REST shared listing rejects all selectors; MCP
 ## Audit delivery
 
 Audit covers authenticated SQL-query calls through `POST /v1/query` and the MCP `query`
-tool, including statements rejected by the guard. It does **not** cover typed memory or
+tool, including statements rejected by the guard. It does **not** cover typed task, memory or
 event API/tool writes, raw SQL sent directly to PostgreSQL, or requests rejected before
 query admission. Using strict audit does not extend this scope.
 
@@ -131,6 +133,7 @@ server-sent events. `GET` and `DELETE` return 405.
 | `memory_history` `{key, limit}` | the key's versions, newest first | `GET /v1/memory/{key}/history` |
 | `memory_undo` `{key, to_version, expected_version}` | undo the latest change, or restore a version | `POST /v1/memory/{key}/undo` |
 | `events_append` `{kind, payload, idempotency_key}` | append to the journal; a repeated key replays | `POST /v1/events` |
+| `task_enqueue`, `task_get`, `task_claim`, `task_renew`, `task_release`, `task_complete`, `task_cancel`, `task_history` | database-enforced task coordination | [task API reference](tasks.md#rest-and-mcp) |
 
 - **Versions.** 2026-07-28 requests carry `io.modelcontextprotocol/protocolVersion` and
   `clientCapabilities` in `params._meta`, mirrored in the `MCP-Protocol-Version`,
@@ -139,7 +142,8 @@ server-sent events. `GET` and `DELETE` return 405.
   `server/discover` describes the server. Older clients use `initialize` (2025-11-25,
   2025-06-18, 2025-03-26) and get the same tools.
 - **Auth and limits.** `Authorization: Bearer <agent token>` on every request; a missing or
-  bad token is 401 with `WWW-Authenticate`. Rate, concurrency and every budget apply as on
+  bad token is 401 with `WWW-Authenticate`. An unavailable authentication database returns
+  retryable 503 `auth_unavailable`, without a bearer challenge. Rate, concurrency and every budget apply as on
   the REST API.
 - **Origin.** A request with an `Origin` header is refused with 403 unless that origin is in
   `MCP_ALLOWED_ORIGINS` (comma-separated), which blocks DNS-rebinding attacks from

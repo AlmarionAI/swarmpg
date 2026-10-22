@@ -1,7 +1,7 @@
 # SwarmPG threat model
 
-Development revision, 2026-10-22. The load harness contains 66 probes on stock Postgres
-and 95 with the signed SwarmPG kernel. The tables cite those probe names; audit delivery
+Development revision, 2026-10-22. The load harness contains 70 probes on stock Postgres
+and 99 with the signed SwarmPG kernel. The tables cite those probe names; audit delivery
 and shared-producer semantics also have gateway unit/integration tests run by the e2e
 script. Test presence is not a production-readiness claim. Negative query probes require
 the expected application code/SQLSTATE and HTTP status; unexpected HTTP 5xx, transport
@@ -146,14 +146,15 @@ Not attacks, but the failure modes that hurt agent fleets most.
 | A web page drives a local gateway (DNS rebinding, A3) | Requests with an `Origin` outside `MCP_ALLOWED_ORIGINS` get 403 | foreign Origin refused (DNS rebinding) | ✔ | ✔ |
 | Bypass REST controls through MCP | Tools call the same code paths, under the same identity, budgets and limits | query cannot read a peer's rows; query cannot change identity; MCP query tool is held to the same budget | ✔ | ✔ |
 
-Protocol conformance (both eras, eight tools) is covered by: legacy initialize negotiates
-2025-06-18; 2026-07-28 server/discover; tools/list returns the 8 tools; schema tool
+Protocol conformance (both eras, sixteen tools) is covered by: legacy initialize negotiates
+2025-06-18; 2026-07-28 server/discover; tools/list returns the 16 tools; schema tool
 describes the tables; memory_put then memory_get round-trips.
 
 ### T10. Audit loss and ambiguous outcomes
 
 SQL-query audit covers the REST query endpoint and MCP query tool, including guard
-rejections. It does not cover typed memory/event API writes or direct database sessions.
+rejections. It does not cover typed task/memory/event API writes or direct database sessions.
+Task transition history is a separate synchronous record committed with each task mutation.
 
 | Risk | Control and limit | Validation |
 |---|---|---|
@@ -167,6 +168,24 @@ Best-effort mode can drop new receipts on capacity or persistence failure and in
 `audit_lost`. Strict mode bounds admission, not availability: an unavailable/full spool
 stops SQL-query admission. Disk failure after execution can leave an unknown outcome.
 See [configuration, health fields and recovery semantics](gateway.md#audit-delivery).
+
+### T11. Task ownership and completion
+
+| Attack or failure | Database control | Validation |
+|---|---|---|
+| Another organization reads, claims or completes a task | Org RLS and explicit function authorization | `foreign org cannot read task rows`; `foreign org cannot claim or complete a task` |
+| Competing claims or a lost claim response acquire conflicting ownership | Task row locking, `SKIP LOCKED`, durable request UUID replay | `TestTaskConcurrentClaimsAndRequestReplayIntegration` |
+| Paused worker writes after lease expiry/reclaim | Database-time lease checks and monotonically advancing fences | `TestTaskLeaseExpiryFencingAndRecoveryIntegration` |
+| Inputs change while completion waits on a lock | Declared input rows locked and versions/visibility rechecked; lease checked again after the wait | `TestTaskInputGuardLocksAndRollsBackIntegration` |
+| Duplicate completion or changed retry result | Successful owner/fence/result replay; mismatched result conflicts; one completion history event | `TestTaskLifecycleAndAtomicReplayIntegration` |
+| Direct SQL changes owner/history or recovers another agent's task | No direct DML grants; private/admin function execution revoked; explicit org and actor checks | `raw task UPDATE cannot transfer ownership`; `TestTaskAuthorityAndSQLBypassIntegration` |
+| Token expires or registry authority changes during a lock wait | Post-wait authorization checks and a registry lock through commit | `TestTaskSQLAuthorizationAfterLockWaitIntegration`; `TestTaskSQLRegistryRevocationSerializesWithCommitIntegration` |
+| Gateway or raw task call commits an oversized receipt | Full task receipt budget checked in SQL and typed adapters before commit | `TestTaskResponseBudgetRollsBackAndFenceIsExactIntegration`; `TestTaskSQLMutatingReceiptRollbackIntegration` |
+
+The [task contract](tasks.md) covers declared inputs and database state only. It does not
+make arbitrary external effects exactly once or validate undeclared reads. Task queues
+are org-shared, with no narrower workspace/queue membership policy. Completed dependencies
+are immutable; cancelled dependencies block dependents until explicit replanning.
 
 ### Positive controls
 
@@ -197,31 +216,34 @@ What is **not** covered today, in rough order of importance.
    no data). Query latency reveals load.
 6. **Cheap but slow work.** `pg_sleep` and similar cost almost nothing to the planner, so
    an agent can hold up to `max_concurrency` connections for its statement timeout each.
-7. **Budget gaps.** CPU, IO and storage size are not metered. The byte budget exists only
-   in the gateway. The gateway passes a `max_rows + 1` kernel ceiling to detect result
+7. **Budget gaps.** CPU, IO and storage size are not metered. Generic query byte budgets
+   exist in the gateway; task functions also bound their receipts in SQL. The gateway
+   passes a `max_rows + 1` kernel ceiling to detect result
    truncation; attempted internal writes consume that same ceiling. Raw non-atomic
    `CALL` can commit between statements; the gateway refuses `CALL` and cursors.
 8. **Memory history is kept forever.** Deleting an agent's data for good (right to erasure)
    needs an operator purge; there is no API for it yet.
 9. **Capabilities are coarse.** All agents share one role, so per-agent privileges are not
    expressible in SQL; `read_only` is enforced by the gateway and a transaction-local
-   setting, not by the kernel.
+   setting, not by the kernel. Task mutations additionally check the agent registry.
 10. **Deployment defaults.** Trust authentication, the default admin key and the default
     principal secret in the quickstart and benchmark are for local use only. TLS is not
     provided by SwarmPG. Rate limits live in one gateway process.
 11. **Audit completeness.** Default best-effort mode may drop receipts; memory-only spools
     do not survive process failure. Strict mode requires an operator-maintained persistent
     volume and still cannot atomically couple SQL commit with audit completion. It does
-    not audit typed memory/event API calls or raw SQL sessions.
+    not audit typed memory/event/task API calls or raw SQL sessions. Task transitions
+    have their own synchronous history.
 12. **Shared information is not trusted information.** Producer identity makes provenance
     explicit; it does not establish that an org peer's content is correct. Shared keys
-    remain owner-written, with no jointly editable workspace or coordination protocol.
+    remain owner-written, with no jointly editable workspace. Task completion validates
+    declared versions and provenance, not the truth of an input or result.
 
 ## Reproduce
 
 ```bash
-make e2e              # stock Postgres: 66 probes
-make kernel && make e2e KERNEL=1   # SwarmPG kernel: 95 probes
+make e2e              # stock Postgres: 70 probes
+make kernel && make e2e KERNEL=1   # SwarmPG kernel: 99 probes
 ```
 
 `bench/run.sh` also runs three of these attacks against a PgBouncer + row-level security
