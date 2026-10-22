@@ -381,7 +381,7 @@ class Harness:
                 child.kill()
                 child.wait(timeout=5)
 
-    def api(self, method, path, body=None, token=None, expected=200, retry=True, deadline=60):
+    def api(self, method, path, body=None, token=None, expected=200, retry=True, deadline=60, retry_admission=False):
         headers = {"Content-Type": "application/json"}
         headers["Authorization" if token else "X-Admin-Key"] = "Bearer " + token if token else self.admin_key
         encoded = None if body is None else json.dumps(body).encode()
@@ -403,7 +403,7 @@ class Harness:
                 return value
             error = value.get("error", {})
             transient = code >= 500 or code == 429 or error.get("code", "").startswith(("08", "57P"))
-            if retry and transient and time.monotonic() < end:
+            if ((retry and transient) or (retry_admission and code == 429)) and time.monotonic() < end:
                 time.sleep(.1)
                 continue
             raise AssertionError((method, path, code, expected, value))
@@ -688,7 +688,8 @@ class Harness:
         self.api("POST", "/v1/tasks/" + stale_task["id"] + "/release", {"fence": stale_claim["fence"]}, self.token)
         fresh = self.api("POST", "/v1/tasks/claim", {"queue": stale_task["queue"], "request_id": str(uuid.uuid4()), "lease_ms": 30000}, self.token)["task"]
         assert int(fresh["fence"]) > int(stale_claim["fence"])
-        self.api("POST", "/v1/tasks/" + stale_task["id"] + "/renew", {"fence": stale_claim["fence"], "lease_ms": 1000}, self.token, expected=409, retry=False)
+        stale = self.api("POST", "/v1/tasks/" + stale_task["id"] + "/renew", {"fence": stale_claim["fence"], "lease_ms": 1000}, self.token, expected=409, retry=False, retry_admission=True)
+        assert stale["error"]["code"] == "stale_claim", "stale fence probe did not reach ownership validation"
         self.report.update({"failover_rto_seconds": rto, "acknowledged_before_failover": acknowledged_before, "verified_after_failover": verified, "acknowledged_completions_lost": 0})
         self.report["faults"].append({"kind": "primary_immediate_shutdown", "old_primary_fenced": True, "required_lsn": required, "old_pin_status": status, "returned_old_primary_status": returned_status, "rto_seconds": rto})
         self.record("fenced primary failure retains acknowledgments and deduplicates external effect with lost receipt", rto_seconds=rto)

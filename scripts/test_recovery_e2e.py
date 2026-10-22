@@ -1,12 +1,15 @@
 """Acceptance-test evidence and real TCP fault-controller regression tests."""
 import copy
 import importlib.util
+import io
 import json
 from pathlib import Path
 import socket
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 spec = importlib.util.spec_from_file_location("recovery_e2e", Path(__file__).with_name("recovery-e2e.py"))
 recovery = importlib.util.module_from_spec(spec)
@@ -14,6 +17,29 @@ spec.loader.exec_module(recovery)
 
 
 class RecoveryEvidenceTests(unittest.TestCase):
+    def test_negative_probe_retries_only_admission_and_keeps_exact_request(self):
+        harness = object.__new__(recovery.Harness)
+        harness.gateway_port = 12345
+        harness.admin_key = "test"
+        def response(code, value):
+            return HTTPError("http://test", code, "test", {}, io.BytesIO(json.dumps(value).encode()))
+        with patch.object(recovery.urllib.request, "urlopen", side_effect=[
+            response(429, {"error": {"code": "org_concurrency_limited"}}),
+            response(409, {"error": {"code": "stale_claim"}}),
+        ]) as send, patch.object(recovery.time, "sleep"):
+            out = harness.api("POST", "/v1/tasks/test/renew", {"fence": "4294967297"}, "token",
+                              expected=409, retry=False, retry_admission=True)
+            self.assertEqual(out["error"]["code"], "stale_claim")
+            self.assertEqual(send.call_count, 2)
+            requests = [call.args[0] for call in send.call_args_list]
+            self.assertEqual(requests[0].data, requests[1].data)
+        for code in (200, 503):
+            with self.subTest(code=code), patch.object(recovery.urllib.request, "urlopen", side_effect=response(code, {})) as send:
+                with self.assertRaises(AssertionError):
+                    harness.api("POST", "/v1/tasks/test/renew", {"fence": "4294967297"}, "token",
+                                expected=409, retry=False, retry_admission=True)
+                self.assertEqual(send.call_count, 1)
+
     def test_promotion_compares_numeric_wal_positions(self):
         recovery.require_replayed("F/FFFFFFFF", "10/0")
         recovery.require_replayed("10/0", "10/0")
