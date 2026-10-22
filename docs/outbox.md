@@ -199,5 +199,7 @@ Outbox messages, history, claim receipts and receiver deduplication records curr
 no automatic retention. Polling creates durable claim receipts, including empty claims.
 Configure polling and concurrency for the workload and monitor pending age, failed rows,
 attempts and growing tables. An unconfigured destination stays pending. This milestone
-does not establish cross-destination ordering, organization-wide admission fairness,
-production throughput, backup/PITR acceptance or distributed failover guarantees.
+does not establish cross-destination ordering, production throughput, backup/PITR
+acceptance or distributed failover guarantees. [Organization admission](admission.md)
+limits agent requests across gateways; administrative outbox delivery calls and receiver
+capacity require separate operator limits.

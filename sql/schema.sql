@@ -1432,3 +1432,235 @@ GRANT EXECUTE ON FUNCTION swarmpg.task_enqueue(text,text,jsonb,uuid[],jsonb),
   swarmpg.task_history(uuid,integer), swarmpg.task_complete(uuid,bigint,jsonb,jsonb),
   swarmpg.task_outbox(uuid) TO agent_runtime;
 COMMIT;
+
+-- Shared organization admission. Each lane locks only its own organization
+-- bucket; no fleet-wide row, sequence or advisory lock serializes gateways.
+BEGIN;
+CREATE TABLE IF NOT EXISTS swarmpg.admission_policies (
+  org_id uuid PRIMARY KEY REFERENCES swarmpg.orgs(id) ON DELETE CASCADE,
+  revision bigint NOT NULL DEFAULT 1,
+  general_rps integer NOT NULL DEFAULT 10000 CHECK (general_rps BETWEEN 1 AND 1000000),
+  general_burst integer NOT NULL DEFAULT 20000 CHECK (general_burst BETWEEN 1 AND 1000000),
+  general_concurrency integer NOT NULL DEFAULT 32 CHECK (general_concurrency BETWEEN 1 AND 10000),
+  control_rps integer NOT NULL DEFAULT 1000 CHECK (control_rps BETWEEN 1 AND 1000000),
+  control_burst integer NOT NULL DEFAULT 2000 CHECK (control_burst BETWEEN 1 AND 1000000),
+  control_concurrency integer NOT NULL DEFAULT 8 CHECK (control_concurrency BETWEEN 1 AND 10000)
+);
+CREATE TABLE IF NOT EXISTS swarmpg.admission_buckets (
+  org_id uuid NOT NULL REFERENCES swarmpg.admission_policies(org_id) ON DELETE CASCADE,
+  class text NOT NULL CHECK (class IN ('general','control')),
+  tokens numeric NOT NULL CHECK (tokens >= 0),
+  granted bigint NOT NULL DEFAULT 0,
+  refilled_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (org_id,class)
+);
+ALTER TABLE swarmpg.admission_buckets ADD COLUMN IF NOT EXISTS granted bigint NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS swarmpg.admission_permits (
+  org_id uuid NOT NULL REFERENCES swarmpg.admission_policies(org_id) ON DELETE CASCADE,
+  request_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  gateway_id uuid NOT NULL,
+  class text NOT NULL CHECK (class IN ('general','control')),
+  ttl_ms integer NOT NULL CHECK (ttl_ms BETWEEN 100 AND 120000),
+  created_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  PRIMARY KEY (org_id,request_id)
+);
+CREATE INDEX IF NOT EXISTS admission_active_idx ON swarmpg.admission_permits(org_id,class,expires_at);
+CREATE INDEX IF NOT EXISTS admission_expiry_idx ON swarmpg.admission_permits(expires_at);
+ALTER TABLE swarmpg.admission_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.admission_policies FORCE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.admission_buckets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.admission_buckets FORCE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.admission_permits ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.admission_permits FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON swarmpg.admission_policies,swarmpg.admission_buckets,swarmpg.admission_permits FROM PUBLIC,agent_runtime;
+
+CREATE OR REPLACE FUNCTION swarmpg._admission_policy_json(p swarmpg.admission_policies) RETURNS jsonb
+LANGUAGE sql STABLE SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+  SELECT to_jsonb(p) || jsonb_build_object('revision',p.revision::text)
+$$;
+CREATE OR REPLACE FUNCTION swarmpg._admission_policy(p_org uuid) RETURNS swarmpg.admission_policies
+LANGUAGE plpgsql SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE p swarmpg.admission_policies%ROWTYPE;
+BEGIN
+  -- The normal request path is a read, not an INSERT ON CONFLICT against a
+  -- hot organization key. Initialization races are confined to the first use.
+  SELECT * INTO p FROM swarmpg.admission_policies WHERE org_id=p_org;
+  IF FOUND THEN RETURN p; END IF;
+  IF p_org IS NULL OR NOT EXISTS (SELECT 1 FROM swarmpg.orgs WHERE id=p_org) THEN
+    RAISE EXCEPTION 'organization not found' USING ERRCODE='PT404';
+  END IF;
+  INSERT INTO swarmpg.admission_policies(org_id) VALUES(p_org) ON CONFLICT DO NOTHING RETURNING * INTO p;
+  IF FOUND THEN
+    INSERT INTO swarmpg.admission_buckets(org_id,class,tokens)
+    VALUES(p_org,'general',p.general_burst),(p_org,'control',p.control_burst);
+  ELSE
+    SELECT * INTO p FROM swarmpg.admission_policies WHERE org_id=p_org;
+  END IF;
+  RETURN p;
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.admission_policy_get(p_org uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+BEGIN
+  RETURN swarmpg._admission_policy_json(swarmpg._admission_policy(p_org));
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.admission_policy_set(p_org uuid,p_policy jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE p swarmpg.admission_policies%ROWTYPE; b swarmpg.admission_buckets%ROWTYPE;
+  field text; value text; cap integer; previous_rate integer; previous_burst integer;
+  new_burst integer; sampled_at timestamptz;
+  fields text[] := ARRAY['general_rps','general_burst','general_concurrency','control_rps','control_burst','control_concurrency'];
+BEGIN
+  IF p_policy IS NULL OR jsonb_typeof(p_policy)<>'object' OR NOT (p_policy ?& fields)
+     OR (p_policy-fields)<>'{}'::jsonb THEN
+    RAISE EXCEPTION 'policy requires exactly six admission fields' USING ERRCODE='PT400';
+  END IF;
+  FOREACH field IN ARRAY fields LOOP
+    value := p_policy->>field;
+    cap := CASE WHEN field LIKE '%concurrency' THEN 10000 ELSE 1000000 END;
+    IF jsonb_typeof(p_policy->field)<>'number' OR length(value)>7 OR value !~ '^[1-9][0-9]*$' THEN
+      RAISE EXCEPTION 'policy values must be positive integers' USING ERRCODE='PT400';
+    END IF;
+    IF value::integer>cap THEN RAISE EXCEPTION 'admission policy exceeds its maximum' USING ERRCODE='PT400'; END IF;
+  END LOOP;
+  p := swarmpg._admission_policy(p_org);
+  -- A policy writer locks both lanes in the same order. Ordinary acquisitions
+  -- lock one lane only and never lock the policy row, preventing lock inversion.
+  PERFORM 1 FROM swarmpg.admission_buckets WHERE org_id=p_org ORDER BY class FOR UPDATE;
+  SELECT * INTO p FROM swarmpg.admission_policies WHERE org_id=p_org;
+  sampled_at := clock_timestamp();
+  FOR b IN SELECT * FROM swarmpg.admission_buckets WHERE org_id=p_org LOOP
+    previous_rate := CASE WHEN b.class='general' THEN p.general_rps ELSE p.control_rps END;
+    previous_burst := CASE WHEN b.class='general' THEN p.general_burst ELSE p.control_burst END;
+    new_burst := (p_policy->>(b.class||'_burst'))::integer;
+    UPDATE swarmpg.admission_buckets SET
+      tokens=least(new_burst::numeric,previous_burst::numeric,
+        b.tokens+greatest(0,extract(epoch FROM (sampled_at-b.refilled_at)))*previous_rate),
+      refilled_at=greatest(b.refilled_at,sampled_at)
+    WHERE org_id=p_org AND class=b.class;
+  END LOOP;
+  UPDATE swarmpg.admission_policies SET revision=revision+1,
+    general_rps=(p_policy->>'general_rps')::integer,general_burst=(p_policy->>'general_burst')::integer,
+    general_concurrency=(p_policy->>'general_concurrency')::integer,control_rps=(p_policy->>'control_rps')::integer,
+    control_burst=(p_policy->>'control_burst')::integer,control_concurrency=(p_policy->>'control_concurrency')::integer
+  WHERE org_id=p_org RETURNING * INTO p;
+  RETURN swarmpg._admission_policy_json(p);
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.admission_acquire(p_org uuid,p_agent uuid,p_gateway uuid,p_request uuid,
+  p_class text,p_ttl_ms integer) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE p swarmpg.admission_policies%ROWTYPE; b swarmpg.admission_buckets%ROWTYPE;
+  permit swarmpg.admission_permits%ROWTYPE; a swarmpg.agents%ROWTYPE;
+  sampled_at timestamptz; earliest_expiry timestamptz; available numeric;
+  rate integer; burst integer; ceiling integer; active integer; remaining integer; inserted boolean;
+BEGIN
+  IF p_org IS NULL OR p_agent IS NULL OR p_gateway IS NULL OR p_request IS NULL OR p_class IS NULL
+     OR p_class NOT IN ('general','control') OR p_ttl_ms IS NULL OR p_ttl_ms NOT BETWEEN 100 AND 120000 THEN
+    RAISE EXCEPTION 'valid organization, agent, gateway, request, class and TTL required' USING ERRCODE='PT400';
+  END IF;
+  SELECT * INTO a FROM swarmpg.agents WHERE id=p_agent AND org_id=p_org;
+  IF NOT FOUND OR a.disabled OR (a.token_expires_at IS NOT NULL AND a.token_expires_at<=clock_timestamp()) THEN
+    RAISE EXCEPTION 'admission requires an enabled unexpired agent in the organization' USING ERRCODE='42501';
+  END IF;
+  p := swarmpg._admission_policy(p_org);
+  SELECT * INTO b FROM swarmpg.admission_buckets WHERE org_id=p_org AND class=p_class FOR UPDATE;
+  -- Recheck after potentially blocking on the lane. Serialize the short grant
+  -- transaction before any later registry revocation; read-only agents may read.
+  SELECT * INTO a FROM swarmpg.agents WHERE id=p_agent AND org_id=p_org FOR SHARE;
+  IF NOT FOUND OR a.disabled OR (a.token_expires_at IS NOT NULL AND a.token_expires_at<=clock_timestamp()) THEN
+    RAISE EXCEPTION 'admission requires an enabled unexpired agent in the organization' USING ERRCODE='42501';
+  END IF;
+  SELECT * INTO permit FROM swarmpg.admission_permits WHERE org_id=p_org AND request_id=p_request FOR UPDATE;
+  IF FOUND THEN
+    IF permit.agent_id<>p_agent OR permit.gateway_id<>p_gateway OR permit.class<>p_class OR permit.ttl_ms<>p_ttl_ms THEN
+      RAISE EXCEPTION 'admission request already identifies different parameters' USING ERRCODE='PT409';
+    END IF;
+    remaining := floor(extract(epoch FROM (permit.expires_at-clock_timestamp()))*1000)::integer;
+    IF remaining<1 THEN RAISE EXCEPTION 'expired admission request cannot be reused' USING ERRCODE='PT409'; END IF;
+    RETURN jsonb_build_object('admitted',true,'reason','','retry_after_ms',0,'lease_ms',remaining,'replayed',true);
+  END IF;
+  sampled_at := clock_timestamp();
+  -- Retain expired rows for 120 seconds beyond expiry, longer than an acquire
+  -- retry deadline. After explicit release or cleanup there is no receipt:
+  -- callers must use fresh UUIDs and never retry beyond their acquire deadline.
+  WITH expired AS (
+    SELECT org_id,request_id FROM swarmpg.admission_permits
+    WHERE org_id=p_org AND class=p_class AND expires_at<sampled_at-interval '120 seconds'
+    ORDER BY expires_at LIMIT 64 FOR UPDATE SKIP LOCKED
+  ) DELETE FROM swarmpg.admission_permits target USING expired
+    WHERE target.org_id=expired.org_id AND target.request_id=expired.request_id;
+  SELECT * INTO p FROM swarmpg.admission_policies WHERE org_id=p_org;
+  rate := CASE WHEN p_class='general' THEN p.general_rps ELSE p.control_rps END;
+  burst := CASE WHEN p_class='general' THEN p.general_burst ELSE p.control_burst END;
+  ceiling := CASE WHEN p_class='general' THEN p.general_concurrency ELSE p.control_concurrency END;
+  available := least(burst::numeric,b.tokens+greatest(0,extract(epoch FROM (sampled_at-b.refilled_at)))*rate);
+  UPDATE swarmpg.admission_buckets SET tokens=available,refilled_at=greatest(b.refilled_at,sampled_at)
+  WHERE org_id=p_org AND class=p_class;
+  SELECT count(*),min(expires_at) INTO active,earliest_expiry FROM swarmpg.admission_permits
+  WHERE org_id=p_org AND class=p_class AND expires_at>sampled_at;
+  IF active>=ceiling THEN
+    RETURN jsonb_build_object('admitted',false,'reason','org_concurrency_limited',
+      'retry_after_ms',greatest(1,ceil(extract(epoch FROM (earliest_expiry-sampled_at))*1000)::integer),
+      'lease_ms',0,'replayed',false);
+  END IF;
+  IF available<1 THEN
+    RETURN jsonb_build_object('admitted',false,'reason','org_rate_limited',
+      'retry_after_ms',greatest(1,ceil((1-available)*1000/rate)::integer),'lease_ms',0,'replayed',false);
+  END IF;
+  INSERT INTO swarmpg.admission_permits(org_id,request_id,agent_id,gateway_id,class,ttl_ms,created_at,expires_at)
+  VALUES(p_org,p_request,p_agent,p_gateway,p_class,p_ttl_ms,sampled_at,sampled_at+p_ttl_ms*interval '1 millisecond')
+  ON CONFLICT DO NOTHING;
+  inserted := FOUND;
+  -- Two different lanes can race the same request UUID. Only one may consume
+  -- a token; the other is a parameter conflict, not another execution grant.
+  IF NOT inserted THEN RAISE EXCEPTION 'admission request already identifies different parameters' USING ERRCODE='PT409'; END IF;
+  UPDATE swarmpg.admission_buckets SET tokens=available-1,granted=granted+1 WHERE org_id=p_org AND class=p_class;
+  remaining := floor(extract(epoch FROM (sampled_at+p_ttl_ms*interval '1 millisecond'-clock_timestamp()))*1000)::integer;
+  IF remaining<1 THEN RAISE EXCEPTION 'admission permit expired before grant returned' USING ERRCODE='PT409'; END IF;
+  RETURN jsonb_build_object('admitted',true,'reason','','retry_after_ms',0,'lease_ms',remaining,'replayed',false);
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.admission_release(p_org uuid,p_gateway uuid,p_request uuid) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+BEGIN
+  DELETE FROM swarmpg.admission_permits WHERE org_id=p_org AND request_id=p_request AND gateway_id=p_gateway;
+  -- Release refunds concurrent capacity, never an already consumed rate token.
+  RETURN FOUND;
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.admission_sweep(p_limit integer DEFAULT 1000) RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE removed integer;
+BEGIN
+  IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 10000 THEN
+    RAISE EXCEPTION 'sweep limit must be 1 to 10000' USING ERRCODE='PT400';
+  END IF;
+  WITH expired AS (
+    SELECT org_id,request_id FROM swarmpg.admission_permits WHERE expires_at<clock_timestamp()-interval '120 seconds'
+    ORDER BY expires_at LIMIT p_limit FOR UPDATE SKIP LOCKED
+  ) DELETE FROM swarmpg.admission_permits target USING expired
+    WHERE target.org_id=expired.org_id AND target.request_id=expired.request_id;
+  GET DIAGNOSTICS removed=ROW_COUNT;
+  RETURN removed;
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.admission_status(p_org uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE p swarmpg.admission_policies%ROWTYPE; sampled_at timestamptz;
+BEGIN
+  p := swarmpg._admission_policy(p_org);
+  sampled_at := clock_timestamp();
+  RETURN jsonb_build_object('policy',swarmpg._admission_policy_json(p),'active',jsonb_build_object(
+    'general',(SELECT count(*) FROM swarmpg.admission_permits WHERE org_id=p_org AND class='general' AND expires_at>sampled_at),
+    'control',(SELECT count(*) FROM swarmpg.admission_permits WHERE org_id=p_org AND class='control' AND expires_at>sampled_at)),
+    'granted',jsonb_build_object(
+    'general',(SELECT granted FROM swarmpg.admission_buckets WHERE org_id=p_org AND class='general'),
+    'control',(SELECT granted FROM swarmpg.admission_buckets WHERE org_id=p_org AND class='control')));
+END $$;
+DO $$
+DECLARE f regprocedure;
+BEGIN
+  FOR f IN SELECT p.oid::regprocedure FROM pg_proc p WHERE p.pronamespace='swarmpg'::regnamespace
+    AND (p.proname LIKE 'admission\_%' OR p.proname LIKE '\_admission\_%')
+  LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC,agent_runtime',f); END LOOP;
+END $$;
+COMMIT;

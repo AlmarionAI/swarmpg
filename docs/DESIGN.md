@@ -20,10 +20,11 @@ client from choosing an identity. This is the advantage to preserve and measure.
 
 | Capability | Current boundary |
 |---|---|
-| Pooled REST/MCP access | Go gateway, 32 runtime connections, short transactions, per-process admission limits |
+| Pooled REST/MCP access | Go gateway, 32 runtime connections, short transactions, local queues and shared organization admission |
 | Agent identity | One composite agent/org principal; kernel seal, optional HMAC verification and fail-closed execution gate |
 | Private data and sharing | Shared tables under forced RLS; own writes, org-readable shared memory; no private DDL |
-| Budgets | Gateway rate/concurrency/time/result limits; kernel plan-cost gate and cumulative attempted-write cap |
+| Budgets | Shared organization rate/concurrency ceilings; local per-agent limits; gateway time/result limits; kernel plan-cost and attempted-write caps |
+| Admission fairness | Per-gateway organization round-robin queues, independent shared general/control quotas, reserved renewal/completion capacity |
 | Memory | Per-key versions, compare-and-set, history, time reads and undo; producer identity, explicit producer selection and shared listing |
 | Records | Hash-chained per-agent journal; SQL-query audit with bounded retry spooling and a strict durable-intent mode |
 | Tasks | Org-shared queues, immutable dependencies/input snapshots, atomic claims, leases, fencing, completion replay and attributed history |
@@ -46,6 +47,7 @@ one-row result-detection headroom and remaining raw-session limits.
 Agents → REST / MCP gateway → pooled agent_runtime connections → PostgreSQL
             │                          │                         + RLS/schema
             │                          └─ signed sealed principal + optional kernel patches
+            ├─ quota connection → shared org buckets and expiring permits
             └─ bounded audit spool → admin connection → audit receipts
 ```
 
@@ -84,6 +86,22 @@ SQL, REST and MCP expose matching conflict, stale-claim, expired-lease and chang
 errors. The task creator can cancel; an administrator can requeue a nonterminal task
 with a reason while invalidating its fence. History and claim receipts persist without
 automatic retention. Read-only/disabled/expired-agent checks run inside SQL mutations.
+
+## Organization admission across gateways
+
+**Implemented in the schema and gateway.** Shared token buckets and expiring permits
+serialize grants per organization and class across replicas. Local bounded queues rotate
+waiting organizations; task renew/release/complete have a separate control lane. This
+establishes shared ceilings and local scheduling fairness, not global queue ordering or
+minimum throughput. Per-agent limits remain process-local.
+
+The [admission contract](admission.md) specifies live policy updates, conservative permit
+expiry, bounded request execution, fail-closed quota errors and admin-only controls. The
+owned-service workload uses three gateways and at least 2,000 actual participating workers,
+with sustained quiet-tenant task completion under noisy traffic and a gateway crash.
+Reports must retain policy settings and client backpressure along with latency and
+correctness evidence. Quotas do not meter CPU, IO or storage, and direct SQL does not pass
+through HTTP admission.
 
 ## Acceptance workload: collaborative work under failure
 
@@ -126,8 +144,8 @@ private agent memory and shared workspace state distinct.
 
 Operational readiness is also required: schema migration and rollback procedures,
 backup/restore and PITR tests, deployment authentication/TLS, token rotation, audit-volume
-operations, retention/purge, observable admission limits, multi-gateway fairness and
-failure recovery. The development Compose setup is not a production deployment recipe.
+operations, retention/purge, capacity tuning for shared admission, longer fairness soaks and
+distributed failover acceptance. The development Compose setup is not a production deployment recipe.
 Extension compatibility and supported PostgreSQL versions need explicit test matrices.
 
 ## Deferred research

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add PostgreSQL-authoritative organization rate, burst and concurrency policies shared
+  across gateways, bounded local organization round-robin queues, and reserved capacity
+  for typed task renew/release/complete. Admission fails closed on quota errors; expiring
+  permits and bounded execution recover capacity after gateway crashes. Add admin policy
+  endpoints, separate auth/quota pools, diagnostics and an owned three-gateway sustained
+  workload. Per-agent limits remain local, with refreshed settings and separate classes.
+
 - Add a transactional task outbox, administrative delivery claims/leases/fences,
   stable idempotency keys, bounded retry cycles, explicit failed-message requeue and
   attributed delivery history. A separate HTTP dispatcher routes operator-configured

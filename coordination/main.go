@@ -250,9 +250,30 @@ func (r *run) admitRequest(ctx context.Context, claim bool) (func(), error) {
 	}
 }
 
+const requestRetryWindow = 30 * time.Second
+
+// Keep the production retry deadline longer than the default admission permit
+// lease (20s), so a gateway crash can safely retain uncertain reservations until
+// expiry. Timing is injectable only in internal tests of the real HTTP path.
+type requestRetryPolicy struct {
+	window, rateDelay, backoff time.Duration
+}
+
 // Retries always reuse the exact request body, including claim request IDs.
 // 5xx/transport failures are acceptable only in a recorded service fault window.
 func (r *run) call(ctx context.Context, a agent, method, path string, body any, admin, retry bool) (apiResponse, error) {
+	return r.callWithRetryPolicy(ctx, a, method, path, body, admin, retry,
+		requestRetryPolicy{requestRetryWindow, time.Second, 50 * time.Millisecond})
+}
+
+func (r *run) callWithRetryPolicy(ctx context.Context, a agent, method, path string, body any, admin, retry bool, policy requestRetryPolicy) (apiResponse, error) {
+	if retry {
+		// WithTimeout preserves an earlier caller deadline. The bound includes
+		// semaphore waits, network attempts and backoff, not just sleep time.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, policy.window)
+		defer cancel()
+	}
 	var encoded []byte
 	var err error
 	if body != nil {
@@ -335,13 +356,16 @@ func (r *run) call(ctx context.Context, a agent, method, path string, body any, 
 		if transient && ctx.Err() == nil && time.Now().UnixNano() > r.faultUntil.Load() {
 			return out, fmt.Errorf("unexpected service failure on %s %s: HTTP %d code=%s transport=%v", method, path, out.Status, out.Code, transportErr)
 		}
-		if retry && (transient || out.Status == 429 || out.Code == "40001" || out.Code == "40P01") && attempt < 15 && ctx.Err() == nil {
+		if retry && (transient || out.Status == 429 || out.Code == "40001" || out.Code == "40P01") {
+			if err := ctx.Err(); err != nil {
+				return out, err
+			}
 			r.mu.Lock()
 			r.report.RequestRetries++
 			r.mu.Unlock()
-			delay := time.Duration(50*(attempt+1)) * time.Millisecond
+			delay := time.Duration(attempt+1) * policy.backoff
 			if out.Status == 429 {
-				delay = time.Second
+				delay = policy.rateDelay
 			}
 			if !sleep(ctx, delay) {
 				return out, ctx.Err()
@@ -1202,7 +1226,7 @@ func main() {
 		client: &http.Client{Transport: &http.Transport{MaxIdleConns: cfg.InFlight * 2, MaxIdleConnsPerHost: cfg.InFlight, MaxConnsPerHost: cfg.InFlight}, Timeout: 10 * time.Second},
 		report: report{Seed: cfg.Seed, SourceCommit: os.Getenv("COORD_SOURCE_COMMIT"), SourceTreeSHA256: os.Getenv("COORD_SOURCE_TREE_SHA256"),
 			Environment:  map[string]string{"go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH, "cpu_count": strconv.Itoa(runtime.NumCPU()), "gomaxprocs": strconv.Itoa(runtime.GOMAXPROCS(0)), "postgres": os.Getenv("COORD_DB_VERSION"), "kernel": os.Getenv("KERNEL"), "audit_mode": "best-effort", "database_mode": os.Getenv("COORD_DB_MODE")},
-			Settings:     map[string]any{"workers": cfg.Workers, "in_flight": cfg.InFlight, "claim_in_flight": claimLimit, "lease_ms": cfg.LeaseMS, "duration": cfg.Duration.String(), "runtime_pool": 32, "empty_poll_backoff_cap_ms": 2000, "lease_renew_interval_ms": cfg.LeaseMS / 3, "quiet_worker_share": 0.8, "noisy_query_rps_limit": 5, "noisy_query_concurrency_limit": 2, "external_effects": false},
+			Settings:     map[string]any{"workers": cfg.Workers, "in_flight": cfg.InFlight, "claim_in_flight": claimLimit, "lease_ms": cfg.LeaseMS, "duration": cfg.Duration.String(), "runtime_pool": 32, "empty_poll_backoff_cap_ms": 2000, "request_retry_window_ms": requestRetryWindow.Milliseconds(), "lease_renew_interval_ms": cfg.LeaseMS / 3, "quiet_worker_share": 0.8, "noisy_query_rps_limit": 5, "noisy_query_concurrency_limit": 2, "external_effects": false},
 			HTTPOutcomes: map[string]int64{}, Events: []event{}, Errors: []string{}},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Duration+time.Duration(cfg.LeaseMS)*time.Millisecond+3*time.Minute)

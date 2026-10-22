@@ -13,4 +13,5 @@
 /.coord-test/
 /coordination/coordination
 /outbox/outbox
+/admission/admission
 /scripts/__pycache__/

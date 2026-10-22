@@ -182,8 +182,11 @@ audit spool only covers `/v1/query` and MCP `query`; typed task APIs use task hi
 do not silently expand the audit scope. Enqueue/claim/completion keys resolve uncertain
 transport outcomes after gateway/database reconnects.
 
-Per-agent HTTP rate/concurrency limits do not promise organization-wide fairness or
-multi-gateway admission fairness. Monitor queue delay and quiet-tenant latency under the
-failure workload. Retention, queue quotas, backup/PITR acceptance and
+[Organization admission](admission.md) shares rate and concurrency ceilings across
+gateways. Typed renew/release/complete use a reserved control lane, while claims and raw
+SQL remain general work. Local queues rotate organizations; per-agent limits remain
+local and there is no global ordering or minimum throughput promise. Monitor queue delay
+and quiet-tenant completion latency under the sustained workload. Retention, durable task
+queue size quotas, backup/PITR acceptance and
 broader deployment compatibility still require operational work. A short 1,000-worker
 test is evidence for its measured conditions, not a production scale guarantee.

@@ -121,6 +121,14 @@ func newSharedMemoryFixture(t *testing.T) *sharedMemoryFixture {
 	t.Cleanup(runtime.Close)
 	f := &sharedMemoryFixture{g: &Gateway{admin: admin, runtime: runtime, sealed: kernel,
 		ceilRows: 100001, ceilCost: 1e9, principalSecret: []byte(os.Getenv("SWARMPG_TEST_PRINCIPAL_SECRET"))}}
+	acfg := defaultAdmissionConfig()
+	controller, err := newAdmissionController(&postgresAdmissionStore{pool: admin, gate: make(chan struct{}, 64)}, acfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.g.admission = controller
+	f.g.quota = admin
+	t.Cleanup(controller.close)
 	var orgs []string
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

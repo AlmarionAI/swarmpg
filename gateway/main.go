@@ -21,10 +21,12 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -53,11 +55,17 @@ type Agent struct {
 }
 
 type Gateway struct {
-	admin    *pgxpool.Pool // privileged: agent registry + audit
-	runtime  *pgxpool.Pool // logged in as agent_runtime: all agent SQL
-	adminKey string
+	admin     *pgxpool.Pool // privileged: agent registry + audit
+	runtime   *pgxpool.Pool // logged in as agent_runtime: all agent SQL
+	adminKey  string
+	auth      *pgxpool.Pool
+	quota     *pgxpool.Pool
+	authGate  chan struct{}
+	admission *admissionController
 
-	mcpOrigins map[string]bool // Origins allowed to call /mcp; requests without one are allowed
+	mcpOrigins     map[string]bool // Origins allowed to call /mcp; requests without one are allowed
+	mcpIngressOnce sync.Once
+	mcpIngress     chan struct{} // bounded body reads before payload-based lane classification
 
 	// SwarmPG kernel only: the principal is sealed in core, optionally signed,
 	// and the row/cost budgets are enforced by the executor up to the
@@ -69,7 +77,7 @@ type Gateway struct {
 
 	cache       sync.Map // tokenHash -> *cachedAgent
 	buckets     sync.Map // agentID -> *bucket
-	sems        sync.Map // agentID -> chan struct{} (per-agent concurrency)
+	sems        sync.Map // agent/class -> *agentSlots (per-process concurrency)
 	seen        sync.Map // agentID -> *lastSeen (throttled last_seen_at writes)
 	auditSpool  *auditSpool
 	auditStrict bool
@@ -84,8 +92,8 @@ type cachedAgent struct {
 	at time.Time
 }
 
-// ---- token bucket per agent (in-process; a multi-gateway deployment needs a
-// shared store — see docs/DESIGN.md control plane. Documented, not pretended away.)
+// Per-agent class limits are local fast-path controls. PostgreSQL enforces the
+// aggregate organization policy across replicas; adding replicas cannot raise it.
 type bucket struct {
 	mu     sync.Mutex
 	tokens float64
@@ -93,13 +101,14 @@ type bucket struct {
 	rate   float64
 }
 
-func (b *bucket) take() bool {
+func (b *bucket) take(rate float64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
 	b.tokens += now.Sub(b.last).Seconds() * b.rate
-	if b.tokens > b.rate*2 {
-		b.tokens = b.rate * 2
+	b.rate = rate
+	if b.tokens > rate*2 {
+		b.tokens = rate * 2
 	}
 	b.last = now
 	if b.tokens < 1 {
@@ -109,27 +118,35 @@ func (b *bucket) take() bool {
 	return true
 }
 
-func (g *Gateway) allow(a *Agent) bool {
+func (g *Gateway) allow(a *Agent, class admissionClass) bool {
 	if a.RPS <= 0 {
-		return true // 0 = unlimited by convention
+		return true
 	}
-	v, _ := g.buckets.LoadOrStore(a.ID, &bucket{tokens: float64(a.RPS), last: time.Now(), rate: float64(a.RPS)})
-	return v.(*bucket).take()
+	key := a.ID + ":" + string(class)
+	v, _ := g.buckets.LoadOrStore(key, &bucket{tokens: float64(a.RPS), last: time.Now(), rate: float64(a.RPS)})
+	return v.(*bucket).take(float64(a.RPS))
 }
 
-// ---- per-agent concurrency cap: one agent cannot occupy the whole runtime pool.
-func (g *Gateway) acquireSlot(a *Agent) (func(), bool) {
+type agentSlots struct {
+	mu     sync.Mutex
+	active int
+}
+
+func (g *Gateway) acquireSlot(a *Agent, class admissionClass) (func(), bool) {
 	if a.MaxConcurrency <= 0 {
 		return func() {}, true
 	}
-	v, _ := g.sems.LoadOrStore(a.ID, make(chan struct{}, a.MaxConcurrency))
-	ch := v.(chan struct{})
-	select {
-	case ch <- struct{}{}:
-		return func() { <-ch }, true
-	default:
+	v, _ := g.sems.LoadOrStore(a.ID+":"+string(class), &agentSlots{})
+	slots := v.(*agentSlots)
+	slots.mu.Lock()
+	if slots.active >= a.MaxConcurrency {
+		slots.mu.Unlock()
 		return nil, false
 	}
+	slots.active++
+	slots.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { slots.mu.Lock(); slots.active--; slots.mu.Unlock() }) }, true
 }
 
 // ---- auth
@@ -148,9 +165,23 @@ func (g *Gateway) authenticate(ctx context.Context, r *http.Request) (*Agent, er
 			return c.a, nil
 		}
 	}
+	pool := g.auth
+	if pool == nil {
+		pool = g.admin
+	} // Explicit in-process test fixtures.
+	ctx, cancel := context.WithTimeout(ctx, admissionDBTimeout)
+	defer cancel()
+	if g.authGate != nil {
+		select {
+		case g.authGate <- struct{}{}:
+			defer func() { <-g.authGate }()
+		default:
+			return nil, admissionRejected("auth_busy", 100)
+		}
+	}
 	a := &Agent{}
 	var expiresAt *time.Time
-	err := g.admin.QueryRow(ctx, `
+	err := pool.QueryRow(ctx, `
 		SELECT id::text, org_id::text, name, shard, rps_limit, max_rows, max_result_bytes,
 		       max_concurrency, max_cost, statement_timeout_ms, read_only, disabled, token_expires_at
 		FROM swarmpg.agents WHERE token_hash = $1`, h).
@@ -401,9 +432,10 @@ func (g *Gateway) withConn(ctx context.Context, a *Agent, fn func(ctx context.Co
 		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer rcancel()
 		if poisoned {
+			markAdmissionRuntimeUncertain(ctx)
 			// Drop a connection we could not leave in a known-clean state.
 			if h := conn.Hijack(); h != nil {
-				_ = h.Close(context.Background())
+				_ = h.Close(rctx)
 			}
 			return
 		}
@@ -413,8 +445,16 @@ func (g *Gateway) withConn(ctx context.Context, a *Agent, fn func(ctx context.Co
 		// DISCARD ALL: its DEALLOCATE ALL would invalidate pgx's prepared-
 		// statement cache and make the next reuse fail with SQLSTATE 26000.
 		if _, derr := conn.Exec(rctx, "CLOSE ALL; RESET ALL; DISCARD TEMP; DISCARD SEQUENCES"); derr != nil {
+			markAdmissionRuntimeUncertain(ctx)
 			if h := conn.Hijack(); h != nil {
-				_ = h.Close(context.Background())
+				_ = h.Close(rctx)
+			}
+			return
+		}
+		if conn.Conn().PgConn().TxStatus() != 'I' {
+			markAdmissionRuntimeUncertain(ctx)
+			if h := conn.Hijack(); h != nil {
+				_ = h.Close(rctx)
 			}
 			return
 		}
@@ -434,6 +474,16 @@ func (g *Gateway) withConn(ctx context.Context, a *Agent, fn func(ctx context.Co
 		seal = g.kernelSetup(a)
 	}
 	stmtTimeout := a.StatementTimeoutMS
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline).Milliseconds()
+		if remaining <= 0 {
+			_ = tx.Rollback(ctx)
+			return context.DeadlineExceeded
+		}
+		if stmtTimeout <= 0 || int64(stmtTimeout) > remaining {
+			stmtTimeout = int(remaining)
+		}
+	}
 	setup := seal + fmt.Sprintf(
 		"SET LOCAL app.agent_id = '%s'; SET LOCAL app.org_id = '%s'; "+
 			"SET LOCAL statement_timeout = %d; SET LOCAL idle_in_transaction_session_timeout = 2000; "+
@@ -786,11 +836,14 @@ func writeErr(w http.ResponseWriter, err *apiError) {
 // expiry, rate limit and per-agent concurrency cap. On success the caller must
 // call release when the request is done.
 func (g *Gateway) admit(r *http.Request) (a *Agent, release func(), aerr *apiError) {
-	g.stats.requests.Add(1)
 	a, err := g.authenticate(r.Context(), r)
 	if err != nil {
 		return nil, nil, err.(*apiError)
 	}
+	return g.admitAgent(r, a, restAdmissionClass(r))
+}
+func (g *Gateway) admitAgent(r *http.Request, a *Agent, class admissionClass) (*Agent, func(), *apiError) {
+	g.stats.requests.Add(1)
 	if a.Disabled {
 		return nil, nil, errForbidden("agent disabled")
 	}
@@ -798,26 +851,43 @@ func (g *Gateway) admit(r *http.Request) (a *Agent, release func(), aerr *apiErr
 		return nil, nil, errForbidden("token expired")
 	}
 	g.touchLastSeen(a)
-	if !g.allow(a) {
+	if !g.allow(a, class) {
 		g.stats.limited.Add(1)
-		return nil, nil, &apiError{Status: 429, Code: "rate_limited", Message: fmt.Sprintf("rate limit %d req/s exceeded", a.RPS), Retryable: true}
+		return nil, nil, admissionRejected("rate_limited", 1000)
 	}
-	release, ok := g.acquireSlot(a)
+	localRelease, ok := g.acquireSlot(a, class)
 	if !ok {
 		g.stats.limited.Add(1)
-		return nil, nil, &apiError{Status: 429, Code: "concurrency_limited", Message: fmt.Sprintf("concurrency limit %d exceeded", a.MaxConcurrency), Retryable: true}
+		return nil, nil, admissionRejected("concurrency_limited", 1000)
 	}
-	return a, release, nil
+	if g.admission == nil {
+		return a, localRelease, nil
+	} // Tests of lower-level adapters may omit HTTP admission.
+	ctx, release, waited, err := g.admission.enter(r.Context(), a, class)
+	*r = *r.WithContext(context.WithValue(ctx, admissionWaitKey{}, waited))
+	if err != nil {
+		localRelease()
+		return nil, nil, err
+	}
+	return a, func() { release(); localRelease() }, nil
 }
 
+type admissionWaitKey struct{}
+
+func setAdmissionTiming(w http.ResponseWriter, r *http.Request) {
+	if waited, ok := r.Context().Value(admissionWaitKey{}).(time.Duration); ok {
+		ms := fmt.Sprintf("%.3f", float64(waited.Microseconds())/1000)
+		w.Header().Set("Server-Timing", "admission;dur="+ms)
+		w.Header().Set("X-SwarmPG-Admission-Wait-Ms", ms)
+	}
+}
 func (g *Gateway) withAgent(h func(http.ResponseWriter, *http.Request, *Agent)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		a, release, aerr := g.admit(r)
-		if aerr != nil {
-			if aerr.Status == 429 {
-				w.Header().Set("Retry-After", "1")
-			}
-			writeErr(w, aerr)
+		a, release, err := g.admit(r)
+		setAdmissionTiming(w, r)
+		if err != nil {
+			admissionHTTPHeaders(w, err)
+			writeErr(w, err)
 			return
 		}
 		defer release()
@@ -1186,9 +1256,10 @@ func (g *Gateway) appendEvent(ctx context.Context, a *Agent, kind string, payloa
 
 func (g *Gateway) routes() http.Handler {
 	mux := http.NewServeMux()
+	g.admissionRoutes(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
-			"ok": true, "requests": g.stats.requests.Load(), "rejected": g.stats.rejected.Load(),
+			"ok": true, "admission": g.admissionStatus(), "requests": g.stats.requests.Load(), "rejected": g.stats.rejected.Load(),
 			"errors": g.stats.errors.Load(), "rate_limited": g.stats.limited.Load(), "audit_lost": g.stats.auditLost.Load(),
 			"audit_retries": g.stats.auditRetries.Load(), "audit": g.auditStatus(),
 			"runtime_pool": g.runtime.Stat().TotalConns(), "admin_pool": g.admin.Stat().TotalConns(),
@@ -1512,6 +1583,17 @@ func main() {
 		runtime:  mustPool(ctx, runtimeURL, 32, true),
 		adminKey: adminKey,
 	}
+	cfg, err := admissionConfigFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	g.auth = mustPool(ctx, adminURL, 4, false)
+	g.quota = mustPool(ctx, adminURL, 4, false)
+	g.authGate = make(chan struct{}, 1024)
+	g.admission, err = newAdmissionController(&postgresAdmissionStore{pool: g.quota, gate: make(chan struct{}, 64)}, cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if err := g.startWriters(); err != nil {
 		log.Fatalf("configure audit: %v", err)
 	}
@@ -1551,7 +1633,31 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 	log.Printf("swarmpg gateway on %s (runtime pool max=%d)", addr, g.runtime.Config().MaxConns)
-	log.Fatal(srv.ListenAndServe())
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-stop
+		drain, cancel := context.WithTimeout(context.Background(), cfg.Execution+admissionMargin)
+		defer cancel()
+		if err := srv.Shutdown(drain); err != nil {
+			// Shutdown leaves active requests running when its deadline elapses.
+			// Close their connections before tearing down admission and DB pools.
+			_ = srv.Close()
+		}
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+	<-done
+	g.admission.close()
+	g.runtime.Close()
+	g.auth.Close()
+	g.quota.Close()
+	// Audit workers retain their existing durable-spool recovery contract; the
+	// process exits after HTTP drain rather than promising a transactional flush.
+
 }
 
 func sslmode(u string) string {
