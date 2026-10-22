@@ -38,8 +38,8 @@ check the harness but is not a substitute for either acceptance duration.
 | `ADMISSION_WORKERS` | `2000` | Worker identities, minimum 2000 |
 | `ADMISSION_DURATION` | `120s` | Sustained production duration, minimum 20s |
 | `ADMISSION_EXECUTION_MS` | `3000` | Gateway execution budget for this workload; permit TTL adds 10 seconds |
-| `ADMISSION_DATABASE_PORT` | `55500` | Owned database listener |
-| `ADMISSION_GATEWAY_PORT` | `55501` | First of three consecutive gateway ports |
+| `ADMISSION_DATABASE_PORT` | `16500` | Owned database listener |
+| `ADMISSION_GATEWAY_PORT` | `16501` | First of three consecutive gateway ports |
 | `ADMISSION_REPORT_DIR` | New temporary directory | Must be empty; evidence is never overwritten |
 
 The wrapper refuses occupied ports, uses isolated test credentials and a fresh database, and

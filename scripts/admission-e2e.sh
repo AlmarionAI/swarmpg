@@ -11,8 +11,9 @@ python3 - "$ADMISSION_RUN_DIR" <<'PY'
 import os,sys
 if any(os.scandir(sys.argv[1])): sys.exit('report directory must be empty; old evidence retained')
 PY
-export ADMISSION_DATABASE_PORT=${ADMISSION_DATABASE_PORT:-55500}
-export ADMISSION_GATEWAY_PORT=${ADMISSION_GATEWAY_PORT:-55501}
+# Keep listeners outside the host ephemeral range used by outbound requests.
+export ADMISSION_DATABASE_PORT=${ADMISSION_DATABASE_PORT:-16500}
+export ADMISSION_GATEWAY_PORT=${ADMISSION_GATEWAY_PORT:-16501}
 export ADMIN_KEY=admission-test-admin
 export PRINCIPAL_SECRET=admission-test-principal
 export ADMISSION_EXECUTION_MS=${ADMISSION_EXECUTION_MS:-3000}

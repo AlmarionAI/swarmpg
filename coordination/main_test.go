@@ -524,7 +524,7 @@ func TestRetryQueueCannotRestartDeadline(t *testing.T) {
 	}))
 	defer server.Close()
 	r := workerTestRun(server, 3000)
-	r.claimSem = make(chan struct{}, 1)
+	r.sem = make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
 		_, err := r.callWithRetryPolicy(context.Background(), agent{ID: "worker"}, "POST", "/v1/tasks/claim", map[string]any{"request_id": "fixed"}, false, true,
@@ -532,15 +532,15 @@ func TestRetryQueueCannotRestartDeadline(t *testing.T) {
 		done <- err
 	}()
 	<-serverEntered
-	// Queue a competing local claimant while the first HTTP attempt holds the
+	// Queue a competing HTTP request while the first HTTP attempt holds the
 	// slot. Its admission must not reset the original operation's retry clock.
 	occupied := make(chan struct{})
 	unblock := make(chan struct{})
 	go func() {
-		r.claimSem <- struct{}{}
+		r.sem <- struct{}{}
 		close(occupied)
 		<-unblock
-		<-r.claimSem
+		<-r.sem
 	}()
 	close(allowResponse)
 	<-occupied
@@ -558,5 +558,57 @@ func TestRetryQueueCannotRestartDeadline(t *testing.T) {
 		if !strings.Contains(err.Error(), detail) {
 			t.Fatalf("deadline diagnostic missing %q: %v", detail, err)
 		}
+	}
+}
+
+func TestClaimRetriesRetainQueuePlaceWithoutHoldingHTTPBudget(t *testing.T) {
+	firstAttempt := make(chan struct{})
+	var mu sync.Mutex
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v1/tasks/claim" {
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		body, _ := io.ReadAll(req.Body)
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		n := len(bodies)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(429)
+			_, _ = w.Write([]byte(`{"error":{"code":"org_concurrency_limited"}}`))
+			close(firstAttempt)
+			return
+		}
+		_, _ = w.Write([]byte(`{"task":null}`))
+	}))
+	defer server.Close()
+	r := workerTestRun(server, 3000)
+	r.claimSem = make(chan struct{}, 1)
+	r.sem = make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.callWithRetryPolicy(context.Background(), agent{ID: "first"}, "POST", "/v1/tasks/claim", map[string]any{"request_id": "stable"}, false, true,
+			requestRetryPolicy{time.Second, 150 * time.Millisecond, time.Millisecond})
+		done <- err
+	}()
+	<-firstAttempt
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	_, err := r.call(ctx, agent{ID: "late"}, "POST", "/v1/tasks/claim", map[string]any{"request_id": "late"}, false, true)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("late claimant displaced retry: %v", err)
+	}
+	if out, err := r.call(context.Background(), agent{}, "POST", "/v1/tasks/owned/renew", nil, false, false); err != nil || out.Status != 200 {
+		t.Fatalf("claim backoff held HTTP capacity: %+v %v", out, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 || bodies[0] != bodies[1] || len(r.claimSem) != 0 || len(r.sem) != 0 {
+		t.Fatalf("lost receipt or capacity: %v", bodies)
 	}
 }
