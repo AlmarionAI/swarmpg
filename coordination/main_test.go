@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -35,9 +37,153 @@ func TestIdlePollingBacksOffWithReproducibleJitter(t *testing.T) {
 
 func workerTestRun(server *httptest.Server, leaseMS int) *run {
 	return &run{
-		cfg: config{Gateway: server.URL, LeaseMS: leaseMS}, client: server.Client(), sem: make(chan struct{}, 8),
-		completed: map[string]bool{}, completers: map[string]bool{},
+		cfg: config{Gateway: server.URL, LeaseMS: leaseMS}, client: server.Client(), sem: make(chan struct{}, 8), claimSem: make(chan struct{}, 4),
+		completed: map[string]bool{}, completers: map[string]bool{}, participants: map[string]bool{},
 		report: report{HTTPOutcomes: map[string]int64{}, Tenants: []tenantReport{{}}},
+	}
+}
+
+func TestLockTimeoutRetriesExactBodyOnlyDuringFaultWindow(t *testing.T) {
+	for _, operation := range []struct {
+		name, path string
+		body       map[string]any
+	}{
+		{"claim", "/v1/tasks/claim", map[string]any{"request_id": "fixed-request", "queue": "work", "lease_ms": 3000}},
+		{"complete", "/v1/tasks/task/complete", map[string]any{"fence": "9007199254740993", "result": result{42}}},
+	} {
+		for _, window := range []string{"active", "absent", "expired"} {
+			t.Run(operation.name+"/"+window, func(t *testing.T) {
+				var mu sync.Mutex
+				var requests []string
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					body, _ := io.ReadAll(req.Body)
+					mu.Lock()
+					requests = append(requests, string(body))
+					n := len(requests)
+					mu.Unlock()
+					if n == 1 {
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = w.Write([]byte(`{"error":{"code":"55P03"}}`))
+					} else {
+						_, _ = w.Write([]byte(`{}`))
+					}
+				}))
+				defer server.Close()
+				r := workerTestRun(server, 3000)
+				if window == "active" {
+					r.faultUntil.Store(time.Now().Add(time.Second).UnixNano())
+					r.report.Faults = []fault{{Kind: "database", StartedAt: time.Now()}}
+				} else if window == "expired" {
+					r.faultUntil.Store(time.Now().Add(-time.Second).UnixNano())
+				}
+				out, err := r.call(context.Background(), agent{ID: "worker"}, "POST", operation.path, operation.body, false, true)
+				mu.Lock()
+				defer mu.Unlock()
+				if window == "active" {
+					if err != nil || out.Status != 200 || len(requests) != 2 || requests[0] != requests[1] || r.report.RequestRetries != 1 {
+						t.Fatalf("fault retry changed request or failed: response=%+v error=%v requests=%v", out, err, requests)
+					}
+				} else {
+					_, decodeErr := decodeOK[map[string]any](out, err)
+					if decodeErr == nil || out.Status != 400 || len(requests) != 1 || r.report.RequestRetries != 0 {
+						t.Fatalf("ordinary lock timeout was masked: response=%+v error=%v requests=%v", out, err, requests)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestSaturatedClaimAdmissionLeavesCapacityForLeaseHolders(t *testing.T) {
+	const claimLimit = 16
+	entered := make(chan struct{}, 1000)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/v1/tasks/claim" {
+			entered <- struct{}{}
+			<-req.Context().Done()
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	r := workerTestRun(server, 3000)
+	r.sem, r.claimSem = make(chan struct{}, 128), make(chan struct{}, claimLimit)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	var wg sync.WaitGroup
+	defer func() { cancel(); wg.Wait() }()
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = r.call(ctx, agent{ID: fmt.Sprint(i)}, "POST", "/v1/tasks/claim", nil, false, false)
+		}(i)
+	}
+	for i := 0; i < claimLimit; i++ {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("claim admission did not reach its cap")
+		}
+	}
+	for _, operation := range []string{"renew", "complete"} {
+		out, err := r.call(ctx, agent{}, "POST", "/v1/tasks/task/"+operation, nil, false, false)
+		if err != nil || out.Status != 200 {
+			t.Fatalf("%s starved behind idle claimers: HTTP%d %v", operation, out.Status, err)
+		}
+	}
+	r.mu.Lock()
+	participants := len(r.participants)
+	r.mu.Unlock()
+	if participants != claimLimit || len(r.sem) != claimLimit || len(entered) != 0 {
+		t.Fatalf("waiting claimers consumed shared capacity or counted as participants: participants=%d in-flight=%d extra-admitted=%d", participants, len(r.sem), len(entered))
+	}
+	cancel()
+	wg.Wait()
+	if len(r.sem) != 0 || len(r.claimSem) != 0 {
+		t.Fatal("cancelled claims leaked admission capacity")
+	}
+	if len(r.participants) != claimLimit {
+		t.Fatal("cancelled waiters were counted as participating workers")
+	}
+}
+
+func TestHeartbeatStopFinishesInflightRenewal(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		close(entered)
+		select {
+		case <-release:
+			_ = json.NewEncoder(w).Encode(task{ID: "task", Owner: "worker", Fence: "1", State: "claimed"})
+		case <-req.Context().Done():
+		}
+	}))
+	defer server.Close()
+	r := workerTestRun(server, 3000)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, stop := r.maintainLease(ctx, agent{ID: "worker"}, &task{ID: "task", Owner: "worker", Fence: "1"})
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("heartbeat did not start")
+	}
+	stopped := make(chan bool, 1)
+	go func() { stopped <- stop() }()
+	select {
+	case <-stopped:
+		t.Fatal("stop cancelled a renewal already in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	once.Do(func() { close(release) })
+	select {
+	case lost := <-stopped:
+		if lost || r.report.LeaseRenewals != 1 || len(r.report.Errors) != 0 {
+			t.Fatalf("graceful heartbeat stop failed: lost=%v report=%+v", lost, r.report)
+		}
+	case <-ctx.Done():
+		t.Fatal("heartbeat stop did not join after renewal")
 	}
 }
 

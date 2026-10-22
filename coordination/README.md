@@ -3,8 +3,9 @@
 This workload tests the durable task contract through the real HTTP gateway. It
 creates 100–1,000 worker identities in two organizations, repeatedly produces
 arithmetic dependency graphs, and checks persisted results and transition history
-after failures. Every registered worker must participate in claiming work. The report
-separately counts workers that actually complete tasks.
+after failures. Every registered worker must dispatch a claim request; waiting for
+client admission does not count as participation. The report separately counts
+workers that actually complete tasks.
 
 Run from the repository root with Go, Python 3, curl and PostgreSQL client tools:
 
@@ -37,8 +38,10 @@ files also remain for diagnosis. Docker containers are removed.
   stale fencing, changed inputs, identical completion replay and conflicting results.
 - Healthy workers renew every third of a lease while reading inputs and calculating;
   deliberate pause faults never renew. Idle workers use seeded jitter with an
-  exponential backoff capped at two seconds, so empty durable claim receipts do not
-  crowd out completion requests. Reports include empty claims and renewal outcomes.
+  exponential backoff capped at two seconds. Claim requests have a separate admission
+  limit of 16, acquired before the shared HTTP limit, to leave capacity for lease
+  holders. A heartbeat already in flight finishes before completion. Reports include
+  both admission limits, empty claims and renewal outcomes.
 - The gateway receives SIGKILL and restarts; the database is crash-restarted while
   workers are active. Each fault must interrupt requests and be followed by a
   successful completion. Transient failures are retried within bounded fault windows;
@@ -71,8 +74,10 @@ rejections, correctness counters, fault recovery times and event traces. The wra
 also retains gateway, schema and workload logs, plus local PostgreSQL logs. CI runs
 both worker counts on stock and kernel and uploads the reports and logs even on failure.
 
-Workers share a 32-connection runtime pool. Thus 1,000 worker identities do not mean
-1,000 simultaneous database connections. The default 30-second production window
+Workers share a 32-connection runtime pool. Claim concurrency is
+`min(16, max(1, COORD_IN_FLIGHT / 2))`; other requests share the total HTTP limit.
+Thus 1,000 worker identities do not mean 1,000 simultaneous database connections.
+This exercises clients using backpressure, not unthrottled overload. The default 30-second production window
 is a reproducible correctness/recovery experiment, not a saturation benchmark or
 production capacity guarantee. The noisy-neighbor case measures current per-agent
 admission; it does not establish organization-wide or multi-gateway fairness.
@@ -85,10 +90,10 @@ All four 30-second production runs passed, including gateway/database crash reco
 
 | Engine | Workers participating | Workers completing tasks | Verified tasks | Reclaimed tasks |
 |---|---:|---:|---:|---:|
-| Stock PostgreSQL 17 | 100 | 98 | 1,760 | 60 |
-| Stock PostgreSQL 17 | 1,000 | 967 | 6,880 | 237 |
-| Signed SwarmPG kernel | 100 | 98 | 1,728 | 59 |
-| Signed SwarmPG kernel | 1,000 | 953 | 6,480 | 223 |
+| Stock PostgreSQL 17 | 100 | 100 | 1,728 | 59 |
+| Stock PostgreSQL 17 | 1,000 | 972 | 7,200 | 248 |
+| Signed SwarmPG kernel | 100 | 99 | 1,776 | 61 |
+| Signed SwarmPG kernel | 1,000 | 966 | 7,360 | 253 |
 
 Every run recorded zero lost results, duplicate completions, stale overwrites,
 attribution failures and dependency failures. See the [measurement summaries](results/2026-10-22.json)

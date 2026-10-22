@@ -162,6 +162,7 @@ type run struct {
 	cfg          config
 	client       *http.Client
 	sem          chan struct{}
+	claimSem     chan struct{}
 	sequence     atomic.Uint64
 	faultUntil   atomic.Int64
 	mu           sync.Mutex
@@ -223,6 +224,32 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// Claim waiters queue outside the shared HTTP budget. Reserving capacity for
+// lease holders prevents idle polls from starving renewals and completions.
+func (r *run) admitRequest(ctx context.Context, claim bool) (func(), error) {
+	if claim {
+		select {
+		case r.claimSem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	select {
+	case r.sem <- struct{}{}:
+		return func() {
+			<-r.sem
+			if claim {
+				<-r.claimSem
+			}
+		}, nil
+	case <-ctx.Done():
+		if claim {
+			<-r.claimSem
+		}
+		return nil, ctx.Err()
+	}
+}
+
 // Retries always reuse the exact request body, including claim request IDs.
 // 5xx/transport failures are acceptable only in a recorded service fault window.
 func (r *run) call(ctx context.Context, a agent, method, path string, body any, admin, retry bool) (apiResponse, error) {
@@ -235,14 +262,20 @@ func (r *run) call(ctx context.Context, a agent, method, path string, body any, 
 		}
 	}
 	for attempt := 0; ; attempt++ {
-		select {
-		case r.sem <- struct{}{}:
-		case <-ctx.Done():
-			return apiResponse{}, ctx.Err()
+		isClaim := method == "POST" && path == "/v1/tasks/claim"
+		release, err := r.admitRequest(ctx, isClaim)
+		if err != nil {
+			return apiResponse{}, err
+		}
+		// A cancelled waiter can win a simultaneously available semaphore.
+		// It must not be counted as a participating HTTP attempt.
+		if err := ctx.Err(); err != nil {
+			release()
+			return apiResponse{}, err
 		}
 		req, err := http.NewRequestWithContext(ctx, method, r.cfg.Gateway+path, bytes.NewReader(encoded))
 		if err != nil {
-			<-r.sem
+			release()
 			return apiResponse{}, err
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -250,6 +283,12 @@ func (r *run) call(ctx context.Context, a agent, method, path string, body any, 
 			req.Header.Set("X-Admin-Key", r.cfg.AdminKey)
 		} else {
 			req.Header.Set("Authorization", "Bearer "+a.Token)
+		}
+		if isClaim && attempt == 0 {
+			r.mu.Lock()
+			r.report.ClaimAttempts++
+			r.participants[a.ID] = true
+			r.mu.Unlock()
 		}
 		resp, transportErr := r.client.Do(req)
 		out := apiResponse{}
@@ -266,7 +305,7 @@ func (r *run) call(ctx context.Context, a agent, method, path string, body any, 
 			_ = json.Unmarshal(out.Body, &envelope)
 			out.Code = envelope.Error.Code
 		}
-		<-r.sem
+		release()
 		key := strconv.Itoa(out.Status)
 		if out.Code != "" {
 			key += ":" + out.Code
@@ -281,7 +320,11 @@ func (r *run) call(ctx context.Context, a agent, method, path string, body any, 
 			r.report.Tenants[a.Tenant].HTTPOutcomes[key]++
 		}
 		r.mu.Unlock()
-		transient := transportErr != nil || out.Status >= 500 || databaseDisconnect(out.Code)
+		// Restart races can leave a retried receipt or renewal waiting on a
+		// transaction until lock_timeout. Retry that exact operation only in
+		// the recorded fault window; ordinary lock timeouts remain failures.
+		faultLockTimeout := out.Code == "55P03" && time.Now().UnixNano() <= r.faultUntil.Load()
+		transient := transportErr != nil || out.Status >= 500 || databaseDisconnect(out.Code) || faultLockTimeout
 		if transient && ctx.Err() == nil && time.Now().UnixNano() <= r.faultUntil.Load() {
 			r.mu.Lock()
 			if n := len(r.report.Faults); n > 0 {
@@ -396,10 +439,6 @@ func (r *run) enqueue(ctx context.Context, a agent, queue, key string, p payload
 }
 
 func (r *run) claim(ctx context.Context, a agent, queue string, lease int) (receipt, error) {
-	r.mu.Lock()
-	r.report.ClaimAttempts++
-	r.participants[a.ID] = true
-	r.mu.Unlock()
 	return decodeOK[receipt](r.call(ctx, a, "POST", "/v1/tasks/claim", map[string]any{
 		"queue": queue, "request_id": r.uuid("claim"), "lease_ms": lease,
 	}, false, true))
@@ -645,10 +684,17 @@ func emptyPollDelay(streak int, random *rand.Rand) time.Duration {
 func (r *run) maintainLease(parent context.Context, a agent, t *task) (context.Context, func() bool) {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
+	stopping := make(chan struct{})
+	var stopOnce sync.Once
 	var lost atomic.Bool
 	go func() {
 		defer close(done)
 		for ctx.Err() == nil {
+			select {
+			case <-stopping:
+				return
+			default:
+			}
 			r.mu.Lock()
 			r.report.LeaseRenewalAttempts++
 			r.mu.Unlock()
@@ -667,8 +713,15 @@ func (r *run) maintainLease(parent context.Context, a agent, t *task) (context.C
 					r.mu.Lock()
 					r.report.LeaseRenewals++
 					r.mu.Unlock()
-					if !sleep(ctx, time.Duration(r.cfg.LeaseMS)*time.Millisecond/3) {
+					timer := time.NewTimer(time.Duration(r.cfg.LeaseMS) * time.Millisecond / 3)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
 						return
+					case <-stopping:
+						timer.Stop()
+						return
+					case <-timer.C:
 					}
 					continue
 				}
@@ -679,7 +732,14 @@ func (r *run) maintainLease(parent context.Context, a agent, t *task) (context.C
 			return
 		}
 	}()
-	return ctx, func() bool { cancel(); <-done; return lost.Load() }
+	return ctx, func() bool {
+		// Finish any renewal already sent, then complete under its fresh lease.
+		// Parent cancellation still interrupts an unavailable service promptly.
+		stopOnce.Do(func() { close(stopping) })
+		<-done
+		cancel()
+		return lost.Load()
+	}
 }
 
 func (r *run) processTask(ctx context.Context, a agent, t *task) {
@@ -1137,11 +1197,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "require 100–1000 workers, 1–1000 in-flight, duration >=6s, lease 500–300000ms, and an owned fault controller")
 		os.Exit(2)
 	}
-	r := &run{cfg: cfg, sem: make(chan struct{}, cfg.InFlight), workerIDs: map[string]int{}, completed: map[string]bool{}, participants: map[string]bool{}, completers: map[string]bool{},
+	claimLimit := min(16, max(1, cfg.InFlight/2))
+	r := &run{cfg: cfg, sem: make(chan struct{}, cfg.InFlight), claimSem: make(chan struct{}, claimLimit), workerIDs: map[string]int{}, completed: map[string]bool{}, participants: map[string]bool{}, completers: map[string]bool{},
 		client: &http.Client{Transport: &http.Transport{MaxIdleConns: cfg.InFlight * 2, MaxIdleConnsPerHost: cfg.InFlight, MaxConnsPerHost: cfg.InFlight}, Timeout: 10 * time.Second},
 		report: report{Seed: cfg.Seed, SourceCommit: os.Getenv("COORD_SOURCE_COMMIT"), SourceTreeSHA256: os.Getenv("COORD_SOURCE_TREE_SHA256"),
 			Environment:  map[string]string{"go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH, "cpu_count": strconv.Itoa(runtime.NumCPU()), "gomaxprocs": strconv.Itoa(runtime.GOMAXPROCS(0)), "postgres": os.Getenv("COORD_DB_VERSION"), "kernel": os.Getenv("KERNEL"), "audit_mode": "best-effort", "database_mode": os.Getenv("COORD_DB_MODE")},
-			Settings:     map[string]any{"workers": cfg.Workers, "in_flight": cfg.InFlight, "lease_ms": cfg.LeaseMS, "duration": cfg.Duration.String(), "runtime_pool": 32, "empty_poll_backoff_cap_ms": 2000, "lease_renew_interval_ms": cfg.LeaseMS / 3, "quiet_worker_share": 0.8, "noisy_query_rps_limit": 5, "noisy_query_concurrency_limit": 2, "external_effects": false},
+			Settings:     map[string]any{"workers": cfg.Workers, "in_flight": cfg.InFlight, "claim_in_flight": claimLimit, "lease_ms": cfg.LeaseMS, "duration": cfg.Duration.String(), "runtime_pool": 32, "empty_poll_backoff_cap_ms": 2000, "lease_renew_interval_ms": cfg.LeaseMS / 3, "quiet_worker_share": 0.8, "noisy_query_rps_limit": 5, "noisy_query_concurrency_limit": 2, "external_effects": false},
 			HTTPOutcomes: map[string]int64{}, Events: []event{}, Errors: []string{}},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Duration+time.Duration(cfg.LeaseMS)*time.Millisecond+3*time.Minute)
