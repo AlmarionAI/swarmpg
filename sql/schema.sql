@@ -1038,37 +1038,6 @@ BEGIN
   RETURN swarmpg._task_response(swarmpg._task_json(t), true);
 END $$;
 
-CREATE OR REPLACE FUNCTION swarmpg.task_complete(p_id uuid, p_fence bigint, p_result jsonb) RETURNS jsonb
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
-DECLARE t swarmpg.tasks%ROWTYPE;
-BEGIN
-  PERFORM swarmpg._task_authorize(true);
-  IF p_result IS NULL OR octet_length(p_result::text) > 65536 THEN
-    RAISE EXCEPTION 'result must be a JSON value of at most 64 KiB' USING ERRCODE = 'PT400';
-  END IF;
-  IF p_fence IS NULL OR p_fence < 1 THEN
-    RAISE EXCEPTION 'fence must be a positive integer' USING ERRCODE = 'PT400';
-  END IF;
-  SELECT * INTO t FROM swarmpg.tasks WHERE id = p_id AND org_id = swarmpg.current_org() FOR UPDATE;
-  IF NOT FOUND THEN RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404'; END IF;
-  IF t.state = 'completed' AND t.owner_agent_id = swarmpg.current_agent() AND t.fence = p_fence THEN
-    IF t.result IS DISTINCT FROM p_result THEN
-      RAISE EXCEPTION 'completed task already contains a different result' USING ERRCODE = 'PT409';
-    END IF;
-    RETURN swarmpg._task_response(jsonb_build_object('task', swarmpg._task_json(t), 'replayed', true), true);
-  END IF;
-  PERFORM swarmpg._task_require_claim(t, p_fence);
-  PERFORM swarmpg._task_check_inputs(t.inputs);
-  PERFORM swarmpg._task_authorize_locked(true);
-  -- Input and authorization locks may outlast the remaining lease.
-  PERFORM swarmpg._task_require_claim(t, p_fence);
-  UPDATE swarmpg.tasks SET state = 'completed', result = p_result, lease_until = NULL,
-    completed_at = clock_timestamp(), updated_at = clock_timestamp(), revision = revision + 1
-  WHERE id = t.id RETURNING * INTO t;
-  PERFORM swarmpg._task_event(t, 'completed', swarmpg.current_agent());
-  RETURN swarmpg._task_response(jsonb_build_object('task', swarmpg._task_json(t), 'replayed', false), true);
-END $$;
-
 CREATE OR REPLACE FUNCTION swarmpg.task_cancel(p_id uuid) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, swarmpg, pg_temp AS $$
 DECLARE t swarmpg.tasks%ROWTYPE;
@@ -1128,6 +1097,322 @@ BEGIN
   RETURN swarmpg._task_json(t);
 END $$;
 
+-- Outbox intents commit with task completion. Delivery state never changes the
+-- canonical completion receipt; retries compare the immutable effect set.
+ALTER TABLE swarmpg.tasks ADD COLUMN IF NOT EXISTS completion_effects jsonb NOT NULL DEFAULT '[]';
+
+CREATE TABLE IF NOT EXISTS swarmpg.outbox_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id uuid NOT NULL,
+  task_id uuid NOT NULL,
+  key text NOT NULL,
+  destination text NOT NULL,
+  payload jsonb NOT NULL,
+  idempotency_key text GENERATED ALWAYS AS ('swarmpg:' || org_id::text || ':' || id::text) STORED,
+  state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','delivering','delivered','failed')),
+  worker_id uuid,
+  fence bigint NOT NULL DEFAULT 0 CHECK (fence >= 0),
+  lease_until timestamptz,
+  attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  total_attempts bigint NOT NULL DEFAULT 0 CHECK (total_attempts >= attempts),
+  max_attempts integer NOT NULL DEFAULT 10 CHECK (max_attempts > 0),
+  available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  last_error text,
+  delivery_response jsonb,
+  revision bigint NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  delivered_at timestamptz,
+  UNIQUE (task_id,key),
+  UNIQUE (org_id,id),
+  FOREIGN KEY (org_id,task_id) REFERENCES swarmpg.tasks(org_id,id) ON DELETE CASCADE,
+  CHECK (state <> 'delivering' OR (worker_id IS NOT NULL AND lease_until IS NOT NULL)),
+  CHECK ((state = 'delivered') = (delivered_at IS NOT NULL)),
+  CHECK ((state = 'delivered') = (delivery_response IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS outbox_claim_idx ON swarmpg.outbox_messages(org_id,destination,available_at,created_at,id)
+  WHERE state IN ('pending','delivering');
+CREATE TABLE IF NOT EXISTS swarmpg.outbox_history (
+  message_id uuid NOT NULL,
+  org_id uuid NOT NULL,
+  revision bigint NOT NULL,
+  event text NOT NULL,
+  worker_id uuid,
+  fence bigint NOT NULL,
+  state text NOT NULL,
+  attempts integer NOT NULL,
+  at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  detail jsonb NOT NULL DEFAULT '{}',
+  PRIMARY KEY (message_id,revision),
+  FOREIGN KEY (org_id,message_id) REFERENCES swarmpg.outbox_messages(org_id,id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS swarmpg.outbox_claim_requests (
+  org_id uuid NOT NULL REFERENCES swarmpg.orgs(id) ON DELETE CASCADE,
+  worker_id uuid NOT NULL,
+  request_id uuid NOT NULL,
+  destination text NOT NULL,
+  lease_ms integer NOT NULL,
+  response jsonb,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (org_id,worker_id,request_id)
+);
+ALTER TABLE swarmpg.outbox_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.outbox_messages FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS outbox_read ON swarmpg.outbox_messages;
+CREATE POLICY outbox_read ON swarmpg.outbox_messages FOR SELECT USING (org_id = swarmpg.current_org());
+ALTER TABLE swarmpg.outbox_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.outbox_history FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS outbox_history_read ON swarmpg.outbox_history;
+CREATE POLICY outbox_history_read ON swarmpg.outbox_history FOR SELECT USING (org_id = swarmpg.current_org());
+ALTER TABLE swarmpg.outbox_claim_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE swarmpg.outbox_claim_requests FORCE ROW LEVEL SECURITY;
+REVOKE ALL ON swarmpg.outbox_messages,swarmpg.outbox_history,swarmpg.outbox_claim_requests FROM PUBLIC,agent_runtime;
+GRANT SELECT ON swarmpg.outbox_messages,swarmpg.outbox_history TO agent_runtime;
+
+CREATE OR REPLACE FUNCTION swarmpg._task_effects(p_effects jsonb) RETURNS jsonb
+LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE e jsonb; normalized jsonb;
+BEGIN
+  IF p_effects IS NULL OR jsonb_typeof(p_effects) <> 'array' THEN
+    RAISE EXCEPTION 'effects must be a JSON array' USING ERRCODE = 'PT400';
+  END IF;
+  IF jsonb_array_length(p_effects) > 32 THEN
+    RAISE EXCEPTION 'at most 32 effects are allowed' USING ERRCODE = 'PT400';
+  END IF;
+  FOR e IN SELECT value FROM jsonb_array_elements(p_effects) LOOP
+    IF jsonb_typeof(e) <> 'object' THEN
+      RAISE EXCEPTION 'each effect must be an object' USING ERRCODE = 'PT400';
+    END IF;
+    IF NOT (e ?& ARRAY['key','destination','payload']) OR (e - ARRAY['key','destination','payload']) <> '{}'::jsonb
+       OR jsonb_typeof(e->'key') <> 'string' OR jsonb_typeof(e->'destination') <> 'string'
+       OR (e->>'key') COLLATE "C" !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+       OR (e->>'destination') COLLATE "C" !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+       OR octet_length((e->'payload')::text) > 65536 THEN
+      RAISE EXCEPTION 'invalid effect fields or payload exceeds 64 KiB' USING ERRCODE = 'PT400';
+    END IF;
+  END LOOP;
+  IF (SELECT count(*) <> count(DISTINCT value->>'key') FROM jsonb_array_elements(p_effects)) THEN
+    RAISE EXCEPTION 'effect keys must be unique within a task' USING ERRCODE = 'PT400';
+  END IF;
+  SELECT coalesce(jsonb_agg(value ORDER BY (value->>'key') COLLATE "C"),'[]') INTO normalized
+  FROM jsonb_array_elements(p_effects);
+  IF octet_length(normalized::text) > 262144 THEN
+    RAISE EXCEPTION 'normalized effects exceed 256 KiB' USING ERRCODE = 'PT400';
+  END IF;
+  RETURN normalized;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg._outbox_json(m swarmpg.outbox_messages) RETURNS jsonb
+LANGUAGE sql STABLE SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+  SELECT to_jsonb(m) || jsonb_build_object('fence',m.fence::text)
+$$;
+CREATE OR REPLACE FUNCTION swarmpg._outbox_event(m swarmpg.outbox_messages,p_event text,
+  p_worker uuid,p_detail jsonb DEFAULT '{}') RETURNS void
+LANGUAGE sql SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+  INSERT INTO swarmpg.outbox_history(message_id,org_id,revision,event,worker_id,fence,state,attempts,detail)
+  VALUES (m.id,m.org_id,m.revision,p_event,p_worker,m.fence,m.state,m.attempts,p_detail)
+$$;
+CREATE OR REPLACE FUNCTION swarmpg._outbox_require_claim(m swarmpg.outbox_messages,p_worker uuid,p_fence bigint) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+BEGIN
+  IF p_worker IS NULL OR p_fence IS NULL OR p_fence < 1 THEN
+    RAISE EXCEPTION 'worker_id and positive fence are required' USING ERRCODE = 'PT400';
+  END IF;
+  IF m.state <> 'delivering' OR m.worker_id IS DISTINCT FROM p_worker OR m.fence <> p_fence THEN
+    RAISE EXCEPTION 'outbox claim is no longer current' USING ERRCODE = 'PT410';
+  END IF;
+  IF m.lease_until <= clock_timestamp() THEN
+    RAISE EXCEPTION 'outbox lease has expired' USING ERRCODE = 'PT411';
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.task_complete(p_id uuid,p_fence bigint,p_result jsonb,p_effects jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE t swarmpg.tasks%ROWTYPE; effects jsonb; e jsonb; m swarmpg.outbox_messages%ROWTYPE;
+BEGIN
+  PERFORM swarmpg._task_authorize(true);
+  IF p_result IS NULL OR octet_length(p_result::text) > 65536 THEN
+    RAISE EXCEPTION 'result must be a JSON value of at most 64 KiB' USING ERRCODE = 'PT400';
+  END IF;
+  IF p_fence IS NULL OR p_fence < 1 THEN
+    RAISE EXCEPTION 'fence must be a positive integer' USING ERRCODE = 'PT400';
+  END IF;
+  effects := swarmpg._task_effects(p_effects);
+  SELECT * INTO t FROM swarmpg.tasks WHERE id = p_id AND org_id = swarmpg.current_org() FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404'; END IF;
+  IF t.state = 'completed' AND t.owner_agent_id = swarmpg.current_agent() AND t.fence = p_fence THEN
+    IF t.result IS DISTINCT FROM p_result OR t.completion_effects IS DISTINCT FROM effects THEN
+      RAISE EXCEPTION 'completed task already contains a different result or effect set' USING ERRCODE = 'PT409';
+    END IF;
+    RETURN swarmpg._task_response(jsonb_build_object('task',swarmpg._task_json(t),'replayed',true),true);
+  END IF;
+  PERFORM swarmpg._task_require_claim(t,p_fence);
+  PERFORM swarmpg._task_check_inputs(t.inputs);
+  PERFORM swarmpg._task_authorize_locked(true);
+  PERFORM swarmpg._task_require_claim(t,p_fence);
+  UPDATE swarmpg.tasks SET state='completed',result=p_result,completion_effects=effects,lease_until=NULL,
+    completed_at=clock_timestamp(),updated_at=clock_timestamp(),revision=revision+1
+  WHERE id=t.id RETURNING * INTO t;
+  PERFORM swarmpg._task_event(t,'completed',swarmpg.current_agent());
+  FOR e IN SELECT value FROM jsonb_array_elements(effects) LOOP
+    INSERT INTO swarmpg.outbox_messages(org_id,task_id,key,destination,payload)
+    VALUES (t.org_id,t.id,e->>'key',e->>'destination',e->'payload') RETURNING * INTO m;
+    PERFORM swarmpg._outbox_event(m,'enqueued',NULL);
+  END LOOP;
+  RETURN swarmpg._task_response(jsonb_build_object('task',swarmpg._task_json(t),'replayed',false),true);
+END $$;
+
+-- No default on the four-argument overload: old SQL callers unambiguously
+-- complete with an empty effect set, including their exact retry comparison.
+CREATE OR REPLACE FUNCTION swarmpg.task_complete(p_id uuid,p_fence bigint,p_result jsonb) RETURNS jsonb
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+  SELECT swarmpg.task_complete(p_id,p_fence,p_result,'[]'::jsonb)
+$$;
+CREATE OR REPLACE FUNCTION swarmpg.task_outbox(p_id uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+BEGIN
+  PERFORM swarmpg._task_authorize(false);
+  IF NOT EXISTS (SELECT 1 FROM swarmpg.tasks WHERE id=p_id AND org_id=swarmpg.current_org()) THEN
+    RAISE EXCEPTION 'task not found' USING ERRCODE = 'PT404';
+  END IF;
+  RETURN swarmpg._task_response(jsonb_build_object('messages',coalesce((
+    SELECT jsonb_agg(swarmpg._outbox_json(m) ORDER BY m.key COLLATE "C") FROM swarmpg.outbox_messages m
+    WHERE m.task_id=p_id AND m.org_id=swarmpg.current_org()),'[]'::jsonb)));
+END $$;
+
+-- Dispatcher authority comes only from function ACLs (schema owner/admin).
+-- A destination is a configured routing name, never an agent-supplied URL.
+CREATE OR REPLACE FUNCTION swarmpg.outbox_claim(p_org uuid,p_destination text,p_worker uuid,p_request uuid,
+  p_lease_ms integer DEFAULT 30000) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE m swarmpg.outbox_messages%ROWTYPE; r swarmpg.outbox_claim_requests%ROWTYPE; receipt jsonb;
+BEGIN
+  PERFORM swarmpg._task_lease(p_lease_ms);
+  IF p_org IS NULL OR p_worker IS NULL OR p_request IS NULL OR p_destination IS NULL
+     OR p_destination COLLATE "C" !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' THEN
+    RAISE EXCEPTION 'organization, worker, request and valid destination are required' USING ERRCODE = 'PT400';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM swarmpg.orgs WHERE id=p_org) THEN
+    RAISE EXCEPTION 'organization not found' USING ERRCODE = 'PT404';
+  END IF;
+  INSERT INTO swarmpg.outbox_claim_requests(org_id,worker_id,request_id,destination,lease_ms)
+  VALUES (p_org,p_worker,p_request,p_destination,p_lease_ms) ON CONFLICT DO NOTHING;
+  SELECT * INTO r FROM swarmpg.outbox_claim_requests
+  WHERE org_id=p_org AND worker_id=p_worker AND request_id=p_request FOR UPDATE;
+  IF r.destination <> p_destination OR r.lease_ms <> p_lease_ms THEN
+    RAISE EXCEPTION 'claim request identifies different parameters' USING ERRCODE = 'PT409';
+  END IF;
+  IF r.response IS NOT NULL THEN RETURN r.response || jsonb_build_object('replayed',true); END IF;
+  LOOP
+    SELECT * INTO m FROM swarmpg.outbox_messages candidate
+    WHERE candidate.org_id=p_org AND candidate.destination=p_destination
+      AND ((candidate.state='pending' AND candidate.available_at <= clock_timestamp())
+        OR (candidate.state='delivering' AND candidate.lease_until <= clock_timestamp()))
+    ORDER BY candidate.available_at,candidate.created_at,candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED;
+    IF NOT FOUND THEN
+      receipt := jsonb_build_object('message',NULL,'replayed',false);
+      EXIT;
+    END IF;
+    -- Reclaim an expired final attempt as a durable failure, then continue to
+    -- useful work. Such messages cannot remain stuck delivering indefinitely.
+    IF m.attempts >= m.max_attempts THEN
+      UPDATE swarmpg.outbox_messages SET state='failed',worker_id=NULL,lease_until=NULL,
+        last_error='delivery attempts exhausted',revision=revision+1,updated_at=clock_timestamp()
+      WHERE id=m.id RETURNING * INTO m;
+      PERFORM swarmpg._outbox_event(m,'failed',NULL,jsonb_build_object('reason','delivery attempts exhausted'));
+      CONTINUE;
+    END IF;
+    UPDATE swarmpg.outbox_messages SET state='delivering',worker_id=p_worker,fence=fence+1,
+      lease_until=clock_timestamp()+p_lease_ms*interval '1 millisecond',attempts=attempts+1,
+      total_attempts=total_attempts+1,revision=revision+1,updated_at=clock_timestamp()
+    WHERE id=m.id RETURNING * INTO m;
+    PERFORM swarmpg._outbox_event(m,'claimed',p_worker,jsonb_build_object('request_id',p_request));
+    receipt := jsonb_build_object('message',swarmpg._outbox_json(m),'replayed',false);
+    EXIT;
+  END LOOP;
+  UPDATE swarmpg.outbox_claim_requests SET response=receipt
+  WHERE org_id=p_org AND worker_id=p_worker AND request_id=p_request;
+  RETURN receipt;
+END $$;
+
+CREATE OR REPLACE FUNCTION swarmpg.outbox_get(p_org uuid,p_id uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE m swarmpg.outbox_messages%ROWTYPE;
+BEGIN
+  SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id;
+  IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE = 'PT404'; END IF;
+  RETURN swarmpg._outbox_json(m);
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.outbox_renew(p_org uuid,p_id uuid,p_worker uuid,p_fence bigint,p_lease_ms integer) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE m swarmpg.outbox_messages%ROWTYPE;
+BEGIN
+  PERFORM swarmpg._task_lease(p_lease_ms);
+  SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE = 'PT404'; END IF;
+  PERFORM swarmpg._outbox_require_claim(m,p_worker,p_fence);
+  UPDATE swarmpg.outbox_messages SET lease_until=greatest(lease_until,clock_timestamp()+p_lease_ms*interval '1 millisecond'),
+    revision=revision+1,updated_at=clock_timestamp() WHERE id=m.id RETURNING * INTO m;
+  PERFORM swarmpg._outbox_event(m,'renewed',p_worker);
+  RETURN swarmpg._outbox_json(m);
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.outbox_ack(p_org uuid,p_id uuid,p_worker uuid,p_fence bigint,p_response jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE m swarmpg.outbox_messages%ROWTYPE;
+BEGIN
+  IF p_response IS NULL OR octet_length(p_response::text)>16384 OR p_worker IS NULL OR p_fence IS NULL OR p_fence<1 THEN
+    RAISE EXCEPTION 'worker, positive fence and JSON response of at most 16 KiB required' USING ERRCODE = 'PT400';
+  END IF;
+  SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE = 'PT404'; END IF;
+  IF m.state='delivered' AND m.worker_id=p_worker AND m.fence=p_fence THEN
+    IF m.delivery_response IS DISTINCT FROM p_response THEN
+      RAISE EXCEPTION 'delivered message contains a different response' USING ERRCODE = 'PT409';
+    END IF;
+    RETURN jsonb_build_object('message',swarmpg._outbox_json(m),'replayed',true);
+  END IF;
+  PERFORM swarmpg._outbox_require_claim(m,p_worker,p_fence);
+  UPDATE swarmpg.outbox_messages SET state='delivered',lease_until=NULL,delivery_response=p_response,
+    delivered_at=clock_timestamp(),updated_at=clock_timestamp(),revision=revision+1 WHERE id=m.id RETURNING * INTO m;
+  PERFORM swarmpg._outbox_event(m,'delivered',p_worker);
+  RETURN jsonb_build_object('message',swarmpg._outbox_json(m),'replayed',false);
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.outbox_nack(p_org uuid,p_id uuid,p_worker uuid,p_fence bigint,
+  p_error text,p_retry_ms integer,p_permanent boolean) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE m swarmpg.outbox_messages%ROWTYPE;
+BEGIN
+  IF p_error IS NULL OR length(p_error) NOT BETWEEN 1 AND 1000 OR p_retry_ms IS NULL
+     OR p_retry_ms NOT BETWEEN 0 AND 3600000 OR p_permanent IS NULL THEN
+    RAISE EXCEPTION 'error, retry_ms 0..3600000 and permanent are required' USING ERRCODE = 'PT400';
+  END IF;
+  SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE = 'PT404'; END IF;
+  PERFORM swarmpg._outbox_require_claim(m,p_worker,p_fence);
+  UPDATE swarmpg.outbox_messages SET state=CASE WHEN p_permanent OR attempts>=max_attempts THEN 'failed' ELSE 'pending' END,
+    worker_id=NULL,lease_until=NULL,last_error=p_error,available_at=clock_timestamp()+p_retry_ms*interval '1 millisecond',
+    revision=revision+1,updated_at=clock_timestamp() WHERE id=m.id RETURNING * INTO m;
+  PERFORM swarmpg._outbox_event(m,CASE WHEN m.state='failed' THEN 'failed' ELSE 'nacked' END,p_worker,
+    jsonb_build_object('error',p_error,'retry_ms',p_retry_ms,'permanent',p_permanent));
+  RETURN swarmpg._outbox_json(m);
+END $$;
+CREATE OR REPLACE FUNCTION swarmpg.outbox_retry(p_org uuid,p_id uuid,p_reason text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog,swarmpg,pg_temp AS $$
+DECLARE m swarmpg.outbox_messages%ROWTYPE;
+BEGIN
+  IF p_reason IS NULL OR length(p_reason) NOT BETWEEN 1 AND 1000 THEN
+    RAISE EXCEPTION 'retry reason must be 1 to 1000 characters' USING ERRCODE = 'PT400';
+  END IF;
+  SELECT * INTO m FROM swarmpg.outbox_messages WHERE org_id=p_org AND id=p_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'outbox message not found' USING ERRCODE = 'PT404'; END IF;
+  IF m.state <> 'failed' THEN RAISE EXCEPTION 'only failed messages can be retried' USING ERRCODE = 'PT409'; END IF;
+  UPDATE swarmpg.outbox_messages SET state='pending',worker_id=NULL,lease_until=NULL,attempts=0,fence=fence+1,
+    available_at=clock_timestamp(),revision=revision+1,updated_at=clock_timestamp() WHERE id=m.id RETURNING * INTO m;
+  PERFORM swarmpg._outbox_event(m,'retried',NULL,jsonb_build_object('reason',p_reason));
+  RETURN swarmpg._outbox_json(m);
+END $$;
+
+
 -- Revoke default PUBLIC execution for every task function, including private
 -- helpers and administrative recovery. Grant only the intended agent surface.
 DO $$
@@ -1135,7 +1420,8 @@ DECLARE f regprocedure;
 BEGIN
   FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
            WHERE p.pronamespace = 'swarmpg'::regnamespace
-             AND (p.proname LIKE 'task\_%' OR p.proname LIKE '\_task\_%')
+             AND (p.proname LIKE 'task\_%' OR p.proname LIKE '\_task\_%'
+               OR p.proname LIKE 'outbox\_%' OR p.proname LIKE '\_outbox\_%')
   LOOP
     EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC, agent_runtime', f);
   END LOOP;
@@ -1143,5 +1429,6 @@ END $$;
 GRANT EXECUTE ON FUNCTION swarmpg.task_enqueue(text,text,jsonb,uuid[],jsonb),
   swarmpg.task_get(uuid), swarmpg.task_claim(text,uuid,integer), swarmpg.task_renew(uuid,bigint,integer),
   swarmpg.task_release(uuid,bigint), swarmpg.task_complete(uuid,bigint,jsonb), swarmpg.task_cancel(uuid),
-  swarmpg.task_history(uuid,integer) TO agent_runtime;
+  swarmpg.task_history(uuid,integer), swarmpg.task_complete(uuid,bigint,jsonb,jsonb),
+  swarmpg.task_outbox(uuid) TO agent_runtime;
 COMMIT;

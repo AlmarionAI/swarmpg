@@ -99,7 +99,7 @@ func TestNotificationIsAccepted(t *testing.T) {
 func TestLegacyToolsList(t *testing.T) {
 	rep := serve(t, `{"jsonrpc":"2.0","id":"a","method":"tools/list"}`, map[string]string{"MCP-Protocol-Version": "2025-06-18"})
 	got := strings.Join(toolNames(t, rep), ",")
-	if got != "schema,query,memory_get,memory_put,memory_delete,memory_history,memory_undo,events_append,task_enqueue,task_get,task_claim,task_renew,task_release,task_complete,task_cancel,task_history" {
+	if got != "schema,query,memory_get,memory_put,memory_delete,memory_history,memory_undo,events_append,task_enqueue,task_get,task_claim,task_renew,task_release,task_complete,task_cancel,task_history,task_outbox" {
 		t.Fatalf("tools: %s", got)
 	}
 	if _, ok := rep.Result["resultType"]; ok {

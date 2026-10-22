@@ -702,7 +702,7 @@ func (g *Gateway) describe(ctx context.Context, a *Agent) (string, *apiError) {
 			       string_agg(c.column_name || ' ' || c.data_type, ', ' ORDER BY c.ordinal_position)
 			FROM information_schema.columns c
 			WHERE c.table_schema = 'swarmpg'
-			  AND c.table_name IN ('memory','memory_history','documents','events','tasks','task_history')
+			  AND c.table_name IN ('memory','memory_history','documents','events','tasks','task_history','outbox_messages','outbox_history')
 			GROUP BY c.table_name ORDER BY c.table_name`)
 		if err != nil {
 			return err
@@ -727,7 +727,10 @@ func (g *Gateway) describe(ctx context.Context, a *Agent) (string, *apiError) {
 		"- Use swarmpg.documents (collection, body jsonb) for your own structured data; you cannot CREATE TABLE.\n" +
 		"- Task queues are shared within your org. Use task_enqueue(queue,key,payload,dependencies,inputs),\n" +
 		"  task_claim(queue,request_id,lease_ms), task_get(id), task_renew(id,fence,lease_ms),\n" +
-		"  task_release(id,fence), task_complete(id,fence,result), task_cancel(id) and task_history(id,limit).\n" +
+		"  task_release(id,fence), task_complete(id,fence,result,effects), task_cancel(id), task_history(id,limit)\n" +
+		"  and task_outbox(id). Omitting effects completes with an empty effect set. Each effect has key,\n" +
+		"  destination and payload; completion stores all intents atomically. Outbox messages/history are\n" +
+		"  read-only within your org; delivery transitions require an admin dispatcher.\n" +
 		"  Prefix SQL calls with swarmpg.; task tables/history are read-only. Keep fencing tokens as strings\n" +
 		"  in REST/MCP; SQL takes bigint. Reuse a claim request UUID on retry. Completion checks your current\n" +
 		"  unexpired lease and all declared producer-selected memory input versions in one transaction.\n" +
@@ -1425,6 +1428,7 @@ func (g *Gateway) routes() http.Handler {
 	}))
 
 	g.taskRoutes(mux)
+	g.outboxRoutes(mux)
 	mux.HandleFunc("/mcp", g.handleMCP)
 
 	return mux

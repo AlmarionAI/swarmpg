@@ -49,8 +49,9 @@ type taskRenewRequest struct {
 }
 
 type taskCompleteRequest struct {
-	Fence  string          `json:"fence"`
-	Result json.RawMessage `json:"result"`
+	Fence   string          `json:"fence"`
+	Result  json.RawMessage `json:"result"`
+	Effects json.RawMessage `json:"effects,omitempty"`
 }
 
 // Both transports reject unknown fields and extra JSON values. In particular,
@@ -261,7 +262,11 @@ func (g *Gateway) taskComplete(ctx context.Context, a *Agent, id string, in task
 	if err := taskJSON(in.Result, "result"); err != nil {
 		return nil, err
 	}
-	return g.taskCall(ctx, a, `SELECT swarmpg.task_complete($1::uuid, $2::bigint, $3::jsonb)`, id, fence, string(in.Result))
+	effects, effectsErr := taskEffects(in.Effects)
+	if effectsErr != nil {
+		return nil, effectsErr
+	}
+	return g.taskCall(ctx, a, `SELECT swarmpg.task_complete($1::uuid, $2::bigint, $3::jsonb, $4::jsonb)`, id, fence, string(in.Result), string(effects))
 }
 
 func (g *Gateway) taskCancel(ctx context.Context, a *Agent, id string) (json.RawMessage, *apiError) {
